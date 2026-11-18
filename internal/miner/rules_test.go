@@ -254,11 +254,16 @@ func TestChainPersistence(t *testing.T) {
 	r.pool = newPool(c)
 	r.m.Pool = r.pool
 	r.mineTo(t, 8)
+	want := c.BestHash()
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
 	c2, err := chainOpen(p, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c2.BestHash() != c.BestHash() {
-		t.Fatalf("reopened chain at %d, want %d", c2.Height(), c.Height())
+	defer c2.Close()
+	if c2.BestHash() != want || c2.Height() != 8 {
+		t.Fatalf("reopened chain at %d, want 8", c2.Height())
 	}
 }

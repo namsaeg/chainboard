@@ -94,9 +94,16 @@ func New(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := store.Open(filepath.Join(dir, "store"))
+	st, err := store.Open(dir)
 	if err != nil {
 		return nil, err
+	}
+	// 0.1.0 kept data as files under store/; import what is complete.
+	if old := filepath.Join(dir, "store"); dirExists(filepath.Join(old, "data")) {
+		if n, err := st.ImportV010(old); err == nil {
+			_ = os.Rename(old, filepath.Join(dir, "store.v010"))
+			cfg.Logf("node: imported %d files from the 0.1.0 store", n)
+		}
 	}
 	if groot, _ := chunk.Root(ch.GenesisData); !st.Complete(groot) {
 		if _, err := st.PutData(ch.GenesisData); err != nil {
@@ -115,6 +122,11 @@ func New(cfg Config) (*Node, error) {
 		OnBlock: host.BroadcastBlock, Logf: cfg.Logf}
 	n.Index.Sync(ch)
 	return n, nil
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // checkUpload is the pool's data policy: all chunks present and an accepted
@@ -158,6 +170,8 @@ func (n *Node) Stop() {
 	}
 	n.Host.Stop()
 	n.wg.Wait()
+	_ = n.Chain.Close()
+	_ = n.Store.Close()
 }
 
 func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
@@ -275,12 +289,7 @@ func (n *Node) Send(t *types.Tx) error {
 		return err
 	}
 	// Dry-run against the pending state so the user hears about errors now.
-	trial := n.Pool.PendingState()
-	n.mu.Lock()
-	for _, q := range n.queue {
-		_ = trial.ApplyTx(q.tx, trial.NewCtx())
-	}
-	n.mu.Unlock()
+	trial := n.trialState()
 	if err := trial.ApplyTx(t, trial.NewCtx()); err != nil {
 		if !(t.Kind == types.TxUpload && errors.Is(n.checkUpload(t), mempool.ErrWaitingData)) {
 			return err
@@ -345,16 +354,56 @@ func (n *Node) Queued() []*types.Tx {
 	return out
 }
 
-// Upload re-encodes an image, stores it and queues the upload transaction.
-func (n *Node) Upload(raw []byte, tier uint16) (cryptox.Hash, error) {
+// UploadResult says what Upload did with a file.
+type UploadResult struct {
+	Root   cryptox.Hash
+	Action string // "upload", "extend" (stored already, retention lengthened) or "reuse"
+	Until  uint64 // height the data is kept until; 0 means permanent
+}
+
+// trialState is the pending state with our still-queued transactions applied.
+func (n *Node) trialState() *state.State {
+	st := n.Pool.PendingState()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, q := range n.queue {
+		_ = st.ApplyTx(q.tx, st.NewCtx())
+	}
+	return st
+}
+
+// Upload re-encodes an image and stores it. Data already on chain is not
+// uploaded again: if it is kept at least as long as the chosen tier it is
+// simply reused, otherwise an extend lengthens its retention.
+func (n *Node) Upload(raw []byte, tier uint16) (UploadResult, error) {
+	months, perm, ok := params.TierMonths(tier)
+	if !ok {
+		return UploadResult{}, errors.New("bad retention tier")
+	}
 	data, class, err := media.Reencode(raw)
 	if err != nil {
-		return cryptox.Hash{}, err
+		return UploadResult{}, err
 	}
 	root, err := n.Store.PutData(data)
 	if err != nil {
-		return root, err
+		return UploadResult{Root: root}, err
+	}
+	st := n.trialState()
+	info, exists := st.Data[root]
+	if exists {
+		until := st.BucketExpiry(info.Bucket)
+		if info.Tier == params.TierPermanent || (!perm && st.BucketFor(st.Height+1, months, perm) <= info.Bucket) {
+			return UploadResult{Root: root, Action: "reuse", Until: until}, nil
+		}
+		t := &types.Tx{Kind: types.TxExtend, DataRoot: root, Tier: tier}
+		if err := n.Send(t); err != nil {
+			return UploadResult{Root: root}, err
+		}
+		return UploadResult{Root: root, Action: "extend", Until: st.BucketExpiry(st.BucketFor(st.Height+1, months, perm))}, nil
 	}
 	t := &types.Tx{Kind: types.TxUpload, DataRoot: root, Size: uint64(len(data)), Tier: tier, Media: class}
-	return root, n.Send(t)
+	if err := n.Send(t); err != nil {
+		return UploadResult{Root: root}, err
+	}
+	return UploadResult{Root: root, Action: "upload", Until: st.BucketExpiry(st.BucketFor(st.Height+1, months, perm))}, nil
 }

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version = "0.1.0"
+	Version = "0.2.0"
 
 	Coin = 100_000_000 // units per coin
 
@@ -41,8 +41,8 @@ type Params struct {
 	VDFIterations     uint64 // SHA-256 iterations per VDF step (target ~1 step/s)
 	ChallengesPerStep int    // challenges unlocked per stored partition per VDF step
 	PartitionChunks   uint64 // chunks per partition
-	BalloonSpace      int    // Balloon hashing buffer, in 32-byte blocks (packing cost)
-	BalloonRounds     int
+	PackMemoryKiB     uint32 // Argon2id memory per packing seed (packing cost)
+	PackTime          uint32 // Argon2id passes
 	GenesisTarget     *big.Int
 	MaxTarget         *big.Int
 	RetargetWindow    int // blocks used for difficulty retarget
@@ -104,13 +104,13 @@ func mustHex(s string) *big.Int {
 func Testnet() *Params {
 	p := &Params{
 		Name:              "testnet",
-		Magic:             0xCB0A0001,
+		Magic:             0xCB0A0002, // 0.2.0: new genesis (packing and RLN rules changed)
 		BlockTime:         60 * time.Second,
 		VDFIterations:     400_000,
 		ChallengesPerStep: 4,
 		PartitionChunks:   4096, // 1 GiB
-		BalloonSpace:      1 << 15,
-		BalloonRounds:     1,
+		PackMemoryKiB:     4096, // 4 MiB per 256 KiB chunk
+		PackTime:          1,
 		GenesisTarget:     mustHex("0400000000000000000000000000000000000000000000000000000000000000"),
 		MaxTarget:         mustHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
 		RetargetWindow:    30,
@@ -125,13 +125,13 @@ func Testnet() *Params {
 func Devnet() *Params {
 	p := &Params{
 		Name:              "devnet",
-		Magic:             0xCB0D0001,
+		Magic:             0xCB0D0002,
 		BlockTime:         2 * time.Second,
 		VDFIterations:     100_000,
 		ChallengesPerStep: 4,
 		PartitionChunks:   16,
-		BalloonSpace:      64,
-		BalloonRounds:     1,
+		PackMemoryKiB:     64,
+		PackTime:          1,
 		GenesisTarget:     mustHex("0200000000000000000000000000000000000000000000000000000000000000"),
 		MaxTarget:         mustHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
 		RetargetWindow:    10,

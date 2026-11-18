@@ -1,15 +1,19 @@
-// Package store keeps data on disk: raw chunks of uploaded data (verified
-// against their data root) and this node's packed replicas.
+// Package store keeps data on disk in one bbolt database: raw chunks of
+// uploaded data (verified against their data root) and this node's packed
+// replicas. Every write is a single atomic transaction.
 package store
 
 import (
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
@@ -19,67 +23,93 @@ import (
 
 type Hash = cryptox.Hash
 
+var (
+	bMeta   = []byte("meta")   // root -> size (u64)
+	bChunks = []byte("chunks") // root || index (u64) -> raw chunk
+	bPacked = []byte("packed") // miner || bucket (u32) || position (u64) -> packed replica
+)
+
 // Store is safe for concurrent use.
 type Store struct {
-	dir string
-	mu  sync.RWMutex
+	db *bolt.DB
+	mu sync.RWMutex
 	// leaves caches the chunk leaves of complete data, to build proofs.
 	leaves map[Hash][]Hash
-	sizes  map[Hash]uint64
 }
 
-type meta struct {
-	Size uint64 `json:"size"`
-}
-
-// Open creates the directory layout.
+// Open opens (or creates) dir/store.db.
 func Open(dir string) (*Store, error) {
-	for _, d := range []string{"data", "packed"} {
-		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
 	}
-	return &Store{dir: dir, leaves: map[Hash][]Hash{}, sizes: map[Hash]uint64{}}, nil
+	db, err := bolt.Open(filepath.Join(dir, "store.db"), 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		for _, b := range [][]byte{bMeta, bChunks, bPacked} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, leaves: map[Hash][]Hash{}}, nil
 }
 
-func (s *Store) dataDir(root Hash) string { return filepath.Join(s.dir, "data", root.String()) }
+// Close closes the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+func chunkKey(root Hash, i uint64) []byte {
+	k := make([]byte, 40)
+	copy(k, root[:])
+	binary.BigEndian.PutUint64(k[32:], i)
+	return k
+}
+
+func packedPrefix(miner cryptox.Address, bucket uint32) []byte {
+	k := make([]byte, 24, 32)
+	copy(k, miner[:])
+	binary.BigEndian.PutUint32(k[20:], bucket)
+	return k
+}
+
+func packedKey(miner cryptox.Address, bucket uint32, pos uint64) []byte {
+	return binary.BigEndian.AppendUint64(packedPrefix(miner, bucket), pos)
+}
+
+func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
 
 // Begin declares data of a given size; chunks can then arrive in any order.
 func (s *Store) Begin(root Hash, size uint64) error {
 	if size == 0 {
 		return chunk.ErrEmpty
 	}
-	d := s.dataDir(root)
-	if err := os.MkdirAll(d, 0o755); err != nil {
-		return err
-	}
-	b, _ := json.Marshal(meta{Size: size})
-	s.mu.Lock()
-	s.sizes[root] = size
-	s.mu.Unlock()
-	return os.WriteFile(filepath.Join(d, "meta.json"), b, 0o644)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		m := tx.Bucket(bMeta)
+		if v := m.Get(root[:]); v != nil {
+			if binary.BigEndian.Uint64(v) != size {
+				return errors.New("store: data root already declared with another size")
+			}
+			return nil
+		}
+		return m.Put(root[:], u64(size))
+	})
 }
 
 // Size returns the declared size of data, if known.
-func (s *Store) Size(root Hash) (uint64, bool) {
-	s.mu.RLock()
-	sz, ok := s.sizes[root]
-	s.mu.RUnlock()
-	if ok {
-		return sz, true
-	}
-	b, err := os.ReadFile(filepath.Join(s.dataDir(root), "meta.json"))
-	if err != nil {
-		return 0, false
-	}
-	var m meta
-	if json.Unmarshal(b, &m) != nil {
-		return 0, false
-	}
-	s.mu.Lock()
-	s.sizes[root] = m.Size
-	s.mu.Unlock()
-	return m.Size, true
+func (s *Store) Size(root Hash) (size uint64, ok bool) {
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(bMeta).Get(root[:]); v != nil {
+			size, ok = binary.BigEndian.Uint64(v), true
+		}
+		return nil
+	})
+	return
 }
 
 // PutChunk stores chunk i after checking it against the data root.
@@ -91,19 +121,35 @@ func (s *Store) PutChunk(root Hash, i uint64, c []byte, path merkle.Proof) error
 	if !chunk.VerifyChunk(root, size, i, c, path) {
 		return errors.New("store: chunk does not match data root")
 	}
-	return os.WriteFile(filepath.Join(s.dataDir(root), fmt.Sprintf("%d.chunk", i)), c, 0o644)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bChunks).Put(chunkKey(root, i), c)
+	})
 }
 
-// PutData stores complete data (its root is computed here).
+// PutData stores complete data (its root is computed here) in one transaction.
 func (s *Store) PutData(data []byte) (Hash, error) {
-	root, leaves := chunk.Root(data)
-	if err := s.Begin(root, uint64(len(data))); err != nil {
-		return root, err
+	if len(data) == 0 {
+		return Hash{}, chunk.ErrEmpty
 	}
-	for i, c := range chunk.Split(data) {
-		if err := os.WriteFile(filepath.Join(s.dataDir(root), fmt.Sprintf("%d.chunk", i)), c, 0o644); err != nil {
-			return root, err
+	root, leaves := chunk.Root(data)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		m := tx.Bucket(bMeta)
+		if v := m.Get(root[:]); v != nil && binary.BigEndian.Uint64(v) != uint64(len(data)) {
+			return errors.New("store: data root already declared with another size")
 		}
+		if err := m.Put(root[:], u64(uint64(len(data)))); err != nil {
+			return err
+		}
+		cb := tx.Bucket(bChunks)
+		for i, c := range chunk.Split(data) {
+			if err := cb.Put(chunkKey(root, uint64(i)), c); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return root, err
 	}
 	s.mu.Lock()
 	s.leaves[root] = leaves
@@ -113,7 +159,16 @@ func (s *Store) PutData(data []byte) (Hash, error) {
 
 // Chunk reads raw chunk i.
 func (s *Store) Chunk(root Hash, i uint64) ([]byte, error) {
-	return os.ReadFile(filepath.Join(s.dataDir(root), fmt.Sprintf("%d.chunk", i)))
+	var out []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bChunks).Get(chunkKey(root, i))
+		if v == nil {
+			return os.ErrNotExist
+		}
+		out = append([]byte(nil), v...)
+		return nil
+	})
+	return out, err
 }
 
 // Missing lists chunk indexes not yet stored.
@@ -122,10 +177,21 @@ func (s *Store) Missing(root Hash) ([]uint64, bool) {
 	if !ok {
 		return nil, false
 	}
+	n := chunk.Count(size)
+	have := make([]bool, n)
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bChunks).Cursor()
+		for k, _ := c.Seek(chunkKey(root, 0)); k != nil && Hash(k[:32]) == root; k, _ = c.Next() {
+			if i := binary.BigEndian.Uint64(k[32:]); i < n {
+				have[i] = true
+			}
+		}
+		return nil
+	})
 	var out []uint64
-	for i := uint64(0); i < chunk.Count(size); i++ {
-		if _, err := os.Stat(filepath.Join(s.dataDir(root), fmt.Sprintf("%d.chunk", i))); err != nil {
-			out = append(out, i)
+	for i, h := range have {
+		if !h {
+			out = append(out, uint64(i))
 		}
 	}
 	return out, true
@@ -151,12 +217,15 @@ func (s *Store) Leaves(root Hash) ([]Hash, error) {
 	}
 	n := chunk.Count(size)
 	l = make([]Hash, n)
-	for i := uint64(0); i < n; i++ {
-		c, err := s.Chunk(root, i)
-		if err != nil {
-			return nil, err
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bChunks)
+		for i := uint64(0); i < n; i++ {
+			l[i] = chunk.ChunkLeaf(b.Get(chunkKey(root, i)))
 		}
-		l[i] = chunk.ChunkLeaf(c)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	s.leaves[root] = l
@@ -171,14 +240,18 @@ func (s *Store) Data(root Hash) ([]byte, error) {
 		return nil, errors.New("store: unknown data")
 	}
 	out := make([]byte, 0, size)
-	for i := uint64(0); i < chunk.Count(size); i++ {
-		c, err := s.Chunk(root, i)
-		if err != nil {
-			return nil, err
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bChunks)
+		for i := uint64(0); i < chunk.Count(size); i++ {
+			v := b.Get(chunkKey(root, i))
+			if v == nil {
+				return errors.New("store: data incomplete")
+			}
+			out = append(out, v...)
 		}
-		out = append(out, c...)
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 // ChunkProof returns chunk i and its path.
@@ -208,44 +281,107 @@ func (s *Store) SubProof(root Hash, i uint64, sub int) (chunk.Proof, error) {
 	return chunk.ProveSub(l, int(i), c, sub)
 }
 
-// Packed replicas are unique to a miner address, so they are kept per address.
-func (s *Store) packedPath(miner cryptox.Address, bucket uint32, pos uint64) string {
-	return filepath.Join(s.dir, "packed", hex.EncodeToString(miner[:]), fmt.Sprint(bucket), fmt.Sprintf("%d.pk", pos))
+// Packed is one packed replica to store.
+type Packed struct {
+	Bucket   uint32
+	Position uint64
+	Data     []byte
 }
 
-// PutPacked stores a packed replica.
-func (s *Store) PutPacked(miner cryptox.Address, bucket uint32, pos uint64, packed []byte) error {
-	p := s.packedPath(miner, bucket, pos)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(p, packed, 0o644)
+// PutPacked stores packed replicas of one miner in a single transaction.
+// Replicas are unique to a miner address, so they are keyed by it.
+func (s *Store) PutPacked(miner cryptox.Address, ps ...Packed) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bPacked)
+		for _, p := range ps {
+			if err := b.Put(packedKey(miner, p.Bucket, p.Position), p.Data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // HasPacked reports whether a packed replica exists.
 func (s *Store) HasPacked(miner cryptox.Address, bucket uint32, pos uint64) bool {
-	_, err := os.Stat(s.packedPath(miner, bucket, pos))
-	return err == nil
+	var ok bool
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(bPacked).Get(packedKey(miner, bucket, pos)) != nil
+		return nil
+	})
+	return ok
 }
 
 // PackedSub reads one packed sub-chunk.
 func (s *Store) PackedSub(miner cryptox.Address, bucket uint32, pos uint64, sub int) ([]byte, error) {
-	f, err := os.Open(s.packedPath(miner, bucket, pos))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	buf := make([]byte, params.SubChunkSize)
-	if _, err := f.ReadAt(buf, int64(sub*params.SubChunkSize)); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	var out []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bPacked).Get(packedKey(miner, bucket, pos))
+		lo, hi := sub*params.SubChunkSize, (sub+1)*params.SubChunkSize
+		if v == nil || sub < 0 || hi > len(v) {
+			return os.ErrNotExist
+		}
+		out = append([]byte(nil), v[lo:hi]...)
+		return nil
+	})
+	return out, err
 }
 
-// DropBucket removes packed replicas of an expired bucket.
+// DropBucket removes the packed replicas of an expired bucket.
 func (s *Store) DropBucket(miner cryptox.Address, bucket uint32) error {
-	return os.RemoveAll(filepath.Join(s.dir, "packed", hex.EncodeToString(miner[:]), fmt.Sprint(bucket)))
+	prefix := packedPrefix(miner, bucket)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bPacked)
+		var keys [][]byte
+		c := b.Cursor()
+		for k, _ := c.Seek(prefix); k != nil && string(k[:24]) == string(prefix); k, _ = c.Next() {
+			keys = append(keys, append([]byte(nil), k...))
+		}
+		for _, k := range keys {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
-// HexRoot formats a root for paths and logs.
+// ImportV010 copies the complete data of a 0.1.0 file store (dir/data/<root>/
+// with meta.json and N.chunk files) into this store and returns how many
+// data roots it imported. Each imported file is re-verified against its root.
+// Packed replicas are not imported: 0.2.0 packs with a different function.
+func (s *Store) ImportV010(dir string) (int, error) {
+	entries, err := os.ReadDir(filepath.Join(dir, "data"))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		want, err := cryptox.ParseHash(e.Name())
+		if err != nil || !e.IsDir() {
+			continue
+		}
+		var data []byte
+		for i := 0; ; i++ {
+			c, err := os.ReadFile(filepath.Join(dir, "data", e.Name(), fmt.Sprintf("%d.chunk", i)))
+			if err != nil {
+				break
+			}
+			data = append(data, c...)
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if root, _ := chunk.Root(data); root != want {
+			continue // incomplete or damaged: the network will refill it
+		}
+		if _, err := s.PutData(data); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+// HexRoot formats a root for logs.
 func HexRoot(h Hash) string { return hex.EncodeToString(h[:8]) }

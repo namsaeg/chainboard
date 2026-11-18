@@ -2,11 +2,11 @@
 // position, so that one stored copy cannot be claimed by several addresses and
 // a missing copy cannot be cheaply rebuilt during mining.
 //
-//	seed   = Balloon(Tagged("cb/pack", bucket, position, miner), space, rounds)
+//	seed   = Argon2id(Tagged("cb/pack", bucket, position, miner), salt, time, memory)
 //	stream = AES-256-CTR(seed) over a full 256 KiB chunk
 //	packed = (chunk padded to 256 KiB) XOR stream
 //
-// The memory-hard Balloon step is the expensive part; the stream can be
+// The memory-hard Argon2id step (RFC 9106) is the expensive part; the stream can be
 // sought, so a verifier unpacks a single 8 KiB sub-chunk.
 package pack
 
@@ -15,6 +15,8 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 
+	"golang.org/x/crypto/argon2"
+
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 )
@@ -22,7 +24,9 @@ import (
 // Seed derives the packing key for one chunk position and miner.
 func Seed(p *params.Params, bucket uint32, position uint64, miner cryptox.Address) cryptox.Hash {
 	in := cryptox.Tagged("cb/pack", cryptox.U64(uint64(bucket)), cryptox.U64(position), miner[:])
-	return cryptox.Balloon(in[:], []byte("cb/pack/salt"), p.BalloonSpace, p.BalloonRounds)
+	var out cryptox.Hash
+	copy(out[:], argon2.IDKey(in[:], []byte("chainboard/pack/v2"), p.PackTime, p.PackMemoryKiB, 1, 32))
+	return out
 }
 
 func xorAt(seed cryptox.Hash, offset int, data []byte) []byte {

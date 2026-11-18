@@ -16,7 +16,7 @@ import (
 func fastParams() *params.Params {
 	p := params.Devnet()
 	p.VDFIterations = 2000
-	p.BalloonSpace = 16
+	p.PackMemoryKiB = 8
 	p.GenesisTarget = new(big.Int).Lsh(big.NewInt(1), 250)
 	p.BlocksPerDay, p.BlocksPerMonth, p.BlocksPerYear = 10, 20, 240
 	p.HalvingBlocks = 1_000_000
@@ -77,13 +77,25 @@ func TestThreeNodes(t *testing.T) {
 	waitFor(t, "transfer", 60*time.Second, func() bool {
 		return b.Chain.Tip().Peek(b.Wallet.Address()).Balance > 0
 	})
-	root, err := b.Upload(pngBytes(), 12)
-	if err != nil {
-		t.Fatal(err)
+	up, err := b.Upload(pngBytes(), 12)
+	if err != nil || up.Action != "upload" {
+		t.Fatalf("upload: %+v %v", up, err)
 	}
+	root := up.Root
 	waitFor(t, "upload mined", 60*time.Second, func() bool {
 		_, ok := c.Chain.Tip().Data[root]
 		return ok
+	})
+	// The same file again: reused for an equal tier, extended for a longer one.
+	if again, err := b.Upload(pngBytes(), 12); err != nil || again.Action != "reuse" || again.Root != root {
+		t.Fatalf("re-upload: %+v %v", again, err)
+	}
+	if longer, err := b.Upload(pngBytes(), 24); err != nil || longer.Action != "extend" {
+		t.Fatalf("longer re-upload: %+v %v", longer, err)
+	}
+	waitFor(t, "auto-extend mined", 60*time.Second, func() bool {
+		d, ok := c.Chain.Tip().Data[root]
+		return ok && d.Tier == 24
 	})
 	post := &types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: "테스트", Text: []byte("세 노드 시험 글"), Attach: []types.Hash{root}}
 	if err := b.Send(post); err != nil {

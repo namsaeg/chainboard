@@ -19,7 +19,7 @@ import (
 func FastParams() *params.Params {
 	p := params.Devnet()
 	p.VDFIterations = 50
-	p.BalloonSpace = 16
+	p.PackMemoryKiB = 8
 	p.GenesisTarget = new(big.Int).Lsh(big.NewInt(1), 254)
 	// Compressed calendar: a "day" is 10 blocks, a month 20, a year 240.
 	p.BlocksPerDay, p.BlocksPerMonth, p.BlocksPerYear = 10, 20, 240

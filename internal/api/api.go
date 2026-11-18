@@ -309,12 +309,12 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	root, err := s.n.Upload(raw, tier)
+	res, err := s.n.Upload(raw, tier)
 	if err != nil {
 		fail(w, 400, err)
 		return
 	}
-	writeJSON(w, map[string]string{"root": root.String()})
+	writeJSON(w, map[string]any{"root": res.Root.String(), "action": res.Action, "until": res.Until})
 }
 
 func (s *server) extend(w http.ResponseWriter, r *http.Request) {

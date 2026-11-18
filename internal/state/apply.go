@@ -340,10 +340,11 @@ func (s *State) dataFee(t *types.Tx, h uint64, ctx *BlockCtx) (uint64, uint32, e
 		return 0, 0, errors.New("extend of unknown data")
 	}
 	if info.Tier == params.TierPermanent {
-		return 0, 0, errors.New("already permanent")
+		return 0, 0, errors.New("data is already stored permanently; nothing to extend")
 	}
 	if !perm && dest <= info.Bucket {
-		return 0, 0, errors.New("new tier does not outlast the current one")
+		return 0, 0, fmt.Errorf("data is already stored until height %d, which this tier would not outlast; choose a longer tier to extend it",
+			s.BucketExpiry(info.Bucket))
 	}
 	rem := s.remainingMonths(info, h)
 	full := StorageFee(s.P, s.Price, info.Size, s.P.MediaReplicas, months, perm)

@@ -97,6 +97,9 @@ func Assign(st *state.State, pledge uint64) []uint64 {
 	return out
 }
 
+// packBatch packed replicas (8 MiB) are written per database transaction.
+const packBatch = 32
+
 // Prepare reassigns partitions and packs every chunk that is stored raw but
 // not yet packed. It returns the data roots that still miss chunks.
 func (m *Miner) Prepare(st *state.State) map[cryptox.Hash][]uint64 {
@@ -104,6 +107,13 @@ func (m *Miner) Prepare(st *state.State) map[cryptox.Hash][]uint64 {
 	addr := m.Key.Address()
 	missing := map[cryptox.Hash][]uint64{}
 	var packed, miss uint64
+	var batch []store.Packed
+	flush := func() {
+		if len(batch) > 0 && m.Store.PutPacked(addr, batch...) == nil {
+			packed += uint64(len(batch))
+		}
+		batch = batch[:0]
+	}
 	for _, p := range parts {
 		bucket, start, length, ok := st.PartitionRange(p)
 		if !ok {
@@ -125,11 +135,13 @@ func (m *Miner) Prepare(st *state.State) map[cryptox.Hash][]uint64 {
 				continue
 			}
 			seed := pack.Seed(st.P, bucket, pos, addr)
-			if err := m.Store.PutPacked(addr, bucket, pos, pack.Pack(seed, raw)); err == nil {
-				packed++
+			batch = append(batch, store.Packed{Bucket: bucket, Position: pos, Data: pack.Pack(seed, raw)})
+			if len(batch) == packBatch {
+				flush()
 			}
 		}
 	}
+	flush()
 	m.mu.Lock()
 	old := m.assigned
 	m.assigned = parts

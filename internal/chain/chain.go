@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -46,7 +48,7 @@ type Chain struct {
 	GenesisData []byte
 
 	mu       sync.RWMutex
-	dir      string
+	db       *bolt.DB // nil for an in-memory chain
 	genesis  Hash
 	blocks   map[Hash]*entry
 	states   map[Hash]*state.State
@@ -57,11 +59,14 @@ type Chain struct {
 	subs     []chan *state.State
 }
 
-// Open loads (or creates) a chain in dir.
+var bBlocks = []byte("blocks") // block hash -> encoded block
+
+// Open loads (or creates) a chain in dir/chain.db. An empty dir keeps the
+// chain in memory only.
 func Open(p *params.Params, dir string) (*Chain, error) {
 	g, data := state.Genesis(p)
 	c := &Chain{
-		P: p, GenesisData: data, dir: dir, genesis: g.Tip,
+		P: p, GenesisData: data, genesis: g.Tip,
 		blocks:  map[Hash]*entry{g.Tip: {height: 0, work: new(big.Int)}},
 		states:  map[Hash]*state.State{g.Tip: g},
 		bad:     map[Hash]error{},
@@ -71,31 +76,50 @@ func Open(p *params.Params, dir string) (*Chain, error) {
 	if dir == "" {
 		return c, nil
 	}
-	bdir := filepath.Join(dir, "blocks")
-	if err := os.MkdirAll(bdir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	files, _ := filepath.Glob(filepath.Join(bdir, "*.blk"))
+	// 0.1.0 kept one file per block under blocks/. Those blocks follow older
+	// consensus rules, so they are set aside rather than loaded.
+	if fi, err := os.Stat(filepath.Join(dir, "blocks")); err == nil && fi.IsDir() {
+		_ = os.Rename(filepath.Join(dir, "blocks"), filepath.Join(dir, "blocks.v010"))
+	}
+	db, err := bolt.Open(filepath.Join(dir, "chain.db"), 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("chain: %w", err)
+	}
+	c.db = db
 	var loaded []*types.Block
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
+	err = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bBlocks)
 		if err != nil {
-			continue
+			return err
 		}
-		b, err := types.DecodeBlock(raw)
-		if err != nil {
-			continue
-		}
-		loaded = append(loaded, b)
+		return b.ForEach(func(_, v []byte) error {
+			if blk, err := types.DecodeBlock(v); err == nil {
+				loaded = append(loaded, blk)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
 	}
 	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Height < loaded[j].Height })
 	for _, b := range loaded {
-		if err := c.add(b, 0, false); err != nil && !errors.Is(err, ErrKnown) {
-			// Unreadable or invalid files are ignored; the network refills gaps.
-			continue
-		}
+		// Invalid stored blocks are ignored; the network refills gaps.
+		_ = c.add(b, 0, false)
 	}
 	return c, nil
+}
+
+// Close closes the block database.
+func (c *Chain) Close() error {
+	if c.db == nil {
+		return nil
+	}
+	return c.db.Close()
 }
 
 // Genesis returns the genesis hash.
@@ -246,8 +270,8 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 	work := new(big.Int).Add(pe.work, types.Work(b.TargetInt()))
 	c.blocks[h] = &entry{block: b, height: b.Height, work: work, parent: b.Prev}
 	c.states[h] = st
-	if persist && c.dir != "" {
-		_ = os.WriteFile(filepath.Join(c.dir, "blocks", h.String()+".blk"), b.Encode(), 0o644)
+	if persist && c.db != nil {
+		_ = c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bBlocks).Put(h[:], b.Encode()) })
 	}
 	if work.Cmp(c.blocks[c.best].work) > 0 {
 		c.setBest(h)
