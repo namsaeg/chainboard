@@ -1,0 +1,7 @@
+# build output
+/chainboard
+/chainboard.exe
+/dist/
+# local node data
+/data/
+*.key

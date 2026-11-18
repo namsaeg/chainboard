@@ -1,0 +1,340 @@
+// Package chain keeps every valid block, picks the heaviest chain, and serves
+// the state at its tip. Reorganisations are handled by recomputing state from
+// the nearest saved snapshot.
+package chain
+
+import (
+	"errors"
+	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/state"
+	"github.com/namsaeg/chainboard/internal/types"
+)
+
+type Hash = cryptox.Hash
+
+var (
+	ErrKnown   = errors.New("chain: block already known")
+	ErrOrphan  = errors.New("chain: parent unknown")
+	ErrInvalid = errors.New("chain: invalid block")
+)
+
+const (
+	snapshotEvery = 50  // keep a state snapshot every N heights
+	recentStates  = 24  // and for the last N blocks of the best chain
+	maxOrphans    = 512 // blocks waiting for their parent
+)
+
+type entry struct {
+	block  *types.Block
+	height uint64
+	work   *big.Int
+	parent Hash
+}
+
+// Chain is safe for concurrent use.
+type Chain struct {
+	P           *params.Params
+	GenesisData []byte
+
+	mu       sync.RWMutex
+	dir      string
+	genesis  Hash
+	blocks   map[Hash]*entry
+	states   map[Hash]*state.State
+	bad      map[Hash]error
+	orphans  map[Hash][]*types.Block // by missing parent
+	best     Hash
+	bestPath []Hash // hash by height on the best chain
+	subs     []chan *state.State
+}
+
+// Open loads (or creates) a chain in dir.
+func Open(p *params.Params, dir string) (*Chain, error) {
+	g, data := state.Genesis(p)
+	c := &Chain{
+		P: p, GenesisData: data, dir: dir, genesis: g.Tip,
+		blocks:  map[Hash]*entry{g.Tip: {height: 0, work: new(big.Int)}},
+		states:  map[Hash]*state.State{g.Tip: g},
+		bad:     map[Hash]error{},
+		orphans: map[Hash][]*types.Block{},
+		best:    g.Tip, bestPath: []Hash{g.Tip},
+	}
+	if dir == "" {
+		return c, nil
+	}
+	bdir := filepath.Join(dir, "blocks")
+	if err := os.MkdirAll(bdir, 0o755); err != nil {
+		return nil, err
+	}
+	files, _ := filepath.Glob(filepath.Join(bdir, "*.blk"))
+	var loaded []*types.Block
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		b, err := types.DecodeBlock(raw)
+		if err != nil {
+			continue
+		}
+		loaded = append(loaded, b)
+	}
+	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Height < loaded[j].Height })
+	for _, b := range loaded {
+		if err := c.add(b, 0, false); err != nil && !errors.Is(err, ErrKnown) {
+			// Unreadable or invalid files are ignored; the network refills gaps.
+			continue
+		}
+	}
+	return c, nil
+}
+
+// Genesis returns the genesis hash.
+func (c *Chain) Genesis() Hash { return c.genesis }
+
+// Tip returns the state at the best block. Callers must not modify it.
+func (c *Chain) Tip() *state.State {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.states[c.best]
+}
+
+// Height of the best chain.
+func (c *Chain) Height() uint64 { return c.Tip().Height }
+
+// Subscribe returns a channel that receives the new tip state on every change.
+func (c *Chain) Subscribe() <-chan *state.State {
+	ch := make(chan *state.State, 4)
+	c.mu.Lock()
+	c.subs = append(c.subs, ch)
+	c.mu.Unlock()
+	return ch
+}
+
+// Has reports whether a block is known.
+func (c *Chain) Has(h Hash) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.blocks[h]
+	return ok
+}
+
+// Block returns a known block.
+func (c *Chain) Block(h Hash) *types.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if e, ok := c.blocks[h]; ok {
+		return e.block
+	}
+	return nil
+}
+
+// BlockAt returns the best-chain block at a height.
+func (c *Chain) BlockAt(height uint64) *types.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if height == 0 || height >= uint64(len(c.bestPath)) {
+		return nil
+	}
+	return c.blocks[c.bestPath[height]].block
+}
+
+// Locator lists best-chain hashes, dense near the tip and sparse further back.
+func (c *Chain) Locator() []Hash {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []Hash
+	step := 1
+	for i := len(c.bestPath) - 1; i >= 0; i -= step {
+		out = append(out, c.bestPath[i])
+		if len(out) > 10 {
+			step *= 2
+		}
+	}
+	if out[len(out)-1] != c.genesis {
+		out = append(out, c.genesis)
+	}
+	return out
+}
+
+// After returns up to max best-chain blocks after the first locator hash we
+// share with the caller.
+func (c *Chain) After(locator []Hash, max int) []*types.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	start := uint64(0)
+	for _, h := range locator {
+		e, ok := c.blocks[h]
+		if ok && e.height < uint64(len(c.bestPath)) && c.bestPath[e.height] == h {
+			start = e.height
+			break
+		}
+	}
+	var out []*types.Block
+	for i := start + 1; i < uint64(len(c.bestPath)) && len(out) < max; i++ {
+		out = append(out, c.blocks[c.bestPath[i]].block)
+	}
+	return out
+}
+
+// Add validates a block and attaches it. It returns ErrOrphan when the parent
+// is missing (the block is kept until the parent arrives).
+func (c *Chain) Add(b *types.Block) error {
+	return c.add(b, time.Now().Unix(), true)
+}
+
+func (c *Chain) add(b *types.Block, now int64, persist bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.addLocked(b, now, persist)
+	if err != nil {
+		return err
+	}
+	// Attach any orphans that were waiting for this block.
+	queue := []Hash{b.Hash()}
+	for len(queue) > 0 {
+		h := queue[0]
+		queue = queue[1:]
+		kids := c.orphans[h]
+		delete(c.orphans, h)
+		for _, k := range kids {
+			if c.addLocked(k, now, persist) == nil {
+				queue = append(queue, k.Hash())
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
+	h := b.Hash()
+	if _, ok := c.blocks[h]; ok {
+		return ErrKnown
+	}
+	if err, ok := c.bad[h]; ok {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	pe, ok := c.blocks[b.Prev]
+	if !ok {
+		if len(c.orphans) < maxOrphans {
+			c.orphans[b.Prev] = append(c.orphans[b.Prev], b)
+		}
+		return ErrOrphan
+	}
+	if _, bad := c.bad[b.Prev]; bad {
+		c.bad[h] = errors.New("parent invalid")
+		return fmt.Errorf("%w: parent invalid", ErrInvalid)
+	}
+	parent, err := c.stateAt(b.Prev)
+	if err != nil {
+		return err
+	}
+	st := parent.Clone()
+	if err := st.ApplyBlock(b, now); err != nil {
+		c.bad[h] = err
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	work := new(big.Int).Add(pe.work, types.Work(b.TargetInt()))
+	c.blocks[h] = &entry{block: b, height: b.Height, work: work, parent: b.Prev}
+	c.states[h] = st
+	if persist && c.dir != "" {
+		_ = os.WriteFile(filepath.Join(c.dir, "blocks", h.String()+".blk"), b.Encode(), 0o644)
+	}
+	if work.Cmp(c.blocks[c.best].work) > 0 {
+		c.setBest(h)
+	}
+	c.prune()
+	return nil
+}
+
+// stateAt returns the state after block h, recomputing it if needed.
+func (c *Chain) stateAt(h Hash) (*state.State, error) {
+	if s, ok := c.states[h]; ok {
+		return s, nil
+	}
+	var path []*types.Block
+	cur := h
+	for {
+		if s, ok := c.states[cur]; ok {
+			st := s.Clone()
+			for i := len(path) - 1; i >= 0; i-- {
+				if err := st.ApplyBlock(path[i], 0); err != nil {
+					return nil, err
+				}
+			}
+			c.states[h] = st
+			return st, nil
+		}
+		e, ok := c.blocks[cur]
+		if !ok || e.block == nil {
+			return nil, errors.New("chain: no snapshot reachable")
+		}
+		path = append(path, e.block)
+		cur = e.parent
+	}
+}
+
+func (c *Chain) setBest(h Hash) {
+	c.best = h
+	e := c.blocks[h]
+	path := make([]Hash, e.height+1)
+	cur := h
+	for i := int(e.height); i >= 0; i-- {
+		path[i] = cur
+		cur = c.blocks[cur].parent
+	}
+	c.bestPath = path
+	st := c.states[h]
+	for _, ch := range c.subs {
+		select {
+		case ch <- st:
+		default:
+		}
+	}
+}
+
+// prune drops state snapshots that are neither recent best-chain states nor
+// periodic checkpoints, nor tips of side branches.
+func (c *Chain) prune() {
+	tipH := uint64(len(c.bestPath) - 1)
+	keep := map[Hash]bool{c.genesis: true}
+	for i := uint64(0); i <= tipH; i++ {
+		if i%snapshotEvery == 0 || i+recentStates > tipH {
+			keep[c.bestPath[i]] = true
+		}
+	}
+	for h := range c.states {
+		if keep[h] {
+			continue
+		}
+		e := c.blocks[h]
+		// Keep recent side-branch states so competing blocks validate cheaply.
+		if e != nil && e.height+recentStates > tipH {
+			continue
+		}
+		delete(c.states, h)
+	}
+}
+
+// BestHash returns the tip hash.
+func (c *Chain) BestHash() Hash {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.best
+}
+
+// Work returns the cumulative work of the best chain.
+func (c *Chain) Work() *big.Int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return new(big.Int).Set(c.blocks[c.best].work)
+}
