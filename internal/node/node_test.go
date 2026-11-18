@@ -86,8 +86,8 @@ func TestThreeNodes(t *testing.T) {
 		_, ok := c.Chain.Tip().Data[root]
 		return ok
 	})
-	// The same file again: reused for an equal tier, extended for a longer one.
-	if again, err := b.Upload(pngBytes(), 12); err != nil || again.Action != "reuse" || again.Root != root {
+	// The same file again: reused for a shorter tier, extended for a longer one.
+	if again, err := b.Upload(pngBytes(), 1); err != nil || again.Action != "reuse" || again.Root != root {
 		t.Fatalf("re-upload: %+v %v", again, err)
 	}
 	if longer, err := b.Upload(pngBytes(), 24); err != nil || longer.Action != "extend" {
@@ -119,5 +119,94 @@ func TestThreeNodes(t *testing.T) {
 	})
 	if err := c.Chain.Tip().CheckSupply(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestAnonymousPosts joins the RLN lane over the network and posts both fully
+// anonymously and under a pseudonym.
+func TestAnonymousPosts(t *testing.T) {
+	p := fastParams()
+	a := start(t, p, true)
+	b := start(t, p, false, a.Host.Addr())
+	c := start(t, p, false, a.Host.Addr(), b.Host.Addr())
+	waitFor(t, "mining", 60*time.Second, func() bool { return a.Chain.Height() >= 8 })
+	if err := a.Send(&types.Tx{Kind: types.TxTransfer, To: b.Wallet.Address(), Amount: 20 * params.Coin}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "funds", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).Balance > 0 })
+	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "가입 전"}); err == nil {
+		t.Fatal("anonymous post accepted before joining")
+	}
+	if err := b.Send(&types.Tx{Kind: types.TxStake, Amount: 10 * params.Coin}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "stake", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).StakePending > 0 })
+	start := b.Chain.Height()
+	waitFor(t, "stake aging", 60*time.Second, func() bool { return b.Chain.Height() > start+p.StakeAgingBlocks })
+	if err := b.JoinRLN(3 * params.Coin); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "membership", 60*time.Second, func() bool { return b.RLNStatus().Status == "active" })
+	if s := b.RLNStatus(); s.Limit != 3 || s.Members != 1 {
+		t.Fatalf("status %+v", s)
+	}
+	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "누가 썼는지 모르는 글"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "가명으로 쓴 글", Pseudo: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "anonymous posts on another node", 90*time.Second, func() bool { return len(c.Index.Board("익명", 0, 10)) == 2 })
+	wallet := b.Wallet.Address().String()
+	var pseudo, plain int
+	for _, v := range c.Index.Board("익명", 0, 10) {
+		if v.Lane != "anon" || v.Author == wallet {
+			t.Fatalf("post leaks its author: %+v", v)
+		}
+		if v.Pseudo && v.Author == b.RLNStatus().Pseudonym {
+			pseudo++
+		} else if v.Author == "" {
+			plain++
+		}
+	}
+	if pseudo != 1 || plain != 1 {
+		t.Fatalf("pseudonym %d, anonymous %d", pseudo, plain)
+	}
+	if s := b.RLNStatus(); s.Used != 2 && s.Epoch == b.Chain.Tip().RLNEpoch(b.Chain.Height()+1) {
+		t.Logf("used %d (epoch may have rolled over)", s.Used)
+	}
+	if len(b.QueuedAnon()) != 0 {
+		waitFor(t, "outbox drained", 30*time.Second, func() bool { return len(b.QueuedAnon()) == 0 })
+	}
+}
+
+// TestOutboxSurvivesRestart closes a node while a transaction waits out its
+// random send delay; the reopened node still has it, unchanged.
+func TestOutboxSurvivesRestart(t *testing.T) {
+	p := fastParams()
+	dir := t.TempDir()
+	open := func(mine bool) *Node {
+		n, err := New(Config{Network: "devnet", DataDir: dir, Listen: "127.0.0.1:0", Mine: mine, PledgeBytes: 1 << 40,
+			SendDelayMax: time.Hour, Embargo: 300 * time.Millisecond, Params: p, Logf: t.Logf})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	a := open(true)
+	waitFor(t, "funds", 60*time.Second, func() bool { return a.Chain.Tip().Peek(a.Wallet.Address()).Balance > params.Coin })
+	tx := &types.Tx{Kind: types.TxTransfer, To: a.Wallet.Address(), Amount: 1}
+	if err := a.Send(tx); err != nil {
+		t.Fatal(err)
+	}
+	a.Stop()
+	b := open(false)
+	defer b.Stop()
+	q := b.Queued()
+	if len(q) != 1 || q[0].ID() != tx.ID() {
+		t.Fatalf("queue after restart: %v", q)
 	}
 }

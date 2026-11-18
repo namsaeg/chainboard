@@ -12,6 +12,7 @@ import (
 	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/rln"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
@@ -42,10 +43,12 @@ type Account struct {
 	Unbonding     []Unbond
 	Vesting       []Tranche
 	LastProof     uint64 // last epoch with a storage proof (block or proof tx)
-	Quota         uint64 // free-lane bytes available at QuotaAt
-	QuotaAt       uint64
 	Partitions    []uint64
 	ProofsInEpoch uint64 // epoch of the last proof tx (one per epoch)
+	// A registration takes effect for epoch challenges from the next epoch:
+	// during the epoch it changed in (PartsEpoch-1), ProveParts are challenged.
+	ProveParts []uint64
+	PartsEpoch uint64
 }
 
 func (a *Account) clone() *Account {
@@ -53,6 +56,7 @@ func (a *Account) clone() *Account {
 	c.Unbonding = append([]Unbond(nil), a.Unbonding...)
 	c.Vesting = append([]Tranche(nil), a.Vesting...)
 	c.Partitions = append([]uint64(nil), a.Partitions...)
+	c.ProveParts = append([]uint64(nil), a.ProveParts...)
 	return &c
 }
 
@@ -68,11 +72,14 @@ type Record struct {
 // Bucket is an append-only chunk space. Bucket 0 is permanent; bucket k > 0
 // expires as a whole at height k × BlocksPerMonth.
 type Bucket struct {
-	ID      uint32
-	Len     uint64 // positions used
-	Records []Record
-	Escrow  uint64 // prepaid fees still to be paid out to storage
-	Bytes   uint64 // live (not moved) bytes
+	ID  uint32
+	Len uint64 // positions used
+	// EpochLen is Len when the current proof epoch began; epoch challenges
+	// only point below it, so they stay the same for the whole epoch.
+	EpochLen uint64
+	Records  []Record
+	Escrow   uint64 // prepaid fees still to be paid out to storage
+	Bytes    uint64 // live (not moved) bytes
 }
 
 func (b *Bucket) clone() *Bucket {
@@ -111,6 +118,10 @@ type HeaderMeta struct {
 
 // State is the full chain state at one block.
 type State struct {
+	// replay is set while re-applying a block this node already validated:
+	// the expensive proofs are not checked again (see ReplayBlock).
+	replay bool
+
 	P         *params.Params
 	Height    uint64
 	Tip       Hash
@@ -132,17 +143,28 @@ type State struct {
 	Price      uint64 // units per raw GB-year
 	PriceEMA   uint64
 	BaseFee    uint64 // units per byte, fee lane
-	Congestion uint64 // free-lane quota multiplier, permille
+	Congestion uint64 // anonymous-lane pressure, permille (shrinks the RLN cap)
 	PermBytes  uint64 // live permanent media bytes
 	TermBytes  uint64 // live term media bytes
 	Proven     uint64 // estimated proven storage, bytes
 	Recent     []HeaderMeta
 	CumWork    *big.Int
+
+	// Anonymous lane (RLN).
+	Members     map[Hash]*Member // by identity commitment; copy-on-write entries
+	RLNTree     *rln.Tree
+	RLNRoots    []RootEntry               // accepted membership roots, newest (current) last
+	RLNNulls    map[uint64]map[Hash]Share // epoch -> nullifier -> share
+	RLNExits    []exit                    // releases in height order
+	RLNCap      uint64                    // per-member cap of RLNCapEpoch
+	RLNCapPrev  uint64                    // cap of the epoch before
+	RLNCapEpoch uint64
 }
 
 // Clone deep-copies the state.
 func (s *State) Clone() *State {
 	c := *s
+	c.replay = false
 	c.Accounts = make(map[Address]*Account, len(s.Accounts))
 	for k, v := range s.Accounts {
 		c.Accounts[k] = v.clone()
@@ -158,8 +180,7 @@ func (s *State) Clone() *State {
 	}
 	c.Posts = make(map[Hash]*PostInfo, len(s.Posts))
 	for k, v := range s.Posts {
-		pi := *v
-		c.Posts[k] = &pi
+		c.Posts[k] = v // entries are replaced, never modified in place
 	}
 	c.Likes = make(map[[52]byte]bool, len(s.Likes))
 	for k, v := range s.Likes {
@@ -171,6 +192,21 @@ func (s *State) Clone() *State {
 	}
 	c.Recent = append([]HeaderMeta(nil), s.Recent...)
 	c.CumWork = new(big.Int).Set(s.CumWork)
+	c.Members = make(map[Hash]*Member, len(s.Members))
+	for k, v := range s.Members {
+		c.Members[k] = v // entries are replaced, never modified in place
+	}
+	c.RLNTree = s.RLNTree.Clone()
+	c.RLNRoots = append([]RootEntry(nil), s.RLNRoots...)
+	c.RLNNulls = make(map[uint64]map[Hash]Share, len(s.RLNNulls))
+	for e, m := range s.RLNNulls {
+		cm := make(map[Hash]Share, len(m))
+		for k, v := range m {
+			cm[k] = v
+		}
+		c.RLNNulls[e] = cm
+	}
+	c.RLNExits = append([]exit(nil), s.RLNExits...)
 	return &c
 }
 
@@ -296,32 +332,6 @@ func (s *State) FileCap() uint64 {
 	return s.MediaCapPerBlock() * s.P.BlocksPerDay / s.P.FileCapDivisor
 }
 
-// EffectiveStake is what backs an account's free-lane quota: matured stake
-// plus locked (unvested) mining income.
-func (s *State) EffectiveStake(a *Account, h uint64) uint64 {
-	st := a.StakeMature
-	if a.StakePending > 0 && h >= a.PendingSince+s.P.StakeAgingBlocks {
-		st += a.StakePending
-	}
-	for _, t := range a.Vesting {
-		st += t.Amount - vestedAt(t, h)
-	}
-	return st
-}
-
-// QuotaAt returns the free-lane quota available at height h.
-func (s *State) QuotaAt(a *Account, h uint64) uint64 {
-	max := mulDiv(s.EffectiveStake(a, h), s.P.QuotaPerCoinDay, params.Coin)
-	q := a.Quota
-	if h > a.QuotaAt {
-		q += mulDiv(max, h-a.QuotaAt, s.P.QuotaRegenBlocks)
-	}
-	if q > max {
-		q = max
-	}
-	return q
-}
-
 func vestedAt(t Tranche, h uint64) uint64 {
 	if h >= t.End {
 		return t.Amount
@@ -366,11 +376,18 @@ func Genesis(p *params.Params) (*State, []byte) {
 		BaseFee:    p.BaseFeeInit,
 		Congestion: 1000,
 		CumWork:    new(big.Int),
+		Members:    map[Hash]*Member{},
+		RLNTree:    rln.NewTree(),
+		RLNNulls:   map[uint64]map[Hash]Share{},
+		RLNCap:     p.RLNMaxLimit,
+		RLNCapPrev: p.RLNMaxLimit,
 	}
+	s.RLNCapEpoch = s.RLNEpoch(1)
+	s.RLNRoots = []RootEntry{{Root: s.RLNRoot()}}
 	data := GenesisData(p)
 	root, _ := chunk.Root(data)
 	n := chunk.Count(uint64(len(data)))
-	s.Buckets[0] = &Bucket{ID: 0, Len: n, Records: []Record{{DataRoot: root, Size: uint64(len(data)), Start: 0, Chunks: n}}, Bytes: uint64(len(data))}
+	s.Buckets[0] = &Bucket{ID: 0, Len: n, EpochLen: n, Records: []Record{{DataRoot: root, Size: uint64(len(data)), Start: 0, Chunks: n}}, Bytes: uint64(len(data))}
 	s.Data[root] = &DataInfo{Bucket: 0, Size: uint64(len(data)), Media: types.MediaOther, Tier: params.TierPermanent, Record: 0}
 	s.VDFOut = cryptox.Tagged("cb/genesis/vdf", []byte(p.Name))
 	s.Tip = GenesisHash(p)
@@ -410,6 +427,9 @@ func (s *State) CheckSupply() error {
 	}
 	for _, b := range s.Buckets {
 		total += b.Escrow
+	}
+	for _, m := range s.Members {
+		total += m.Bond
 	}
 	total += s.Endowment + s.RepairPool
 	if total != s.Supply {

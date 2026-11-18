@@ -27,9 +27,19 @@ async function refreshStatus() {
     $('#mining').textContent = `파티션 ${m.assigned_partitions} · 패킹 ${m.packed_chunks} · VDF ${m.vdf_steps} · 찾은 블록 ${m.blocks_found} ${m.last_result || ''}`;
     const w = await api('/api/wallet');
     const box = $('#wallet'); box.replaceChildren();
-    for (const [k, v] of [['주소', w.address], ['잔액', w.balance], ['잠긴 보상', w.vesting], ['예치', w.stake], ['무료 할당', w.free_quota + ' bytes'], ['보내는 중', w.queued]]) {
+    for (const [k, v] of [['주소', w.address], ['잔액', w.balance], ['잠긴 보상', w.vesting], ['예치', w.stake], ['숙성 중 예치', w.stake_matures_at ? `${w.stake_pending} (높이 ${w.stake_matures_at}에 숙성)` : w.stake_pending], ['보내는 중', w.queued]]) {
       const d = el('div'); d.append(el('span', 'muted', k + ' '), el('span', '', String(v))); box.append(d);
     }
+    const r = await api('/api/rln');
+    const names = { none: '등록 안 됨', pending: '등록 대기', active: '활성', leaving: '해제 중', gone: '종료됨' };
+    const rb = $('#rln'); rb.replaceChildren();
+    const rows = [['상태', names[r.status] || r.status], ['회원 수', r.members]];
+    if (r.member) rows.push(['보증금', r.bond], ['이번 시간', `${r.used} / ${Math.min(r.limit, r.cap)}개 (${r.epoch_blocks_left}블록 뒤 초기화)`]);
+    if (r.status === 'leaving') rows.push(['보증금 반환 높이', r.release]);
+    if (r.pseudonym) rows.push(['가명', short(r.pseudonym)]);
+    for (const [k, v] of rows) { const d = el('div'); d.append(el('span', 'muted', k + ' '), el('span', '', String(v))); rb.append(d); }
+    $('#rlnLeave').hidden = r.status !== 'active';
+    $('#rlnJoinForm').hidden = r.member;
   } catch (e) { toast('노드에 연결할 수 없어요: ' + e.message, true); }
 }
 
@@ -47,10 +57,11 @@ function renderPost(p, isComment) {
   (p.attach || []).forEach((a) => { const img = el('img'); img.src = '/api/data/' + a; img.alt = '첨부'; img.loading = 'lazy';
     img.onerror = () => img.replaceWith(el('div', 'small muted', '첨부를 이 노드가 아직 갖고 있지 않아요 · ' + short(a))); d.append(img); });
   const m = el('div', 'meta');
-  m.append(el('span', '', short(p.author)), el('span', '', when(p.time)), el('span', '', p.lane === 'free' ? '무료 차선' : '수수료 차선'));
+  const who = p.lane === 'anon' ? (p.pseudonym ? '가명 ' + short(p.author) : '익명') : short(p.author);
+  m.append(el('span', '', who), el('span', '', when(p.time)), el('span', '', p.lane === 'anon' ? '익명 차선' : '수수료 차선'));
   if (p.pending) m.append(el('span', '', '전송 대기/미확정'));
   else {
-    const like = el('a', '', `좋아요 ${p.likes}`); like.onclick = () => post('/api/like', { id: p.id, lane: 'free' }).then(() => toast('좋아요를 보냈어요')).catch((e) => toast(e.message, true)); m.append(like);
+    const like = el('a', '', `좋아요 ${p.likes}`); like.onclick = () => post('/api/like', { id: p.id }).then(() => toast('좋아요를 보냈어요')).catch((e) => toast(e.message, true)); m.append(like);
     if (!isComment) { const c = el('a', '', `댓글 ${p.comments}`); c.onclick = () => showThread(p.id); m.append(c); }
     (p.attach || []).forEach((a) => { const x = el('a', '', '첨부 연장'); x.onclick = () => {
       const tier = prompt('연장할 보존 기간 (1y, 5y, 20y, perm)', '5y'); if (tier) post('/api/extend', { root: a, tier }).then(() => toast('연장을 보냈어요')).catch((e) => toast(e.message, true)); }; m.append(x); });
@@ -78,8 +89,9 @@ async function showThread(id) {
   card.append(close, renderPost(t.post));
   (t.comments || []).forEach((c) => { const r = renderPost(c, true); r.style.marginLeft = '16px'; card.append(r); });
   const f = el('form'); const ta = el('textarea'); ta.placeholder = '댓글'; ta.maxLength = 1000; const b = el('button', '', '댓글 쓰기');
-  f.append(ta, b);
-  f.onsubmit = (e) => { e.preventDefault(); post('/api/post', { board: t.post.board, text: ta.value, parent: id, lane: 'free' })
+  const ln = el('select'); ln.append(new Option('익명', 'anon'), new Option('수수료', 'fee'));
+  f.append(ta, ln, b);
+  f.onsubmit = (e) => { e.preventDefault(); post('/api/post', { board: t.post.board, text: ta.value, parent: id, lane: ln.value })
     .then(() => { ta.value = ''; toast('댓글을 보냈어요'); }).catch((err) => toast(err.message, true)); };
   card.append(f);
   box.append(card);
@@ -95,17 +107,25 @@ $('#postForm').onsubmit = async (e) => {
   const f = e.target;
   try {
     const attach = [];
+    let note = '';
     if (f.file.files.length) {
+      if (f.lane.value === 'anon') return toast('첨부는 수수료 차선에서만 올릴 수 있어요', true);
       const fd = new FormData(); fd.append('file', f.file.files[0]); fd.append('tier', f.tier.value);
       const r = await api('/api/upload', { method: 'POST', body: fd });
       attach.push(r.root);
+      if (r.action === 'reuse') note = ' 같은 파일이 이미 저장돼 있어 다시 올리지 않았어요.';
+      if (r.action === 'extend') note = ' 같은 파일이 이미 저장돼 있어 보존 기간만 늘렸어요.';
     }
-    await post('/api/post', { board, text: f.text.value, lane: f.lane.value, attach });
-    f.reset(); toast('글을 보냈어요. 잠시 후 미확정 글로 보여요.'); refreshPosts();
+    await post('/api/post', { board, text: f.text.value, lane: f.lane.value, pseudonym: f.pseudonym.checked, attach });
+    f.reset(); toast('글을 보냈어요. 잠시 후 미확정 글로 보여요.' + note); refreshPosts();
   } catch (err) { toast(err.message, true); }
 };
 $('#stakeForm').onsubmit = (e) => { e.preventDefault(); const op = e.submitter.dataset.op;
   post('/api/' + op, { amount: e.target.amount.value }).then(() => toast(op === 'stake' ? '예치를 보냈어요' : '예치 해제를 보냈어요')).catch((err) => toast(err.message, true)); };
+$('#rlnJoinForm').onsubmit = (e) => { e.preventDefault();
+  post('/api/rln/join', { amount: e.target.amount.value }).then(() => toast('익명 글쓰기 등록을 보냈어요')).catch((err) => toast(err.message, true)); };
+$('#rlnLeave').onclick = () => { if (confirm('등록을 해제할까요? 보증금은 해제 기간이 지난 뒤 돌아와요.'))
+  post('/api/rln/leave', {}).then(() => toast('등록 해제를 보냈어요')).catch((err) => toast(err.message, true)); };
 $('#sendForm').onsubmit = (e) => { e.preventDefault();
   post('/api/transfer', { to: e.target.to.value.trim(), amount: e.target.amount.value }).then(() => toast('송금을 보냈어요')).catch((err) => toast(err.message, true)); };
 

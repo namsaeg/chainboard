@@ -27,6 +27,7 @@ type BlockCtx struct {
 	Tips        uint64
 	Burn        uint64
 	Proofs      int
+	Slashes     int
 }
 
 // NewCtx starts a context for the next block.
@@ -104,11 +105,43 @@ type TxCost struct {
 
 func (c TxCost) Total() uint64 { return c.Base + c.Storage + c.Tip }
 
+// checkParent validates the post a comment answers.
+func (s *State) checkParent(t *types.Tx) error {
+	if t.Parent.IsZero() {
+		return nil
+	}
+	parent, ok := s.Posts[t.Parent]
+	if !ok {
+		return errors.New("comment on unknown post")
+	}
+	if !parent.Parent.IsZero() {
+		return errors.New("cannot reply to a comment")
+	}
+	return nil
+}
+
+// notePost records a post (signed or anonymous).
+func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash) {
+	s.noteDup(dupKey, h)
+	s.Posts[t.ID()] = &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h}
+	if !t.Parent.IsZero() {
+		pi := *s.Posts[t.Parent]
+		pi.Comments++
+		s.Posts[t.Parent] = &pi
+	}
+}
+
 // ApplyTx validates and applies one transaction. It is atomic: on error
 // neither the state nor ctx is modified.
 func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	if err := t.CheckStateless(); err != nil {
 		return err
+	}
+	switch t.Kind {
+	case types.TxAnonPost:
+		return s.applyAnon(t, ctx)
+	case types.TxRLNSlash:
+		return s.applySlash(t, ctx)
 	}
 	h := ctx.H
 	from := t.Sender()
@@ -125,48 +158,27 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	size := uint64(t.EncodedSize())
 	next := *ctx
 
-	// Lane accounting.
+	// Fee lane accounting.
 	var dupKey Hash
 	dupMul := uint64(1)
 	if t.Kind == types.TxPost {
 		dupKey, dupMul = s.dupMultiplier(t.Text, h)
 	}
 	cost := TxCost{Tip: t.Tip}
-	var quotaLeft uint64
-	if t.Lane == types.LaneFree {
-		if !t.IsText() {
-			return errors.New("free lane carries posts and likes only")
+	if t.Kind == types.TxProof {
+		if next.Proofs >= MaxProofTxs {
+			return errors.New("too many proofs in block")
 		}
-		if t.Tip != 0 {
-			return errors.New("free lane has no tips")
-		}
-		if next.FreeUsed+size > s.P.TextCapFree() {
-			return errors.New("free lane full")
-		}
-		qcost := mulDiv(size*dupMul, s.Congestion, 1000)
-		q := s.QuotaAt(acc, h)
-		if q < qcost {
-			return fmt.Errorf("free-lane quota too low: have %d bytes, need %d", q, qcost)
-		}
-		quotaLeft = q - qcost
-		next.FreeUsed += size
-		next.FreeStorage += TextStorageFee(s.P, s.Price, int(size))
+		next.Proofs++
 	} else {
-		if t.Kind == types.TxProof {
-			if next.Proofs >= MaxProofTxs {
-				return errors.New("too many proofs in block")
-			}
-			next.Proofs++
-		} else {
-			if next.FeeUsed+size > s.P.TextCapFee() {
-				return errors.New("fee lane full")
-			}
-			next.FeeUsed += size
+		if next.FeeUsed+size > s.P.TextCapFee() {
+			return errors.New("fee lane full")
 		}
-		cost.Base = s.BaseFee * size * dupMul
-		if t.IsText() {
-			cost.Storage = TextStorageFee(s.P, s.Price, int(size))
-		}
+		next.FeeUsed += size
+	}
+	cost.Base = s.BaseFee * size * dupMul
+	if t.IsText() {
+		cost.Storage = TextStorageFee(s.P, s.Price, int(size))
 	}
 
 	// Kind-specific checks.
@@ -184,14 +196,8 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 			return errors.New("unstake exceeds stake")
 		}
 	case types.TxPost:
-		if !t.Parent.IsZero() {
-			parent, ok := s.Posts[t.Parent]
-			if !ok {
-				return errors.New("comment on unknown post")
-			}
-			if !parent.Parent.IsZero() {
-				return errors.New("cannot reply to a comment")
-			}
+		if err := s.checkParent(t); err != nil {
+			return err
 		}
 		for _, a := range t.Attach {
 			if _, ok := s.Data[a]; !ok {
@@ -224,40 +230,42 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		if err := s.checkEpochProof(from, acc, t.Proof, h); err != nil {
 			return err
 		}
+	case types.TxRLNJoin:
+		if err := s.checkJoin(t, acc); err != nil {
+			return err
+		}
+	case types.TxRLNLeave:
+		if err := s.checkLeave(t, from); err != nil {
+			return err
+		}
 	}
 
 	// Payment checks.
-	if t.Lane == types.LaneFee {
-		total := cost.Total()
-		if total > t.MaxFee {
-			return fmt.Errorf("fee %d exceeds max fee %d", total, t.MaxFee)
-		}
-		need := total
-		if t.Kind == types.TxTransfer || t.Kind == types.TxStake {
-			need += t.Amount
-		}
-		if acc.Balance < need {
-			return fmt.Errorf("insufficient balance: have %d need %d", acc.Balance, need)
-		}
+	total := cost.Total()
+	if total > t.MaxFee {
+		return fmt.Errorf("fee %d exceeds max fee %d", total, t.MaxFee)
+	}
+	need := total
+	if t.Kind == types.TxTransfer || t.Kind == types.TxStake {
+		need += t.Amount
+	}
+	if acc.Balance < need {
+		return fmt.Errorf("insufficient balance: have %d need %d", acc.Balance, need)
 	}
 
 	// Everything checked: commit.
-	if t.Lane == types.LaneFree {
-		acc.Quota, acc.QuotaAt = quotaLeft, h
+	acc.Balance -= total
+	next.Burn += cost.Base
+	next.Tips += cost.Tip
+	if t.Kind == types.TxUpload || t.Kind == types.TxExtend {
+		if _, ok := s.Buckets[cost.Dest]; !ok {
+			s.Buckets[cost.Dest] = &Bucket{ID: cost.Dest}
+		}
+	}
+	if cost.Dest == 0 {
+		s.Endowment += cost.Storage
 	} else {
-		acc.Balance -= cost.Total()
-		next.Burn += cost.Base
-		next.Tips += cost.Tip
-		if t.Kind == types.TxUpload || t.Kind == types.TxExtend {
-			if _, ok := s.Buckets[cost.Dest]; !ok {
-				s.Buckets[cost.Dest] = &Bucket{ID: cost.Dest}
-			}
-		}
-		if cost.Dest == 0 {
-			s.Endowment += cost.Storage
-		} else {
-			s.Buckets[cost.Dest].Escrow += cost.Storage
-		}
+		s.Buckets[cost.Dest].Escrow += cost.Storage
 	}
 	acc.Nonce++
 	switch t.Kind {
@@ -286,21 +294,27 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		}
 		acc.Unbonding = append(acc.Unbonding, Unbond{Amount: t.Amount, Release: h + s.P.UnbondBlocks})
 	case types.TxPost:
-		s.noteDup(dupKey, h)
-		s.Posts[t.ID()] = &PostInfo{Board: t.Board, Author: from, Parent: t.Parent, Height: h}
-		if !t.Parent.IsZero() {
-			s.Posts[t.Parent].Comments++
-		}
+		s.notePost(t, h, dupKey)
 	case types.TxLike:
 		s.Likes[likeKey(t.Target, from)] = true
-		s.Posts[t.Target].Likes++
+		pi := *s.Posts[t.Target]
+		pi.Likes++
+		s.Posts[t.Target] = &pi
 	case types.TxUpload, types.TxExtend:
 		s.placeData(t, h)
 	case types.TxRegister:
+		if e := s.Epoch(h); acc.PartsEpoch != e+1 {
+			acc.ProveParts = acc.Partitions
+			acc.PartsEpoch = e + 1
+		}
 		acc.Partitions = append([]uint64(nil), t.Partitions...)
 	case types.TxProof:
 		acc.LastProof = s.Epoch(h)
 		acc.ProofsInEpoch = s.Epoch(h) + 1
+	case types.TxRLNJoin:
+		s.applyJoin(t, from, acc, h)
+	case types.TxRLNLeave:
+		s.applyLeave(t, h)
 	}
 	s.Accounts[from] = acc
 	*ctx = next
@@ -450,19 +464,41 @@ func MeetsTarget(sol Hash, target *big.Int, weight uint64) bool {
 	return new(big.Int).SetBytes(sol[:]).Cmp(t) < 0
 }
 
+// epochChallenge is what a storage node must prove with a proof transaction.
+// The challenge is fixed for the whole epoch, so a proof can travel the stem
+// and wait in pools: the seed, the challenged partitions (registrations count
+// from the next epoch) and the partition lengths are all taken as of the
+// epoch's start. A point that lands on extended-away or expired data is
+// redrawn, a few times, so the node is not blamed for it.
 func (s *State) epochChallenge(a Address, acc *Account) (Challenge, uint64, bool) {
-	if len(acc.Partitions) == 0 {
+	h := s.Height + 1
+	e := s.Epoch(h)
+	parts := acc.Partitions
+	if acc.PartsEpoch == e+1 {
+		parts = acc.ProveParts
+	}
+	if len(parts) == 0 {
 		return Challenge{}, 0, false
 	}
-	seed := cryptox.Tagged("cb/epochseed", cryptox.U64(s.Epoch(s.Height+1)), s.EpochSeed[:])
-	c0 := cryptox.Tagged("cb/epochchal", seed[:], a[:])
-	part := acc.Partitions[new(big.Int).SetBytes(c0[8:16]).Uint64()%uint64(len(acc.Partitions))]
-	bucket, start, length, ok := s.PartitionRange(part)
-	if !ok {
-		return Challenge{}, 0, false
+	seed := cryptox.Tagged("cb/epochseed", cryptox.U64(e), s.EpochSeed[:])
+	for try := uint64(0); try < 8; try++ {
+		c0 := cryptox.Tagged("cb/epochchal", seed[:], a[:], cryptox.U64(try))
+		part := parts[new(big.Int).SetBytes(c0[8:16]).Uint64()%uint64(len(parts))]
+		bucket, idx := SplitPartition(part)
+		b, ok := s.Buckets[bucket]
+		if !ok {
+			continue
+		}
+		start := idx * s.P.PartitionChunks
+		if start >= b.EpochLen {
+			continue
+		}
+		length := min(s.P.PartitionChunks, b.EpochLen-start)
+		if c, ok := s.pointAt(c0, bucket, start, length, h); ok {
+			return c, part, true
+		}
 	}
-	c, ok := s.pointAt(c0, bucket, start, length, s.Height+1)
-	return c, part, ok
+	return Challenge{}, 0, false
 }
 
 // EpochChallenge tells a storage node what to prove this epoch.
@@ -549,6 +585,17 @@ const MaxFutureSeconds = 2 * 60 * 60
 
 // ApplyBlock validates a block against this state and applies it. now is the
 // local unix time (0 skips the future-time check, used when replaying).
+// ReplayBlock applies a block this node validated in full before: one read
+// back from its own database at start-up, or re-applied to rebuild a pruned
+// state. The VDF, the block signature, the packed storage proof and the
+// anonymous-post proofs are not checked again; everything that changes the
+// state is. Without this, start-up would redo every block's VDF.
+func (s *State) ReplayBlock(b *types.Block) error {
+	s.replay = true
+	defer func() { s.replay = false }()
+	return s.ApplyBlock(b, 0)
+}
+
 func (s *State) ApplyBlock(b *types.Block, now int64) error {
 	hd := &b.Header
 	h := s.Height + 1
@@ -571,14 +618,14 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 	if len(hd.VDFOutputs) == 0 || hd.VDFStep != s.VDFStep+uint64(len(hd.VDFOutputs)) {
 		return errors.New("bad VDF step count")
 	}
-	if !vdf.VerifyChain(vdf.Reseed(s.VDFOut, s.Tip), hd.VDFOutputs, s.P.VDFIterations) {
+	if !s.replay && !vdf.VerifyChain(vdf.Reseed(s.VDFOut, s.Tip), hd.VDFOutputs, s.P.VDFIterations) {
 		return errors.New("bad VDF outputs")
 	}
 	if len(hd.Miner) != 32 || len(hd.Sig) != 64 {
 		return errors.New("bad miner key")
 	}
 	sh := hd.SigHash()
-	if !cryptox.Verify(hd.Miner, sh[:], hd.Sig) {
+	if !s.replay && !cryptox.Verify(hd.Miner, sh[:], hd.Sig) {
 		return errors.New("bad block signature")
 	}
 	miner := hd.MinerAddr()
@@ -589,7 +636,7 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 	if !ok || c.Position != hd.Sol.Position || c.Sub != int(hd.Sol.Sub) {
 		return errors.New("solution does not answer its challenge")
 	}
-	if !s.VerifyPacked(c, miner, hd.Sol.PackedSub, hd.Sol.Path) {
+	if !s.replay && !s.VerifyPacked(c, miner, hd.Sol.PackedSub, hd.Sol.Path) {
 		return errors.New("solution chunk does not verify")
 	}
 	if !MeetsTarget(SolutionHash(c.H0, hd.Sol.PackedSub), target, c.Weight) {
@@ -618,6 +665,8 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	h := ctx.H
 	hd := &b.Header
+
+	s.releaseExits(h)
 
 	// Expire term buckets.
 	var ids []uint32
@@ -695,7 +744,13 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 			}
 			a.Vesting = nil
 		}
+	}
+	// The last block of an epoch fixes the next epoch's challenge inputs.
+	if (h+1)%s.P.ProofEpoch == 0 {
 		s.EpochSeed = hd.Hash()
+		for _, b := range s.Buckets {
+			b.EpochLen = b.Len
+		}
 	}
 
 	// Price, base fee, congestion, proven storage.
@@ -710,6 +765,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	s.Price = NextPrice(s.P, s.Price, &s.PriceEMA, ObservedPrice(s.P, reward+payouts, s.Proven))
 	s.BaseFee = NextBaseFee(s.P, s.BaseFee, ctx.FeeUsed)
 	s.Congestion = NextCongestion(s.P, s.Congestion, ctx.FreeUsed)
+	s.rolloverEpoch(h + 1)
 
 	s.Recent = append(s.Recent, HeaderMeta{Time: hd.Time, Target: hd.Target, Steps: steps})
 	if keep := s.P.RetargetWindow + 12; len(s.Recent) > keep {

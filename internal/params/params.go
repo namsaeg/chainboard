@@ -77,14 +77,20 @@ type Params struct {
 
 	// Text lanes.
 	TextBytesPerBlock uint64
-	FreeLanePermille  uint64 // share of text capacity for the free (stake) lane
+	FreeLanePermille  uint64 // share of text capacity for the anonymous (RLN) lane
 	BaseFeeInit       uint64 // units per byte, fee lane
 	BaseFeeMin        uint64
-	QuotaPerCoinDay   uint64 // free-lane bytes per staked coin per regen window
-	QuotaRegenBlocks  uint64 // quota refills fully over this many blocks (one day)
 	StakeAgingBlocks  uint64
 	UnbondBlocks      uint64
 	DupWindowBlocks   uint64
+
+	// Anonymous lane (RLN). A membership bonds stake for a per-epoch message
+	// limit; posts prove membership without revealing which member wrote them.
+	RLNEpochBlocks   uint64 // blocks per rate-limit epoch
+	RLNMaxLimit      uint64 // most messages per epoch of one membership (≤ 65535)
+	RLNBondPerMsg    uint64 // bond needed per message of limit
+	RLNRootWindow    uint64 // blocks a replaced membership root stays usable in proofs
+	RLNSlashPermille uint64 // share of a slashed bond paid to the block's miner; the rest is burned
 
 	// Media.
 	MinMediaPerBlock  uint64 // bytes; floor of the automatic media cap
@@ -146,7 +152,7 @@ func Devnet() *Params {
 	p.VestingBlocks = 50
 	p.RampBlocks = 20
 	p.DupWindowBlocks = 30
-	p.QuotaRegenBlocks = 10
+	p.RLNEpochBlocks = 30 // one minute
 	return p
 }
 
@@ -177,8 +183,11 @@ func (p *Params) setEconomics() {
 	p.FreeLanePermille = 300
 	p.BaseFeeInit = 10
 	p.BaseFeeMin = 1
-	p.QuotaPerCoinDay = 1000
-	p.QuotaRegenBlocks = p.BlocksPerDay
+	p.RLNEpochBlocks = p.BlocksPerDay / 24 // one hour
+	p.RLNMaxLimit = 30                     // 30 posts an hour = 720 a day
+	p.RLNBondPerMsg = Coin
+	p.RLNRootWindow = 15 // covers the send delay (≤ 5 min) and propagation
+	p.RLNSlashPermille = 500
 	p.StakeAgingBlocks = 7 * p.BlocksPerDay
 	p.UnbondBlocks = 30 * p.BlocksPerDay
 	p.DupWindowBlocks = p.BlocksPerDay
@@ -200,6 +209,9 @@ func TierMonths(t uint16) (months uint64, permanent bool, ok bool) {
 	}
 	return 0, false, false
 }
+
+// RLNScope separates this network's nullifiers from every other network's.
+func (p *Params) RLNScope() uint64 { return uint64(p.Magic) }
 
 // TextCapFree and TextCapFee split the per-block text capacity between lanes.
 func (p *Params) TextCapFree() uint64 { return p.TextBytesPerBlock * p.FreeLanePermille / 1000 }

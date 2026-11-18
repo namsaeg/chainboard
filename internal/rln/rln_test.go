@@ -88,7 +88,37 @@ func TestTreeRemove(t *testing.T) {
 	if tr.Root() != empty.Root() || r1 == empty.Root() {
 		t.Fatal("zeroed tree root mismatch")
 	}
-	if len(tr.nodes) != 0 {
-		t.Fatalf("leftover nodes %d", len(tr.nodes))
+	if tr.nodes() != 0 {
+		t.Fatalf("leftover nodes %d", tr.nodes())
+	}
+}
+
+func TestTreeCloneIsolation(t *testing.T) {
+	a := NewTree()
+	for i := 0; i < 600; i++ {
+		var e fr.Element
+		e.SetUint64(uint64(i + 1))
+		a.Append(e)
+	}
+	ra := a.Root()
+	b := a.Clone()
+	var z fr.Element
+	z.SetUint64(999)
+	b.Set(5, z)
+	b.Append(z)
+	if a.Root() != ra || b.Root() == ra {
+		t.Fatal("clone write leaked into the original")
+	}
+	a.Set(7, z)
+	if b.Leaf(7) == z {
+		t.Fatal("original write leaked into the clone")
+	}
+	// Rebuilding b from scratch gives the same root: paths are consistent.
+	c := NewTree()
+	for i := uint32(0); i < b.Next; i++ {
+		c.Append(b.Leaf(i))
+	}
+	if c.Root() != b.Root() {
+		t.Fatal("copy-on-write tree root differs from a fresh build")
 	}
 }

@@ -44,6 +44,9 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/stake", s.stake)
 	mux.HandleFunc("/api/unstake", s.stake)
 	mux.HandleFunc("/api/transfer", s.transfer)
+	mux.HandleFunc("/api/rln", s.rlnStatus)
+	mux.HandleFunc("/api/rln/join", s.rlnJoin)
+	mux.HandleFunc("/api/rln/leave", s.rlnLeave)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return guard(mux)
@@ -120,7 +123,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		"p2p_listen":         n.Host.Addr(),
 		"storage_price":      coins(st.Price) + " / raw GB-year",
 		"base_fee_per_byte":  st.BaseFee,
-		"free_lane_pressure": float64(st.Congestion) / 1000,
+		"anon_lane_pressure": float64(st.Congestion) / 1000,
 		"media_cap_block":    st.MediaCapPerBlock(),
 		"file_cap":           st.FileCap(),
 		"supply":             coins(st.Supply),
@@ -137,20 +140,28 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 func (s *server) wallet(w http.ResponseWriter, r *http.Request) {
 	n := s.n
 	addr := n.Wallet.Address()
-	st := n.Pool.PendingState()
+	st := n.WalletState()
 	acc := st.Peek(addr)
 	h := st.Height + 1
-	writeJSON(w, map[string]any{
+	mature, pending := acc.StakeMature, acc.StakePending
+	if pending > 0 && h >= acc.PendingSince+st.P.StakeAgingBlocks {
+		mature, pending = mature+pending, 0 // aged; settles with the next transaction
+	}
+	out := map[string]any{
 		"address":       addr.String(),
 		"balance":       coins(acc.Balance),
 		"vesting":       coins(st.Locked(&acc, h)),
 		"claimable":     coins(st.Claimable(&acc, h)),
-		"stake":         coins(acc.StakeMature + acc.StakePending),
-		"stake_pending": coins(acc.StakePending),
-		"free_quota":    st.QuotaAt(&acc, h),
+		"stake":         coins(mature + pending),
+		"stake_mature":  coins(mature),
+		"stake_pending": coins(pending),
 		"nonce":         acc.Nonce,
-		"queued":        len(n.Queued()),
-	})
+		"queued":        n.Outgoing(),
+	}
+	if pending > 0 {
+		out["stake_matures_at"] = acc.PendingSince + st.P.StakeAgingBlocks
+	}
+	writeJSON(w, out)
 }
 
 func (s *server) boards(w http.ResponseWriter, r *http.Request) {
@@ -168,18 +179,12 @@ func (s *server) board(w http.ResponseWriter, r *http.Request) {
 }
 
 type postReq struct {
-	Board  string   `json:"board"`
-	Text   string   `json:"text"`
-	Parent string   `json:"parent"`
-	Lane   string   `json:"lane"`
-	Attach []string `json:"attach"`
-}
-
-func lane(s string) types.Lane {
-	if s == "free" {
-		return types.LaneFree
-	}
-	return types.LaneFee
+	Board     string   `json:"board"`
+	Text      string   `json:"text"`
+	Parent    string   `json:"parent"`
+	Lane      string   `json:"lane"` // "anon" (default) or "fee"
+	Pseudonym bool     `json:"pseudonym"`
+	Attach    []string `json:"attach"`
 }
 
 func (s *server) post(w http.ResponseWriter, r *http.Request) {
@@ -206,15 +211,29 @@ func (s *server) post(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("text must be UTF-8 and at most 1024 bytes"))
 		return
 	}
-	t := &types.Tx{Kind: types.TxPost, Lane: lane(req.Lane), Board: strings.TrimSpace(req.Board), Text: []byte(req.Text)}
+	var parent cryptox.Hash
 	if req.Parent != "" {
 		h, err := cryptox.ParseHash(req.Parent)
 		if err != nil {
 			fail(w, 400, err)
 			return
 		}
-		t.Parent = h
+		parent = h
 	}
+	board := strings.TrimSpace(req.Board)
+	if req.Lane != "fee" {
+		if len(req.Attach) > 0 {
+			fail(w, 400, errors.New("anonymous posts are text only; use the fee lane for attachments"))
+			return
+		}
+		if err := s.n.AnonPost(node.AnonRequest{Board: board, Text: req.Text, Parent: parent, Pseudo: req.Pseudonym}); err != nil {
+			fail(w, 400, err)
+			return
+		}
+		writeJSON(w, map[string]bool{"queued": true})
+		return
+	}
+	t := &types.Tx{Kind: types.TxPost, Board: board, Text: []byte(req.Text), Parent: parent}
 	for _, a := range req.Attach {
 		h, err := cryptox.ParseHash(a)
 		if err != nil {
@@ -231,23 +250,7 @@ func (s *server) post(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) pending(w http.ResponseWriter, r *http.Request) {
-	st := s.n.Chain.Tip()
-	var out []node.PostView
-	for _, t := range s.n.Queued() {
-		if t.Kind == types.TxPost {
-			v := node.View(t, 0, 0)
-			v.Pending = true
-			out = append(out, *v)
-		}
-	}
-	for _, t := range s.n.Pool.Pending() {
-		if t.Kind == types.TxPost {
-			v := node.View(t, st.Height+1, 0)
-			v.Pending = true
-			out = append(out, *v)
-		}
-	}
-	writeJSON(w, out)
+	writeJSON(w, s.n.PendingPosts())
 }
 
 func (s *server) data(w http.ResponseWriter, r *http.Request) {
@@ -345,8 +348,7 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) like(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID   string `json:"id"`
-		Lane string `json:"lane"`
+		ID string `json:"id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -357,7 +359,7 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.Send(&types.Tx{Kind: types.TxLike, Target: id, Lane: lane(req.Lane)}); err != nil {
+	if err := s.n.Send(&types.Tx{Kind: types.TxLike, Target: id}); err != nil {
 		fail(w, 400, err)
 		return
 	}
@@ -408,6 +410,53 @@ func (s *server) transfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.n.Send(&types.Tx{Kind: types.TxTransfer, To: to, Amount: amt}); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"queued": true})
+}
+
+func (s *server) rlnStatus(w http.ResponseWriter, r *http.Request) {
+	info := s.n.RLNStatus()
+	writeJSON(w, map[string]any{
+		"member": info.Member, "status": info.Status, "commitment": info.Commitment,
+		"limit": info.Limit, "bond": coins(info.Bond), "release": info.Release,
+		"epoch": info.Epoch, "cap": info.Cap, "used": info.Used, "epoch_blocks_left": info.EpochLeft,
+		"members": info.Members, "pseudonym": info.Pseudonym,
+		"bond_per_message": coins(s.n.P.RLNBondPerMsg), "max_limit": s.n.P.RLNMaxLimit,
+	})
+}
+
+func (s *server) rlnJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, 405, errors.New("POST only"))
+		return
+	}
+	var req struct {
+		Amount string `json:"amount"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	amt, err := parseCoins(req.Amount)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if err := s.n.JoinRLN(amt); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"queued": true})
+}
+
+func (s *server) rlnLeave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, 405, errors.New("POST only"))
+		return
+	}
+	if err := s.n.LeaveRLN(); err != nil {
 		fail(w, 400, err)
 		return
 	}

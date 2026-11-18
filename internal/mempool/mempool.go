@@ -23,6 +23,11 @@ type DataCheck func(t *types.Tx) error
 
 // Pool is safe for concurrent use.
 type Pool struct {
+	// OnDoubleSignal, if set, is called (outside the pool lock) when an
+	// anonymous post double-signals: the member's secret can be recovered
+	// and the member slashed.
+	OnDoubleSignal func(*state.DoubleSignal)
+
 	mu      sync.Mutex
 	txs     map[Hash]*item
 	check   DataCheck
@@ -50,6 +55,15 @@ var ErrWaitingData = errors.New("mempool: waiting for data chunks")
 
 // Add validates a transaction against the pending state and keeps it.
 func (p *Pool) Add(t *types.Tx) error {
+	err := p.add(t)
+	var ds *state.DoubleSignal
+	if errors.As(err, &ds) && p.OnDoubleSignal != nil {
+		p.OnDoubleSignal(ds)
+	}
+	return err
+}
+
+func (p *Pool) add(t *types.Tx) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	id := t.ID()
@@ -100,16 +114,27 @@ func (p *Pool) ordered() []*item {
 }
 
 // Reset re-validates the pool on a new tip, dropping what no longer applies
-// (mined, conflicting or expired).
+// (mined, conflicting or expired). A pooled anonymous post that now collides
+// with a mined one is still reported as a double signal.
 func (p *Pool) Reset(tip *state.State) {
+	var signals []*state.DoubleSignal
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.tip = tip
 	p.pending = tip.Clone()
 	p.ctx = p.pending.NewCtx()
 	for _, it := range p.ordered() {
 		if err := p.pending.ApplyTx(it.tx, p.ctx); err != nil {
 			delete(p.txs, it.tx.ID())
+			var ds *state.DoubleSignal
+			if errors.As(err, &ds) {
+				signals = append(signals, ds)
+			}
+		}
+	}
+	p.mu.Unlock()
+	if p.OnDoubleSignal != nil {
+		for _, ds := range signals {
+			p.OnDoubleSignal(ds)
 		}
 	}
 }
@@ -125,9 +150,9 @@ func (p *Pool) Template(tip *state.State) []*types.Tx {
 	rewardCap := tip.BlockReward(ctx.H)
 	var out []*types.Tx
 	for _, it := range items {
-		if it.tx.Lane == types.LaneFree &&
+		if it.tx.Kind == types.TxAnonPost &&
 			ctx.FreeStorage+state.TextStorageFee(st.P, st.Price, it.tx.EncodedSize()) > rewardCap {
-			continue // free-lane storage is paid from this block's issuance
+			continue // anonymous-lane storage is paid from this block's issuance
 		}
 		if st.ApplyTx(it.tx, ctx) == nil {
 			out = append(out, it.tx)
@@ -152,6 +177,13 @@ func (p *Pool) PendingState() *state.State {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pending.Clone()
+}
+
+// TipHash is the block the pool is built on.
+func (p *Pool) TipHash() Hash {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tip.Tip
 }
 
 // Account reads one account from the pending state (cheap, no copy of the state).

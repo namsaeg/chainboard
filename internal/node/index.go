@@ -21,7 +21,8 @@ type PostView struct {
 	Time     int64    `json:"time"`
 	Likes    uint64   `json:"likes"`
 	Comments uint64   `json:"comments"`
-	Lane     string   `json:"lane"`
+	Lane     string   `json:"lane"`                // "anon" or "fee"
+	Pseudo   bool     `json:"pseudonym,omitempty"` // author is a pseudonym key
 	Pending  bool     `json:"pending,omitempty"`
 }
 
@@ -50,10 +51,14 @@ func (ix *Index) reset() {
 
 // View converts a post transaction.
 func View(t *types.Tx, height uint64, tm int64) *PostView {
-	v := &PostView{ID: t.ID().String(), Board: t.Board, Text: string(t.Text), Author: t.Sender().String(),
+	v := &PostView{ID: t.ID().String(), Board: t.Board, Text: string(t.Text), Author: t.Author().String(),
 		Height: height, Time: tm, Lane: "fee"}
-	if t.Lane == types.LaneFree {
-		v.Lane = "free"
+	if t.Kind == types.TxAnonPost {
+		v.Lane = "anon"
+		v.Author = ""
+		if len(t.PseudoPub) > 0 {
+			v.Author, v.Pseudo = t.Author().String(), true
+		}
 	}
 	if !t.Parent.IsZero() {
 		v.Parent = t.Parent.String()
@@ -83,7 +88,7 @@ func (ix *Index) Sync(c *chain.Chain) {
 			break
 		}
 		for _, t := range b.Txs {
-			if t.Kind != types.TxPost {
+			if !t.IsPost() {
 				continue
 			}
 			id := t.ID()
@@ -145,4 +150,45 @@ func (ix *Index) Thread(id cryptox.Hash) (*PostView, []PostView) {
 	sort.SliceStable(cs, func(i, j int) bool { return cs[i].Height < cs[j].Height })
 	cp := *p
 	return &cp, cs
+}
+
+// PendingPosts lists posts not mined yet: ours still queued, travelling the
+// stem or waiting to be proven again, and everyone's in the pool.
+func (n *Node) PendingPosts() []PostView {
+	var out []PostView
+	seen := map[cryptox.Hash]bool{}
+	add := func(t *types.Tx) {
+		if (t.Kind != types.TxPost && t.Kind != types.TxAnonPost) || seen[t.ID()] {
+			return
+		}
+		seen[t.ID()] = true
+		v := View(t, 0, 0)
+		v.Pending = true
+		out = append(out, *v)
+	}
+	for _, t := range n.Pool.Pending() {
+		add(t)
+	}
+	n.mu.Lock()
+	var own []*types.Tx
+	for _, s := range n.sent {
+		own = append(own, s.tx)
+	}
+	for _, q := range n.queue {
+		if q.tx != nil {
+			own = append(own, q.tx)
+		}
+	}
+	n.mu.Unlock()
+	for _, t := range own {
+		add(t)
+	}
+	for _, a := range n.unsentAnon() {
+		v := PostView{Board: a.Board, Text: a.Text, Lane: "anon", Pseudo: a.Pseudo, Pending: true}
+		if !a.Parent.IsZero() {
+			v.Parent = a.Parent.String()
+		}
+		out = append(out, v)
+	}
+	return out
 }

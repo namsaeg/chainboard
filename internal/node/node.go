@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
 	"github.com/namsaeg/chainboard/internal/chain"
 	"github.com/namsaeg/chainboard/internal/chunk"
@@ -53,16 +55,34 @@ type Node struct {
 	Wallet *cryptox.Key
 	Index  *Index
 
-	mu       sync.Mutex
-	queue    []queued // own transactions waiting for their send time
-	nextFree time.Time
-	regFor   []uint64 // partitions we last registered
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	dir        string
+	mu         sync.Mutex
+	queue      []queued           // own transactions waiting for their send time
+	sent       map[uint64]*sentTx // own account transactions sent but not yet mined, by nonce
+	lastOutbox []byte             // outbox.json as last written
+	nextFree   time.Time
+	regFor     []uint64 // partitions we last registered
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+
+	rlnMu  sync.Mutex // guards the fields below
+	secret *fr.Element
+	usage  rlnUsage
+	pseudo *cryptox.Key
+	outbox []*outboxItem
 }
 
+// sentTx is an own transaction that left through the stem. It does not enter
+// our own pool until it comes back as fluff, so its nonce is tracked here.
+type sentTx struct {
+	tx *types.Tx
+	at time.Time
+}
+
+// queued is an own transaction (tx) or anonymous post (anon) waiting to leave.
 type queued struct {
 	tx     *types.Tx
+	anon   *AnonRequest
 	sendAt time.Time
 }
 
@@ -96,8 +116,16 @@ func New(cfg Config) (*Node, error) {
 	}
 	st, err := store.Open(dir)
 	if err != nil {
+		ch.Close()
 		return nil, err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			st.Close()
+			ch.Close()
+		}
+	}()
 	// 0.1.0 kept data as files under store/; import what is complete.
 	if old := filepath.Join(dir, "store"); dirExists(filepath.Join(old, "data")) {
 		if n, err := st.ImportV010(old); err == nil {
@@ -110,8 +138,18 @@ func New(cfg Config) (*Node, error) {
 			return nil, err
 		}
 	}
-	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, Index: NewIndex()}
+	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, Index: NewIndex(), dir: dir,
+		sent: map[uint64]*sentTx{}}
+	if err := n.loadRLN(); err != nil {
+		return nil, err
+	}
+	if k, err := os.Stat(filepath.Join(dir, "pseudonym.key")); err == nil && !k.IsDir() {
+		if n.pseudo, err = cryptox.LoadOrCreateKey(filepath.Join(dir, "pseudonym.key")); err != nil {
+			return nil, err
+		}
+	}
 	n.Pool = mempool.New(ch.Tip(), n.checkUpload)
+	n.Pool.OnDoubleSignal = n.onDoubleSignal
 	host, err := p2p.New(p2p.Config{P: p, Chain: ch, Pool: n.Pool, Store: st,
 		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo})
 	if err != nil {
@@ -121,6 +159,8 @@ func New(cfg Config) (*Node, error) {
 	n.Miner = &miner.Miner{Chain: ch, Pool: n.Pool, Store: st, Key: wallet, PledgeBytes: cfg.PledgeBytes,
 		OnBlock: host.BroadcastBlock, Logf: cfg.Logf}
 	n.Index.Sync(ch)
+	n.loadOutbox()
+	ok = true
 	return n, nil
 }
 
@@ -170,6 +210,7 @@ func (n *Node) Stop() {
 	}
 	n.Host.Stop()
 	n.wg.Wait()
+	n.saveOutbox()
 	_ = n.Chain.Close()
 	_ = n.Store.Close()
 }
@@ -182,9 +223,14 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 		select {
 		case <-ctx.Done():
 			return
-		case st := <-tips:
-			n.Pool.Reset(st)
+		case <-tips:
+			// Work from the newest tip, not the notified one: a backlog of
+			// notifications must not move the pool backwards.
+			st := n.Chain.Tip()
+			n.syncPool()
 			n.Index.Sync(n.Chain)
+			n.tendSent(st)
+			n.tendOutbox(st)
 			n.storageDuties(st)
 		case <-t.C:
 			n.storageDuties(n.Chain.Tip())
@@ -210,9 +256,25 @@ func (n *Node) storageDuties(st *state.State) {
 			n.regFor = assigned
 		}
 	}
-	if tx, ok := n.Miner.EpochProof(st, n.nextNonce()); ok {
-		_ = n.Host.SubmitOwn(tx)
+	if n.proofTravelling(st.Epoch(st.Height + 1)) {
+		return
 	}
+	if tx, ok := n.Miner.EpochProof(st, n.nextNonce()); ok {
+		_ = n.submit(tx)
+	}
+}
+
+// proofTravelling reports whether our storage proof for epoch is sent but not
+// mined yet.
+func (n *Node) proofTravelling(epoch uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, s := range n.sent {
+		if s.tx.Kind == types.TxProof && s.tx.Proof.Epoch == epoch {
+			return true
+		}
+	}
+	return false
 }
 
 func sameParts(a, b []uint64) bool {
@@ -227,23 +289,122 @@ func sameParts(a, b []uint64) bool {
 	return true
 }
 
+// syncPool rebuilds the pool on the chain tip when a block arrived that the
+// tip watcher has not handled yet, so own transactions see current balances.
+func (n *Node) syncPool() {
+	if tip := n.Chain.Tip(); n.Pool.TipHash() != tip.Tip {
+		n.Pool.Reset(tip)
+	}
+}
+
 // nextNonce is the nonce for a new own transaction: pending pool state plus
-// what is still queued here.
+// what is still queued or travelling the stem.
 func (n *Node) nextNonce() uint64 {
-	base := n.Pool.Account(n.Wallet.Address()).Nonce
+	n.syncPool()
+	pooled := n.Pool.Account(n.Wallet.Address()).Nonce
+	next := pooled
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, q := range n.queue {
-		if q.tx.Nonce >= base {
-			base = q.tx.Nonce + 1
+		if q.tx != nil && q.tx.Nonce >= next {
+			next = q.tx.Nonce + 1
 		}
 	}
-	return base
+	for nonce := range n.sent {
+		if nonce >= next {
+			next = nonce + 1
+		}
+	}
+	return next
+}
+
+// submit sends an own account transaction through the stem and remembers it
+// until it is mined.
+func (n *Node) submit(t *types.Tx) error {
+	if err := n.Host.SubmitOwn(t); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.sent[t.Nonce] = &sentTx{tx: t, at: time.Now()}
+	n.mu.Unlock()
+	return nil
+}
+
+// resendOwnAfter is how long a sent transaction may stay out of our pool
+// before it is sent again: past the longest embargo, it was dropped.
+func (n *Node) resendOwnAfter() time.Duration {
+	if n.cfg.Embargo > 0 {
+		return 4*n.cfg.Embargo + 2*time.Second
+	}
+	return 2 * time.Minute
+}
+
+// tendSent forgets mined own transactions and sends again the ones the
+// network dropped. One that can no longer apply blocks every later nonce, so
+// it and the ones after it are given up (and logged).
+func (n *Node) tendSent(tip *state.State) {
+	addr := n.Wallet.Address()
+	mined := tip.Peek(addr).Nonce
+	n.mu.Lock()
+	var stale []*types.Tx
+	for nonce, s := range n.sent {
+		switch {
+		case nonce < mined:
+			delete(n.sent, nonce)
+		case time.Since(s.at) > n.resendOwnAfter() && !n.Pool.Has(s.tx.ID()):
+			stale = append(stale, s.tx)
+			s.at = time.Now()
+		}
+	}
+	n.mu.Unlock()
+	if len(stale) == 0 {
+		return
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i].Nonce < stale[j].Nonce })
+	trial := n.Pool.PendingState()
+	for _, t := range stale {
+		err := trial.ApplyTx(t, trial.NewCtx())
+		if err == nil {
+			_ = n.Host.SubmitOwn(t)
+			continue
+		}
+		if t.Nonce != trial.Peek(addr).Nonce {
+			continue // waits on an earlier one still travelling
+		}
+		// Fill the nonce with a no-op so the later ones (unchanged, as they
+		// may still be travelling) can apply. Re-signing them under new
+		// nonces could let both copies be mined.
+		filler := &types.Tx{Kind: types.TxTransfer, To: addr, Lane: types.LaneFee, Nonce: t.Nonce}
+		if n.finish(filler) == nil && trial.ApplyTx(filler, trial.NewCtx()) == nil && n.Host.SubmitOwn(filler) == nil {
+			n.mu.Lock()
+			n.sent[t.Nonce] = &sentTx{tx: filler, at: time.Now()}
+			n.mu.Unlock()
+			n.cfg.Logf("node: %s (nonce %d) can no longer apply (%v); replaced by a no-op", t.Kind, t.Nonce, err)
+			continue
+		}
+		n.mu.Lock()
+		dropped := 0
+		for nonce := range n.sent {
+			if nonce >= t.Nonce {
+				delete(n.sent, nonce)
+				dropped++
+			}
+		}
+		n.mu.Unlock()
+		n.cfg.Logf("node: %s (nonce %d) can no longer apply: %v; gave up %d transaction(s)", t.Kind, t.Nonce, err, dropped)
+		return
+	}
 }
 
 // prepare fills in nonce and fee and signs.
 func (n *Node) prepare(t *types.Tx) error {
+	n.syncPool()
 	t.Nonce = n.nextNonce()
+	return n.finish(t)
+}
+
+// finish fills in the fee of a transaction whose nonce is set, and signs.
+func (n *Node) finish(t *types.Tx) error {
 	if t.Lane == types.LaneFee && t.MaxFee == 0 {
 		st := n.Pool.PendingState()
 		// Quote with headroom for base-fee moves while the transaction waits.
@@ -262,6 +423,7 @@ func (n *Node) prepare(t *types.Tx) error {
 // Quote prices a fee-lane transaction at the current pending state: base fee,
 // storage and tip, without the amount it moves.
 func (n *Node) Quote(t *types.Tx) (uint64, error) {
+	n.syncPool()
 	st := n.Pool.PendingState()
 	acc := st.Account(n.Wallet.Address())
 	acc.Balance = ^uint64(0) >> 2 // quote even without funds
@@ -295,18 +457,7 @@ func (n *Node) Send(t *types.Tx) error {
 			return err
 		}
 	}
-	delay := time.Duration(0)
-	if n.cfg.SendDelayMax > 0 {
-		delay = time.Duration(mrand.Int63n(int64(n.cfg.SendDelayMax)))
-	}
-	at := time.Now().Add(delay)
-	n.mu.Lock()
-	if at.Before(n.nextFree) {
-		at = n.nextFree
-	}
-	n.nextFree = at
-	n.queue = append(n.queue, queued{tx: t, sendAt: at})
-	n.mu.Unlock()
+	n.enqueue(queued{tx: t})
 	return nil
 }
 
@@ -314,42 +465,62 @@ func (n *Node) sendNow(t *types.Tx) error {
 	if err := n.prepare(t); err != nil {
 		return err
 	}
-	return n.Host.SubmitOwn(t)
+	return n.submit(t)
 }
 
 func (n *Node) sendLoop(ctx context.Context) {
 	defer n.wg.Done()
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
-	for {
+	for tick := 0; ; tick++ {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+		if tick%5 == 0 {
+			n.saveOutbox()
+		}
 		now := time.Now()
-		var due []*types.Tx
+		var due []queued
 		n.mu.Lock()
 		for len(n.queue) > 0 && !n.queue[0].sendAt.After(now) {
-			due = append(due, n.queue[0].tx)
+			due = append(due, n.queue[0])
 			n.queue = n.queue[1:]
 		}
 		n.mu.Unlock()
-		for _, tx := range due {
-			if err := n.Host.SubmitOwn(tx); err != nil {
-				n.cfg.Logf("node: send %s: %v", tx.Kind, err)
+		for _, q := range due {
+			if q.anon != nil {
+				n.leaveAnon(*q.anon)
+				continue
+			}
+			if err := n.submit(q.tx); err != nil {
+				n.cfg.Logf("node: send %s: %v", q.tx.Kind, err)
 			}
 		}
 	}
+}
+
+// WalletState is the pending state as our wallet will see it once our queued
+// and travelling transactions apply.
+func (n *Node) WalletState() *state.State { return n.trialState() }
+
+// Outgoing counts own transactions not mined yet (queued or travelling).
+func (n *Node) Outgoing() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.queue) + len(n.sent)
 }
 
 // Queued returns own transactions still waiting to leave.
 func (n *Node) Queued() []*types.Tx {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	out := make([]*types.Tx, len(n.queue))
-	for i, q := range n.queue {
-		out[i] = q.tx
+	var out []*types.Tx
+	for _, q := range n.queue {
+		if q.tx != nil {
+			out = append(out, q.tx)
+		}
 	}
 	return out
 }
@@ -361,13 +532,25 @@ type UploadResult struct {
 	Until  uint64 // height the data is kept until; 0 means permanent
 }
 
-// trialState is the pending state with our still-queued transactions applied.
+// trialState is the pending state with our travelling and still-queued
+// transactions applied.
 func (n *Node) trialState() *state.State {
+	n.syncPool()
 	st := n.Pool.PendingState()
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	var travelling []*types.Tx
+	for _, s := range n.sent {
+		travelling = append(travelling, s.tx)
+	}
+	sort.Slice(travelling, func(i, j int) bool { return travelling[i].Nonce < travelling[j].Nonce })
+	for _, t := range travelling {
+		_ = st.ApplyTx(t, st.NewCtx()) // fails harmlessly if already pooled
+	}
 	for _, q := range n.queue {
-		_ = st.ApplyTx(q.tx, st.NewCtx())
+		if q.tx != nil {
+			_ = st.ApplyTx(q.tx, st.NewCtx())
+		}
 	}
 	return st
 }

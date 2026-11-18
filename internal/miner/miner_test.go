@@ -98,17 +98,16 @@ func TestMineAndPost(t *testing.T) {
 	if _, ok := tip.Posts[post.ID()]; !ok {
 		t.Fatal("post not mined")
 	}
-	// Free-lane comment backed by locked income (counts as stake).
+	// A comment, and a reply to that comment (not allowed).
 	acc = tip.Peek(addr)
-	cm := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce, Lane: types.LaneFree, Board: "free",
-		Text: []byte("무료 차선 댓글"), Parent: post.ID()}
+	cm := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce, MaxFee: 10 * params.Coin, Board: "free",
+		Text: []byte("댓글"), Parent: post.ID()}
 	cm.Sign(r.m.Key)
 	r.pool.Reset(tip)
 	if err := r.pool.Add(cm); err != nil {
 		t.Fatal(err)
 	}
-	// Replying to a comment is not allowed.
-	bad := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce + 1, Lane: types.LaneFree, Board: "free",
+	bad := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce + 1, MaxFee: 10 * params.Coin, Board: "free",
 		Text: []byte("답글"), Parent: cm.ID()}
 	bad.Sign(r.m.Key)
 	if err := r.pool.Add(bad); err == nil {

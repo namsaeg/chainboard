@@ -122,27 +122,25 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 		t.Fatal("repeated text was not surcharged")
 	}
 
-	// Stake must age before it backs quota, and unstaking takes the unbond delay.
+	// Stake must age before it can bond an anonymous-lane membership, and
+	// unstaking takes the unbond delay.
 	staker := cryptox.KeyFromSeed(append(make([]byte, 31), 77))
 	r.send(t, k, &types.Tx{Kind: types.TxTransfer, To: staker.Address(), Amount: 20 * params.Coin, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	r.pool.Reset(r.c.Tip())
 	r.send(t, staker, &types.Tx{Kind: types.TxStake, Amount: 10 * params.Coin, MaxFee: params.Coin})
 	r.mineN(t, 1)
-	tip = r.c.Tip()
-	acc := tip.Peek(staker.Address())
-	if tip.EffectiveStake(&acc, tip.Height+1) != 0 {
-		t.Fatal("fresh stake counted before aging")
+	r.pool.Reset(r.c.Tip())
+	join := &types.Tx{Kind: types.TxRLNJoin, Amount: 2 * params.Coin, Commitment: types.Hash{31: 1}, Limit: 2, MaxFee: params.Coin,
+		Nonce: r.pool.PendingState().Peek(staker.Address()).Nonce}
+	join.Sign(staker)
+	if err := r.pool.Add(join); err == nil {
+		t.Fatal("fresh stake bonded before aging")
 	}
-	r.mineN(t, p.StakeAgingBlocks+p.QuotaRegenBlocks)
-	tip = r.c.Tip()
-	acc = tip.Peek(staker.Address())
-	if tip.QuotaAt(&acc, tip.Height+1) == 0 {
-		t.Fatal("aged stake gives no quota")
-	}
-	r.pool.Reset(tip)
-	r.send(t, staker, &types.Tx{Kind: types.TxPost, Lane: types.LaneFree, Board: "b", Text: []byte("무료 글")})
-	r.send(t, staker, &types.Tx{Kind: types.TxUnstake, Amount: 10 * params.Coin, MaxFee: params.Coin})
+	r.mineN(t, p.StakeAgingBlocks)
+	r.pool.Reset(r.c.Tip())
+	r.send(t, staker, &types.Tx{Kind: types.TxRLNJoin, Amount: 2 * params.Coin, Commitment: types.Hash{31: 1}, Limit: 2, MaxFee: params.Coin})
+	r.send(t, staker, &types.Tx{Kind: types.TxUnstake, Amount: 8 * params.Coin, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	before := r.c.Tip().Peek(staker.Address()).Balance
 	r.mineN(t, p.UnbondBlocks+1)
@@ -151,7 +149,10 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	r.send(t, staker, &types.Tx{Kind: types.TxTransfer, To: k.Address(), Amount: 1, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	after := r.c.Tip().Peek(staker.Address()).Balance
-	if after < before+9*params.Coin {
+	if m := r.c.Tip().Members[types.Hash{31: 1}]; m == nil || m.Bond != 2*params.Coin {
+		t.Fatal("membership bond not recorded")
+	}
+	if after < before+7*params.Coin {
 		t.Fatalf("unbonded stake not returned: before %d after %d", before, after)
 	}
 	r.check(t)
@@ -205,6 +206,15 @@ func TestForfeitAndEpochProofs(t *testing.T) {
 	a.pool.Reset(tip)
 	a.send(t, prover.Key, &types.Tx{Kind: types.TxRegister, Partitions: prover.Assigned(), MaxFee: params.Coin})
 	a.mineN(t, 1)
+	tip = a.c.Tip()
+	a.pool.Reset(tip)
+	// A registration is challenged from the next epoch on.
+	if _, ok := prover.EpochProof(tip, 0); ok {
+		t.Fatal("epoch proof due in the epoch of registration")
+	}
+	for regEpoch := tip.Epoch(tip.Height); a.c.Tip().Epoch(a.c.Height()+1) == regEpoch; {
+		a.mineN(t, 1)
+	}
 	tip = a.c.Tip()
 	a.pool.Reset(tip)
 	tx, ok := prover.EpochProof(tip, a.pool.PendingState().Peek(prover.Key.Address()).Nonce)

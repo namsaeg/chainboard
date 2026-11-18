@@ -263,7 +263,12 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 		return err
 	}
 	st := parent.Clone()
-	if err := st.ApplyBlock(b, now); err != nil {
+	apply := func() error { return st.ApplyBlock(b, now) }
+	if !persist {
+		// Read back from our own database: validated before it was stored.
+		apply = func() error { return st.ReplayBlock(b) }
+	}
+	if err := apply(); err != nil {
 		c.bad[h] = err
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -291,7 +296,7 @@ func (c *Chain) stateAt(h Hash) (*state.State, error) {
 		if s, ok := c.states[cur]; ok {
 			st := s.Clone()
 			for i := len(path) - 1; i >= 0; i-- {
-				if err := st.ApplyBlock(path[i], 0); err != nil {
+				if err := st.ReplayBlock(path[i]); err != nil {
 					return nil, err
 				}
 			}

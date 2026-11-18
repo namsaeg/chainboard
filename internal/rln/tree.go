@@ -1,6 +1,10 @@
 package rln
 
-import "github.com/consensys/gnark-crypto/ecc/bn254/fr"
+import (
+	"sync/atomic"
+
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+)
 
 var zeros [Depth + 1]fr.Element
 
@@ -10,31 +14,76 @@ func init() {
 	}
 }
 
-// Tree is a sparse, append-mostly Merkle tree of member leaves. Removed
-// members are overwritten with the zero leaf; indices are never reused.
+const pageBits = 8 // 256 nodes per page
+
+type page struct {
+	owner   uint64
+	present [1 << pageBits / 64]uint64
+	v       [1 << pageBits]fr.Element
+}
+
+var treeIDs atomic.Uint64
+
+// Tree is a sparse Merkle tree of member leaves. Removed members are
+// overwritten with the zero leaf; indices are never reused.
+//
+// Clones share storage copy-on-write in pages of 256 nodes, so cloning a
+// state with many members is cheap.
 type Tree struct {
 	Next  uint32
-	nodes map[uint64]fr.Element
+	id    atomic.Uint64
+	pages map[uint64]*page
 }
 
 // NewTree returns an empty tree.
-func NewTree() *Tree { return &Tree{nodes: map[uint64]fr.Element{}} }
+func NewTree() *Tree {
+	t := &Tree{pages: map[uint64]*page{}}
+	t.id.Store(treeIDs.Add(1))
+	return t
+}
 
-func key(level int, idx uint64) uint64 { return uint64(level)<<32 | idx }
+func pageKey(level int, idx uint64) (uint64, int) {
+	return uint64(level)<<40 | idx>>pageBits, int(idx & (1<<pageBits - 1))
+}
 
 func (t *Tree) get(level int, idx uint64) fr.Element {
-	if v, ok := t.nodes[key(level, idx)]; ok {
-		return v
+	k, slot := pageKey(level, idx)
+	if p, ok := t.pages[k]; ok && p.present[slot/64]&(1<<(slot%64)) != 0 {
+		return p.v[slot]
 	}
 	return zeros[level]
 }
 
-// Clone deep-copies the tree.
-func (t *Tree) Clone() *Tree {
-	c := &Tree{Next: t.Next, nodes: make(map[uint64]fr.Element, len(t.nodes))}
-	for k, v := range t.nodes {
-		c.nodes[k] = v
+func (t *Tree) put(level int, idx uint64, v fr.Element) {
+	k, slot := pageKey(level, idx)
+	p, ok := t.pages[k]
+	id := t.id.Load()
+	if !ok {
+		p = &page{owner: id}
+		t.pages[k] = p
+	} else if p.owner != id {
+		c := *p
+		c.owner = id
+		p = &c
+		t.pages[k] = p
 	}
+	if v == zeros[level] {
+		p.present[slot/64] &^= 1 << (slot % 64)
+	} else {
+		p.present[slot/64] |= 1 << (slot % 64)
+		p.v[slot] = v
+	}
+}
+
+// Clone returns an independent tree. Both trees stop owning their pages, so
+// the first write to a shared page copies it.
+func (t *Tree) Clone() *Tree {
+	c := &Tree{Next: t.Next, pages: make(map[uint64]*page, len(t.pages))}
+	for k, v := range t.pages {
+		c.pages[k] = v
+	}
+	c.id.Store(treeIDs.Add(1))
+	t.id.Store(treeIDs.Add(1))
 	return c
 }
 
@@ -54,11 +103,7 @@ func (t *Tree) Set(i uint32, leaf fr.Element) {
 	idx := uint64(i)
 	cur := leaf
 	for level := 0; level <= Depth; level++ {
-		if cur == zeros[level] {
-			delete(t.nodes, key(level, idx))
-		} else {
-			t.nodes[key(level, idx)] = cur
-		}
+		t.put(level, idx, cur)
 		if level == Depth {
 			break
 		}
@@ -87,4 +132,17 @@ func (t *Tree) Path(i uint32) (path [Depth]fr.Element, bits [Depth]uint8) {
 		idx >>= 1
 	}
 	return
+}
+
+// nodes counts stored (non-zero) nodes; for tests.
+func (t *Tree) nodes() int {
+	n := 0
+	for _, p := range t.pages {
+		for _, w := range p.present {
+			for ; w != 0; w &= w - 1 {
+				n++
+			}
+		}
+	}
+	return n
 }

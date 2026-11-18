@@ -51,6 +51,10 @@ func main() {
 			*delay = 0
 		}
 	}
+	var embargo time.Duration // Dandelion++ default (30–60 s)
+	if *network == "devnet" {
+		embargo = 3 * time.Second // devnet favours speed over sender privacy
+	}
 	host, _, err := net.SplitHostPort(*httpAddr)
 	if err == nil && host != "127.0.0.1" && host != "localhost" && host != "::1" {
 		log.Printf("WARNING: the API controls your wallet; %s is reachable from other machines", *httpAddr)
@@ -69,6 +73,7 @@ func main() {
 		Mine:         *mine,
 		PledgeBytes:  uint64(*pledge * 1e9),
 		SendDelayMax: *delay,
+		Embargo:      embargo,
 	})
 	if err != nil {
 		log.Fatal(err)

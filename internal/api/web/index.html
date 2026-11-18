@@ -24,6 +24,14 @@
       </details>
     </div>
     <div class="card">
+      <h2>익명 글쓰기</h2>
+      <div id="rln" class="small"></div>
+      <form id="rlnJoinForm"><input name="amount" placeholder="보증금 (코인)" required>
+        <button>등록</button></form>
+      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1코인마다 1시간에 익명 글 1개를 쓸 수 있어요(최대 30개). 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
+      <button id="rlnLeave" class="small">등록 해제</button>
+    </div>
+    <div class="card">
       <h2>게시판</h2>
       <ul id="boards"></ul>
       <form id="boardForm"><input name="name" placeholder="게시판 이름" maxlength="32" required><button>열기</button></form>
@@ -46,11 +54,13 @@
             <option value="5y">첨부 5년</option><option value="20y">첨부 20년</option><option value="perm">첨부 영구</option>
           </select>
           <select name="lane" title="차선">
-            <option value="free">무료 차선 (예치 할당)</option><option value="fee">수수료 차선</option>
+            <option value="anon">익명 (무료)</option><option value="fee">수수료 (지갑 주소 공개)</option>
           </select>
+          <label class="small"><input type="checkbox" name="pseudonym"> 가명으로 서명</label>
           <button>글쓰기</button>
         </div>
-        <p class="small muted">보낸 글은 0~5분 무작위 지연 후 다른 노드를 거쳐 나갑니다(발신 위치 보호). 첨부 이미지는 다시 인코딩되어 메타데이터가 지워집니다.</p>
+        <p class="small muted">익명 글은 영지식 증명으로 "등록된 회원 중 누군가"라는 것만 드러나요. 증명을 만드는 데 몇 초 걸려요. 첨부는 수수료 차선에서만 가능해요.
+          보낸 글은 0~5분 무작위 지연 후 다른 노드를 거쳐 나갑니다(발신 위치 보호). 첨부 이미지는 다시 인코딩되어 메타데이터가 지워집니다.</p>
       </form>
     </div>
     <div id="thread"></div>

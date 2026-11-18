@@ -177,3 +177,33 @@ func Verify(proof []byte, pub Public) error {
 }
 
 func init() { logger.Disable() }
+
+// verified remembers proofs that already passed, keyed by everything a proof
+// depends on, so re-validating the mempool on every block stays cheap.
+var verified = struct {
+	sync.Mutex
+	m map[[32]byte]struct{}
+}{m: map[[32]byte]struct{}{}}
+
+const maxVerifiedCache = 1 << 16
+
+// VerifyCached is Verify with a cache of successes. key must commit to the
+// proof bytes and every public input.
+func VerifyCached(key [32]byte, proof []byte, pub Public) error {
+	verified.Lock()
+	_, ok := verified.m[key]
+	verified.Unlock()
+	if ok {
+		return nil
+	}
+	if err := Verify(proof, pub); err != nil {
+		return err
+	}
+	verified.Lock()
+	if len(verified.m) >= maxVerifiedCache {
+		verified.m = map[[32]byte]struct{}{}
+	}
+	verified.m[key] = struct{}{}
+	verified.Unlock()
+	return nil
+}

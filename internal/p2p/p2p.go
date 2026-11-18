@@ -82,7 +82,8 @@ type peer struct {
 	addr    string // dialable address (outbound, or the peer's announced listen address)
 	id      []byte
 	height  uint64
-	sendCh  chan frame
+	sendCh  chan frame    // never closed: a send may race a disconnect
+	quit    chan struct{} // closed when the peer is closed
 	closeMu sync.Once
 }
 
@@ -194,6 +195,7 @@ func (h *Host) maintain() {
 	defer t.Stop()
 	for {
 		h.dialMore()
+		h.refetchWaiting()
 		select {
 		case <-h.quit:
 			return
@@ -273,7 +275,7 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 			addr = net.JoinHostPort(host, port)
 		}
 	}
-	p := &peer{h: h, conn: c, out: out, addr: addr, id: peerKey(c.ConnectionState()), height: them.Height, sendCh: make(chan frame, 256)}
+	p := &peer{h: h, conn: c, out: out, addr: addr, id: peerKey(c.ConnectionState()), height: them.Height, sendCh: make(chan frame, 256), quit: make(chan struct{})}
 	h.mu.Lock()
 	h.peers[p] = true
 	if addr != "" {
@@ -298,6 +300,7 @@ func (h *Host) announce() string {
 
 func (p *peer) send(typ uint8, b []byte) {
 	select {
+	case <-p.quit:
 	case p.sendCh <- frame{typ, b}:
 	default: // slow peer: drop rather than block the node
 	}
@@ -306,19 +309,22 @@ func (p *peer) send(typ uint8, b []byte) {
 func (p *peer) close() {
 	p.closeMu.Do(func() {
 		p.conn.Close()
-		close(p.sendCh)
+		close(p.quit)
 	})
 }
 
 func (p *peer) writeLoop() {
 	defer p.h.wg.Done()
-	for f := range p.sendCh {
-		p.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if err := writeMsg(p.conn, f.typ, f.b); err != nil {
-			p.conn.Close()
-			for range p.sendCh {
-			}
+	for {
+		select {
+		case <-p.quit:
 			return
+		case f := <-p.sendCh:
+			p.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if err := writeMsg(p.conn, f.typ, f.b); err != nil {
+				p.close()
+				return
+			}
 		}
 	}
 }

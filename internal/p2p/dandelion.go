@@ -144,9 +144,20 @@ func (h *Host) stemPeer() *peer {
 	return h.stem
 }
 
+// maxWaiting bounds uploads parked until their data arrives.
+const maxWaiting = 1024
+
+// refetchAfter is how long a chunk request may go unanswered before the
+// chunk is asked for again (from a randomly chosen peer).
+const refetchAfter = 3 * time.Second
+
 // wait parks an upload until its chunks arrive and asks peers for them.
 func (h *Host) wait(t *types.Tx, from *peer) {
 	h.mu.Lock()
+	if len(h.waiting) >= maxWaiting {
+		h.mu.Unlock()
+		return
+	}
 	h.waiting[t.ID()] = t
 	h.mu.Unlock()
 	if _, ok := h.cfg.Store.Size(t.DataRoot); !ok {
@@ -170,10 +181,11 @@ func (h *Host) FetchData(root Hash, prefer *peer) {
 	if len(ps) == 0 {
 		return
 	}
+	mrand.Shuffle(len(ps), func(i, j int) { ps[i], ps[j] = ps[j], ps[i] })
 	for i, idx := range missing {
 		key := fmt.Sprintf("%s:%d", root, idx)
 		h.mu.Lock()
-		if last, ok := h.fetching[key]; ok && time.Since(last) < 15*time.Second {
+		if last, ok := h.fetching[key]; ok && time.Since(last) < refetchAfter {
 			h.mu.Unlock()
 			continue
 		}
@@ -206,6 +218,26 @@ func (h *Host) FetchChunks(want map[Hash][]uint64) {
 	}
 }
 
+// refetchWaiting asks again for the data of parked uploads. A peer that
+// lacks a chunk ignores the request, so unanswered requests are retried.
+func (h *Host) refetchWaiting() {
+	h.mu.Lock()
+	roots := map[Hash]bool{}
+	for _, t := range h.waiting {
+		roots[t.DataRoot] = true
+	}
+	for k, at := range h.fetching {
+		if time.Since(at) > time.Minute {
+			delete(h.fetching, k)
+		}
+	}
+	h.mu.Unlock()
+	for r := range roots {
+		h.FetchData(r, nil)
+		h.retryWaiting(r)
+	}
+}
+
 // retryWaiting re-submits uploads whose data is now complete.
 func (h *Host) retryWaiting(root Hash) {
 	if !h.cfg.Store.Complete(root) {
@@ -225,4 +257,20 @@ func (h *Host) retryWaiting(root Hash) {
 			h.broadcast(msgTx, t.Encode(), nil)
 		}
 	}
+}
+
+// Publish broadcasts a transaction at once, skipping the stem phase. It is
+// for transactions that need no sender privacy, such as slashes.
+func (h *Host) Publish(t *types.Tx) error {
+	if err := t.CheckStateless(); err != nil {
+		return err
+	}
+	return h.fluffErr(t, t.Encode())
+}
+
+// WaitingUploads counts upload transactions parked until their data arrives.
+func (h *Host) WaitingUploads() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.waiting)
 }

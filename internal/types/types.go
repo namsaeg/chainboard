@@ -33,19 +33,36 @@ const (
 	TxRegister        // declares the partitions a storage node keeps
 	TxProof           // epoch storage proof
 	TxLike
+	TxAnonPost // unsigned post of the anonymous lane, carrying an RLN proof
+	TxRLNJoin  // moves mature stake into an RLN membership bond
+	TxRLNLeave // starts the exit of a membership (bond returns after unbonding)
+	TxRLNSlash // unsigned: reveals a member's secret recovered from a double signal
 )
 
-func (k TxKind) String() string {
-	return [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "like"}[min(int(k), 9)]
-}
+var kindNames = [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "like",
+	"anonpost", "rlnjoin", "rlnleave", "rlnslash"}
+
+func (k TxKind) String() string { return kindNames[min(int(k), len(kindNames)-1)] }
+
+// Signed reports whether a kind is signed by an account. Anonymous posts and
+// slashes have no sender, nonce, fee or signature.
+func (k TxKind) Signed() bool { return k != TxAnonPost && k != TxRLNSlash }
 
 // Lane selects how a text transaction pays.
 type Lane uint8
 
 const (
 	LaneFee  Lane = 0 // pays base fee (burned) + storage + tip
-	LaneFree Lane = 1 // spends stake quota; storage paid from issuance
+	LaneAnon Lane = 1 // anonymous RLN posts; storage paid from issuance
 )
+
+// LaneOf is the lane a transaction uses.
+func (t *Tx) LaneOf() Lane {
+	if t.Kind == TxAnonPost {
+		return LaneAnon
+	}
+	return LaneFee
+}
 
 // Media classes accepted by node policy (consensus only records the class).
 const (
@@ -64,7 +81,20 @@ type StorageProof struct {
 	Path      chunk.Proof
 }
 
-// Tx is a signed transaction. Only the fields of its Kind are encoded.
+// RLNProof is the rate-limit proof of an anonymous post. Root, Nullifier and
+// Y are BN254 scalars in canonical big-endian form.
+type RLNProof struct {
+	Root      Hash
+	Epoch     uint64
+	Nullifier Hash
+	Y         Hash
+	Proof     []byte
+}
+
+// MaxRLNProof bounds the encoded Groth16 proof.
+const MaxRLNProof = 256
+
+// Tx is a transaction. Only the fields of its Kind are encoded.
 type Tx struct {
 	Kind   TxKind
 	From   []byte // Ed25519 public key
@@ -92,6 +122,13 @@ type Tx struct {
 
 	Proof *StorageProof
 
+	Commitment Hash   // rlnjoin, rlnleave: identity commitment
+	Limit      uint16 // rlnjoin: messages per epoch
+	RLN        *RLNProof
+	PseudoPub  []byte // anonpost, optional: Ed25519 key of a pseudonym
+	PseudoSig  []byte
+	Secret     Hash // rlnslash: the revealed identity secret
+
 	Sig []byte
 }
 
@@ -99,11 +136,13 @@ const maxPartitions = 4096
 
 func (t *Tx) encodeBody(w *codec.Writer) {
 	w.U8(uint8(t.Kind))
-	w.Fixed(t.From)
-	w.Var(t.Nonce)
-	w.U8(uint8(t.Lane))
-	w.Var(t.MaxFee)
-	w.Var(t.Tip)
+	if t.Kind.Signed() {
+		w.Fixed(t.From)
+		w.Var(t.Nonce)
+		w.U8(uint8(t.Lane))
+		w.Var(t.MaxFee)
+		w.Var(t.Tip)
+	}
 	switch t.Kind {
 	case TxTransfer:
 		w.Fixed(t.To[:])
@@ -141,7 +180,66 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 		w.U8(p.Sub)
 		w.Bytes(p.PackedSub)
 		chunk.EncodeProof(w, p.Path)
+	case TxAnonPost:
+		t.encodeAnonContent(w)
+		r := t.RLN
+		w.Fixed(r.Root[:])
+		w.Var(r.Epoch)
+		w.Fixed(r.Nullifier[:])
+		w.Fixed(r.Y[:])
+		w.Bytes(r.Proof)
+		w.Bool(len(t.PseudoPub) > 0)
+		if len(t.PseudoPub) > 0 {
+			w.Fixed(t.PseudoSig)
+		}
+	case TxRLNJoin:
+		w.Var(t.Amount)
+		w.Fixed(t.Commitment[:])
+		w.U16(t.Limit)
+	case TxRLNLeave:
+		w.Fixed(t.Commitment[:])
+	case TxRLNSlash:
+		w.Fixed(t.Secret[:])
 	}
+}
+
+// encodeAnonContent is what an anonymous post says: board, text, parent and
+// the optional pseudonym key.
+func (t *Tx) encodeAnonContent(w *codec.Writer) {
+	w.Bytes([]byte(t.Board))
+	w.Bytes(t.Text)
+	w.Fixed(t.Parent[:])
+	if len(t.PseudoPub) > 0 {
+		w.Fixed(t.PseudoPub)
+	} else {
+		w.Fixed(make([]byte, ed25519.PublicKeySize))
+	}
+}
+
+// Signal is the RLN signal of an anonymous post: the hash of its content.
+// Two posts with the same nullifier and different signals reveal the secret.
+func (t *Tx) Signal() Hash {
+	var w codec.Writer
+	t.encodeAnonContent(&w)
+	return cryptox.Tagged("cb/anon/signal", w.B)
+}
+
+// PseudoHash is what a pseudonym key signs.
+func (t *Tx) PseudoHash() Hash {
+	sig := t.Signal()
+	return cryptox.Tagged("cb/anon/pseudo", sig[:])
+}
+
+// Author is the address shown for a post: the sender, the pseudonym, or zero
+// for a fully anonymous post.
+func (t *Tx) Author() Address {
+	switch {
+	case t.Kind.Signed():
+		return t.Sender()
+	case len(t.PseudoPub) == ed25519.PublicKeySize:
+		return cryptox.AddressOf(t.PseudoPub)
+	}
+	return Address{}
 }
 
 // SigHash is what the sender signs.
@@ -155,15 +253,22 @@ func (t *Tx) SigHash() Hash {
 func (t *Tx) Encode() []byte {
 	var w codec.Writer
 	t.encodeBody(&w)
-	w.Fixed(t.Sig)
+	if t.Kind.Signed() {
+		w.Fixed(t.Sig)
+	}
 	return w.B
 }
 
 // ID is the transaction hash.
 func (t *Tx) ID() Hash { return cryptox.Tagged("cb/tx", t.Encode()) }
 
-// Sender is the address of From.
-func (t *Tx) Sender() Address { return cryptox.AddressOf(t.From) }
+// Sender is the address of From (zero for unsigned kinds).
+func (t *Tx) Sender() Address {
+	if !t.Kind.Signed() {
+		return Address{}
+	}
+	return cryptox.AddressOf(t.From)
+}
 
 // EncodedSize is the encoded size in bytes.
 func (t *Tx) EncodedSize() int { return len(t.Encode()) }
@@ -178,12 +283,14 @@ func (t *Tx) Sign(k *cryptox.Key) {
 func decodeTx(r *codec.Reader) (*Tx, error) {
 	t := &Tx{}
 	t.Kind = TxKind(r.U8())
-	t.From = make([]byte, ed25519.PublicKeySize)
-	r.Fixed(t.From)
-	t.Nonce = r.Var()
-	t.Lane = Lane(r.U8())
-	t.MaxFee = r.Var()
-	t.Tip = r.Var()
+	if t.Kind.Signed() {
+		t.From = make([]byte, ed25519.PublicKeySize)
+		r.Fixed(t.From)
+		t.Nonce = r.Var()
+		t.Lane = Lane(r.U8())
+		t.MaxFee = r.Var()
+		t.Tip = r.Var()
+	}
 	switch t.Kind {
 	case TxTransfer:
 		r.Fixed(t.To[:])
@@ -224,12 +331,51 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		p.PackedSub = r.Bytes(params.SubChunkSize)
 		p.Path = chunk.DecodeProof(r)
 		t.Proof = p
+	case TxAnonPost:
+		t.Board = string(r.Bytes(params.MaxBoardBytes))
+		t.Text = r.Bytes(params.MaxPostBytes)
+		r.Fixed(t.Parent[:])
+		pub := make([]byte, ed25519.PublicKeySize)
+		r.Fixed(pub)
+		p := &RLNProof{}
+		r.Fixed(p.Root[:])
+		p.Epoch = r.Var()
+		r.Fixed(p.Nullifier[:])
+		r.Fixed(p.Y[:])
+		p.Proof = r.Bytes(MaxRLNProof)
+		t.RLN = p
+		if r.Bool() {
+			t.PseudoPub = pub
+			t.PseudoSig = make([]byte, ed25519.SignatureSize)
+			r.Fixed(t.PseudoSig)
+		} else if r.Err == nil && !allZero(pub) {
+			return nil, errors.New("pseudonym key without signature")
+		}
+	case TxRLNJoin:
+		t.Amount = r.Var()
+		r.Fixed(t.Commitment[:])
+		t.Limit = r.U16()
+	case TxRLNLeave:
+		r.Fixed(t.Commitment[:])
+	case TxRLNSlash:
+		r.Fixed(t.Secret[:])
 	default:
 		return nil, fmt.Errorf("unknown tx kind %d", t.Kind)
 	}
-	t.Sig = make([]byte, ed25519.SignatureSize)
-	r.Fixed(t.Sig)
+	if t.Kind.Signed() {
+		t.Sig = make([]byte, ed25519.SignatureSize)
+		r.Fixed(t.Sig)
+	}
 	return t, r.Err
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // DecodeTx decodes one transaction, rejecting trailing bytes.
@@ -242,27 +388,57 @@ func DecodeTx(b []byte) (*Tx, error) {
 	return t, r.Done()
 }
 
+func checkPostContent(t *Tx) error {
+	if !utf8.Valid(t.Text) || !utf8.ValidString(t.Board) {
+		return errors.New("post text and board must be UTF-8")
+	}
+	if len(t.Board) == 0 {
+		return errors.New("post needs a board")
+	}
+	if len(t.Text) == 0 && len(t.Attach) == 0 {
+		return errors.New("empty post")
+	}
+	if !t.Parent.IsZero() && len(t.Attach) > 0 {
+		return errors.New("comments cannot carry attachments")
+	}
+	return nil
+}
+
 // CheckStateless validates everything that does not need chain state.
+// RLN proofs are verified by the state, which knows the accepted roots.
 func (t *Tx) CheckStateless() error {
+	switch t.Kind {
+	case TxAnonPost:
+		if t.RLN == nil || len(t.RLN.Proof) == 0 || len(t.RLN.Proof) > MaxRLNProof {
+			return errors.New("anonymous post needs an RLN proof")
+		}
+		if len(t.Attach) > 0 {
+			return errors.New("anonymous posts are text only")
+		}
+		if err := checkPostContent(t); err != nil {
+			return err
+		}
+		if len(t.PseudoPub) > 0 {
+			h := t.PseudoHash()
+			if len(t.PseudoPub) != ed25519.PublicKeySize || len(t.PseudoSig) != ed25519.SignatureSize ||
+				!cryptox.Verify(t.PseudoPub, h[:], t.PseudoSig) {
+				return errors.New("bad pseudonym signature")
+			}
+		}
+		return nil
+	case TxRLNSlash:
+		return nil
+	}
 	if len(t.From) != ed25519.PublicKeySize || len(t.Sig) != ed25519.SignatureSize {
 		return errors.New("bad key or signature length")
 	}
-	if t.Lane > LaneFree {
-		return errors.New("bad lane")
+	if t.Lane != LaneFee {
+		return errors.New("signed transactions use the fee lane")
 	}
 	switch t.Kind {
 	case TxPost:
-		if !utf8.Valid(t.Text) || !utf8.ValidString(t.Board) {
-			return errors.New("post text and board must be UTF-8")
-		}
-		if len(t.Board) == 0 {
-			return errors.New("post needs a board")
-		}
-		if len(t.Text) == 0 && len(t.Attach) == 0 {
-			return errors.New("empty post")
-		}
-		if !t.Parent.IsZero() && len(t.Attach) > 0 {
-			return errors.New("comments cannot carry attachments")
+		if err := checkPostContent(t); err != nil {
+			return err
 		}
 	case TxLike:
 	case TxUpload:
@@ -272,21 +448,17 @@ func (t *Tx) CheckStateless() error {
 		if _, _, ok := params.TierMonths(t.Tier); !ok {
 			return errors.New("bad tier")
 		}
-		if t.Lane != LaneFee {
-			return errors.New("uploads use the fee lane")
-		}
 	case TxExtend:
 		if _, _, ok := params.TierMonths(t.Tier); !ok {
 			return errors.New("bad tier")
 		}
-		if t.Lane != LaneFee {
-			return errors.New("extends use the fee lane")
+	case TxRLNJoin:
+		if t.Limit == 0 || t.Amount == 0 {
+			return errors.New("membership needs a limit and a bond")
 		}
-	case TxTransfer, TxStake, TxUnstake, TxRegister, TxProof:
-		if t.Lane != LaneFee {
-			return errors.New("only text uses the free lane")
-		}
-		if t.Kind == TxProof && (t.Proof == nil || len(t.Proof.PackedSub) != params.SubChunkSize) {
+	case TxTransfer, TxStake, TxUnstake, TxRegister, TxRLNLeave:
+	case TxProof:
+		if t.Proof == nil || len(t.Proof.PackedSub) != params.SubChunkSize {
 			return errors.New("bad proof")
 		}
 	default:
@@ -300,7 +472,10 @@ func (t *Tx) CheckStateless() error {
 }
 
 // IsText reports whether the tx counts against text lane capacity.
-func (t *Tx) IsText() bool { return t.Kind == TxPost || t.Kind == TxLike }
+func (t *Tx) IsText() bool { return t.Kind == TxPost || t.Kind == TxLike || t.Kind == TxAnonPost }
+
+// IsPost reports whether the tx creates a post.
+func (t *Tx) IsPost() bool { return t.Kind == TxPost || t.Kind == TxAnonPost }
 
 // Solution is the storage proof that wins a block.
 type Solution struct {
@@ -455,7 +630,7 @@ func TxRoot(txs []*Tx) Hash {
 func BoardRoot(txs []*Tx) Hash {
 	var leaves []Hash
 	for _, t := range txs {
-		if t.Kind == TxPost {
+		if t.IsPost() {
 			id := t.ID()
 			leaves = append(leaves, merkle.Leaf(append([]byte(t.Board+"\x00"), id[:]...)))
 		}
