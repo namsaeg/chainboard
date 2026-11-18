@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
@@ -47,6 +48,7 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/rln", s.rlnStatus)
 	mux.HandleFunc("/api/rln/join", s.rlnJoin)
 	mux.HandleFunc("/api/rln/leave", s.rlnLeave)
+	mux.HandleFunc("/api/rln/ack", s.rlnAck)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return guard(mux)
@@ -71,6 +73,18 @@ type server struct{ n *node.Node }
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// sendFail answers a refused send: 409 with the warnings to confirm, or 400.
+func sendFail(w http.ResponseWriter, err error) {
+	var we *node.WarningError
+	if errors.As(err, &we) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": we.Error(), "warnings": we.Warnings, "fee": coins(we.Fee)})
+		return
+	}
+	fail(w, 400, err)
 }
 
 func fail(w http.ResponseWriter, code int, err error) {
@@ -161,6 +175,8 @@ func (s *server) wallet(w http.ResponseWriter, r *http.Request) {
 	if pending > 0 {
 		out["stake_matures_at"] = acc.PendingSince + st.P.StakeAgingBlocks
 	}
+	score, free, next := n.BurstInfo()
+	out["burst_score"], out["burst_free"], out["burst_next_factor"] = score, free, next
 	writeJSON(w, out)
 }
 
@@ -175,7 +191,7 @@ func (s *server) board(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	writeJSON(w, s.n.Index.Board(q.Get("name"), minLikes, limit))
+	writeJSON(w, s.n.Board(q.Get("name"), minLikes, limit))
 }
 
 type postReq struct {
@@ -185,6 +201,8 @@ type postReq struct {
 	Lane      string   `json:"lane"` // "anon" (default) or "fee"
 	Pseudonym bool     `json:"pseudonym"`
 	Attach    []string `json:"attach"`
+	Tier      string   `json:"tier"`    // fee lane: how long the text is kept (default 1m)
+	Confirm   bool     `json:"confirm"` // accept the warnings of a 409 answer
 }
 
 func (s *server) post(w http.ResponseWriter, r *http.Request) {
@@ -194,7 +212,7 @@ func (s *server) post(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, err)
 			return
 		}
-		p, cs := s.n.Index.Thread(id)
+		p, cs := s.n.Thread(id)
 		if p == nil {
 			fail(w, 404, errors.New("post not found"))
 			return
@@ -226,14 +244,26 @@ func (s *server) post(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, errors.New("anonymous posts are text only; use the fee lane for attachments"))
 			return
 		}
-		if err := s.n.AnonPost(node.AnonRequest{Board: board, Text: req.Text, Parent: parent, Pseudo: req.Pseudonym}); err != nil {
-			fail(w, 400, err)
+		if err := s.n.AnonPost(node.AnonRequest{Board: board, Text: req.Text, Parent: parent, Pseudo: req.Pseudonym,
+			Confirm: req.Confirm}); err != nil {
+			sendFail(w, err)
 			return
 		}
 		writeJSON(w, map[string]bool{"queued": true})
 		return
 	}
 	t := &types.Tx{Kind: types.TxPost, Board: board, Text: []byte(req.Text), Parent: parent}
+	if req.Text != "" {
+		tier := params.TierFree
+		if req.Tier != "" {
+			var err error
+			if tier, err = tierFrom(req.Tier); err != nil {
+				fail(w, 400, err)
+				return
+			}
+		}
+		t.Tier = tier
+	}
 	for _, a := range req.Attach {
 		h, err := cryptox.ParseHash(a)
 		if err != nil {
@@ -242,8 +272,8 @@ func (s *server) post(w http.ResponseWriter, r *http.Request) {
 		}
 		t.Attach = append(t.Attach, h)
 	}
-	if err := s.n.Send(t); err != nil {
-		fail(w, 400, err)
+	if err := s.n.SendChecked(t, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"id": t.ID().String()})
@@ -312,9 +342,9 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	res, err := s.n.Upload(raw, tier)
+	res, err := s.n.Upload(raw, tier, r.FormValue("confirm") == "true")
 	if err != nil {
-		fail(w, 400, err)
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]any{"root": res.Root.String(), "action": res.Action, "until": res.Until})
@@ -322,15 +352,12 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Root string `json:"root"`
-		Tier string `json:"tier"`
+		Root    string `json:"root"` // data root, or
+		Post    string `json:"post"` // post id (its text)
+		Tier    string `json:"tier"`
+		Confirm bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-		fail(w, 400, err)
-		return
-	}
-	root, err := cryptox.ParseHash(req.Root)
-	if err != nil {
 		fail(w, 400, err)
 		return
 	}
@@ -339,8 +366,26 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.Send(&types.Tx{Kind: types.TxExtend, DataRoot: root, Tier: tier}); err != nil {
+	if req.Post != "" {
+		id, err := cryptox.ParseHash(req.Post)
+		if err != nil {
+			fail(w, 400, err)
+			return
+		}
+		if err := s.n.ExtendPost(id, tier, req.Confirm); err != nil {
+			sendFail(w, err)
+			return
+		}
+		writeJSON(w, map[string]bool{"queued": true})
+		return
+	}
+	root, err := cryptox.ParseHash(req.Root)
+	if err != nil {
 		fail(w, 400, err)
+		return
+	}
+	if err := s.n.SendChecked(&types.Tx{Kind: types.TxExtend, DataRoot: root, Tier: tier}, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"queued": true})
@@ -348,7 +393,8 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) like(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID string `json:"id"`
+		ID      string `json:"id"`
+		Confirm bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -359,8 +405,8 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.Send(&types.Tx{Kind: types.TxLike, Target: id}); err != nil {
-		fail(w, 400, err)
+	if err := s.n.SendChecked(&types.Tx{Kind: types.TxLike, Target: id}, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"queued": true})
@@ -368,7 +414,8 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) stake(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Amount string `json:"amount"`
+		Amount  string `json:"amount"`
+		Confirm bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -383,8 +430,8 @@ func (s *server) stake(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, "unstake") {
 		kind = types.TxUnstake
 	}
-	if err := s.n.Send(&types.Tx{Kind: kind, Amount: amt}); err != nil {
-		fail(w, 400, err)
+	if err := s.n.SendChecked(&types.Tx{Kind: kind, Amount: amt}, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"queued": true})
@@ -392,8 +439,9 @@ func (s *server) stake(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) transfer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		To     string `json:"to"`
-		Amount string `json:"amount"`
+		To      string `json:"to"`
+		Amount  string `json:"amount"`
+		Confirm bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -409,8 +457,8 @@ func (s *server) transfer(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.Send(&types.Tx{Kind: types.TxTransfer, To: to, Amount: amt}); err != nil {
-		fail(w, 400, err)
+	if err := s.n.SendChecked(&types.Tx{Kind: types.TxTransfer, To: to, Amount: amt}, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"queued": true})
@@ -424,7 +472,18 @@ func (s *server) rlnStatus(w http.ResponseWriter, r *http.Request) {
 		"epoch": info.Epoch, "cap": info.Cap, "used": info.Used, "epoch_blocks_left": info.EpochLeft,
 		"members": info.Members, "pseudonym": info.Pseudonym,
 		"bond_per_message": coins(s.n.P.RLNBondPerMsg), "max_limit": s.n.P.RLNMaxLimit,
+		"remaining": info.Remaining, "foreign_use": info.ForeignUse,
+		"epoch_minutes_left": (time.Duration(info.EpochLeft)*s.n.P.BlockTime + time.Minute - 1) / time.Minute,
 	})
+}
+
+func (s *server) rlnAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, 405, errors.New("POST only"))
+		return
+	}
+	s.n.AckForeign()
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *server) rlnJoin(w http.ResponseWriter, r *http.Request) {

@@ -27,6 +27,8 @@ const (
 	msgChunk
 	msgGetPeers
 	msgPeers
+	msgGetTexts // post bodies by hash
+	msgTexts
 )
 
 const maxMessage = 32 << 20

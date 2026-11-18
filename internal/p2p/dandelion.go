@@ -58,7 +58,7 @@ func (h *Host) SubmitOwn(t *types.Tx) error {
 	if err := t.CheckStateless(); err != nil {
 		return err
 	}
-	raw := t.Encode()
+	raw := t.EncodeWire()
 	next := h.stemPeer()
 	if next == nil {
 		// Alone on the network: nothing to hide from.
@@ -254,7 +254,7 @@ func (h *Host) retryWaiting(root Hash) {
 	h.mu.Unlock()
 	for _, t := range ready {
 		if h.cfg.Pool.Add(t) == nil {
-			h.broadcast(msgTx, t.Encode(), nil)
+			h.broadcast(msgTx, t.EncodeWire(), nil)
 		}
 	}
 }
@@ -265,7 +265,7 @@ func (h *Host) Publish(t *types.Tx) error {
 	if err := t.CheckStateless(); err != nil {
 		return err
 	}
-	return h.fluffErr(t, t.Encode())
+	return h.fluffErr(t, t.EncodeWire())
 }
 
 // WaitingUploads counts upload transactions parked until their data arrives.

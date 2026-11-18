@@ -14,7 +14,8 @@ import (
 
 func anon(t *testing.T, st *state.State, sec fr.Element, text string, msgID uint64) *types.Tx {
 	t.Helper()
-	tx := &types.Tx{Kind: types.TxAnonPost, Board: "익명", Text: []byte(text)}
+	tx := &types.Tx{Kind: types.TxAnonPost, Board: "익명", Tier: params.TierFree}
+	tx.SetText([]byte(text))
 	if err := st.ProveAnon(tx, sec, msgID); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,8 @@ func TestRLNLane(t *testing.T) {
 	if err := r.pool.Add(anon(t, st, sec, "첫 익명 글", 0)); !errors.Is(err, state.ErrDuplicateAnon) {
 		t.Fatalf("resend of the same post: %v", err)
 	}
-	over := &types.Tx{Kind: types.TxAnonPost, Board: "익명", Text: []byte("x")}
+	over := &types.Tx{Kind: types.TxAnonPost, Board: "익명", Tier: params.TierFree}
+	over.SetText([]byte("x"))
 	if st.ProveAnon(over, sec, 3) == nil {
 		t.Fatal("message beyond the limit was provable")
 	}

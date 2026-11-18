@@ -7,6 +7,7 @@ import (
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/rln"
 	"github.com/namsaeg/chainboard/internal/types"
 )
@@ -321,11 +322,11 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 	if err := s.checkParent(t); err != nil {
 		return err
 	}
-	dupKey, mul := s.dupMultiplier(t.Text, h)
+	dupKey, mul := s.dupMultiplier(t, h)
 	if mul > 1 {
 		return errors.New("repeated text must use the fee lane")
 	}
-	size := uint64(t.EncodedSize())
+	size := uint64(t.LaneSize())
 	if ctx.FreeUsed+size > s.P.TextCapFree() {
 		return errors.New("anonymous lane full")
 	}
@@ -336,13 +337,20 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 	}
 
 	// Commit.
+	fee, dest := s.textFee(uint64(t.TextLen), params.TierFree, h)
 	ctx.FreeUsed += size
-	ctx.FreeStorage += TextStorageFee(s.P, s.Price, int(size))
+	ctx.FreeStorage += fee
+	s.fund(dest, fee)
 	if s.RLNNulls[p.Epoch] == nil {
 		s.RLNNulls[p.Epoch] = map[Hash]Share{}
 	}
 	s.RLNNulls[p.Epoch][p.Nullifier] = share
 	s.notePost(t, h, dupKey)
+	id := t.ID()
+	pi := *s.Posts[id]
+	pi.TextBucket = dest
+	s.Posts[id] = &pi
+	s.queueText(id, t.TextHash, t.TextLen, dest)
 	return nil
 }
 

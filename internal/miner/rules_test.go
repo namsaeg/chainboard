@@ -102,24 +102,33 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	k := r.m.Key
 	tip := r.c.Tip()
 	r.pool.Reset(tip)
-	text := []byte("같은 글 반복")
-	first := &types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: "b", Text: text}
+	text := "같은 광고 문구를 계속 반복해서 올립니다" // over DupMinBytes
+	first := textPost("b", text, types.Hash{})
 	first.Nonce = tip.Peek(k.Address()).Nonce
 	first.Sign(k)
 	var exact uint64
 	for i := 0; i < 3; i++ { // MaxFee is part of the size; iterate to a fixed point
-		size := uint64(first.EncodedSize())
-		exact = tip.BaseFee*size + state.TextStorageFee(p, tip.Price, int(size))
+		size := uint64(first.LaneSize())
+		exact = tip.BaseFee*size + state.StorageFee(p, tip.Price, uint64(first.TextLen), p.TextReplicas, 1, false)
 		first.MaxFee = exact
 		first.Sign(k)
 	}
 	if err := r.pool.Add(first); err != nil {
 		t.Fatal(err)
 	}
-	second := &types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: "b", Text: text, MaxFee: exact, Nonce: first.Nonce + 1}
+	second := textPost("b", text, types.Hash{})
+	second.MaxFee, second.Nonce = exact, first.Nonce+1
 	second.Sign(k)
 	if err := r.pool.Add(second); err == nil {
 		t.Fatal("repeated text was not surcharged")
+	}
+	if dup, _ := r.pool.PendingState().FeeFactors(second); dup != 2 {
+		t.Fatalf("repeat factor %d, want 2", dup)
+	}
+	short := textPost("b", "ㅋㅋㅋ", types.Hash{})
+	short.From = k.Pub
+	if dup, _ := r.pool.PendingState().FeeFactors(short); dup != 1 {
+		t.Fatalf("short text counted as a repeat (factor %d)", dup)
 	}
 
 	// Stake must age before it can bond an anonymous-lane membership, and

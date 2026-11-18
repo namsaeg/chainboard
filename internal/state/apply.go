@@ -65,11 +65,14 @@ func (s *State) settle(a *Account, h uint64) {
 	}
 }
 
-func (s *State) dupMultiplier(text []byte, h uint64) (Hash, uint64) {
-	if len(text) == 0 {
+// dupMultiplier is the repeat surcharge of a post: 2^n when the same text
+// (by hash, from anyone) already appeared n times in the window. Texts
+// shorter than DupMinBytes are not counted: short replies are common.
+func (s *State) dupMultiplier(t *types.Tx, h uint64) (Hash, uint64) {
+	if uint64(t.TextLen) < s.P.DupMinBytes {
 		return Hash{}, 1
 	}
-	k := cryptox.Tagged("cb/dup", text)
+	k := cryptox.Tagged("cb/dup", t.TextHash[:])
 	e := s.dups[k]
 	if h > e.Last+s.P.DupWindowBlocks {
 		e.Count = 0
@@ -123,7 +126,8 @@ func (s *State) checkParent(t *types.Tx) error {
 // notePost records a post (signed or anonymous).
 func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash) {
 	s.noteDup(dupKey, h)
-	s.Posts[t.ID()] = &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h}
+	s.Posts[t.ID()] = &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h,
+		TextHash: t.TextHash, TextLen: t.TextLen, TextTier: t.Tier}
 	if !t.Parent.IsZero() {
 		pi := *s.Posts[t.Parent]
 		pi.Comments++
@@ -155,14 +159,19 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	if t.Nonce != acc.Nonce {
 		return fmt.Errorf("bad nonce: have %d want %d", t.Nonce, acc.Nonce)
 	}
-	size := uint64(t.EncodedSize())
+	size := uint64(t.LaneSize())
 	next := *ctx
 
 	// Fee lane accounting.
 	var dupKey Hash
 	dupMul := uint64(1)
 	if t.Kind == types.TxPost {
-		dupKey, dupMul = s.dupMultiplier(t.Text, h)
+		dupKey, dupMul = s.dupMultiplier(t, h)
+	}
+	burstMul, burstScore := uint64(1), acc.Burst
+	if countsForBurst(t.Kind) {
+		burstScore = min(s.BurstScore(acc, h)+burstUnit, 1_000_000*burstUnit)
+		burstMul = s.BurstMultiplier(burstScore)
 	}
 	cost := TxCost{Tip: t.Tip}
 	if t.Kind == types.TxProof {
@@ -176,9 +185,9 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		}
 		next.FeeUsed += size
 	}
-	cost.Base = s.BaseFee * size * dupMul
-	if t.IsText() {
-		cost.Storage = TextStorageFee(s.P, s.Price, int(size))
+	cost.Base = satMul(satMul(s.BaseFee*size, dupMul), burstMul)
+	if t.Kind == types.TxPost && t.TextLen > 0 {
+		cost.Storage, cost.Dest = s.textFee(uint64(t.TextLen), t.Tier, h)
 	}
 
 	// Kind-specific checks.
@@ -211,7 +220,20 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		if s.Likes[likeKey(t.Target, from)] {
 			return errors.New("already liked")
 		}
-	case types.TxUpload, types.TxExtend:
+	case types.TxExtend:
+		var fee uint64
+		var dest uint32
+		var err error
+		if t.Target.IsZero() {
+			fee, dest, err = s.dataFee(t, h, &next)
+		} else {
+			fee, dest, err = s.postExtendFee(t, h)
+		}
+		if err != nil {
+			return err
+		}
+		cost.Storage, cost.Dest = fee, dest
+	case types.TxUpload:
 		fee, dest, err := s.dataFee(t, h, &next)
 		if err != nil {
 			return err
@@ -257,17 +279,11 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	acc.Balance -= total
 	next.Burn += cost.Base
 	next.Tips += cost.Tip
-	if t.Kind == types.TxUpload || t.Kind == types.TxExtend {
-		if _, ok := s.Buckets[cost.Dest]; !ok {
-			s.Buckets[cost.Dest] = &Bucket{ID: cost.Dest}
-		}
-	}
-	if cost.Dest == 0 {
-		s.Endowment += cost.Storage
-	} else {
-		s.Buckets[cost.Dest].Escrow += cost.Storage
-	}
+	s.fund(cost.Dest, cost.Storage)
 	acc.Nonce++
+	if countsForBurst(t.Kind) {
+		acc.Burst, acc.BurstAt = burstScore, h
+	}
 	switch t.Kind {
 	case types.TxTransfer:
 		acc.Balance -= t.Amount
@@ -295,13 +311,26 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		acc.Unbonding = append(acc.Unbonding, Unbond{Amount: t.Amount, Release: h + s.P.UnbondBlocks})
 	case types.TxPost:
 		s.notePost(t, h, dupKey)
+		if t.TextLen > 0 {
+			id := t.ID()
+			pi := *s.Posts[id]
+			pi.TextBucket = cost.Dest
+			s.Posts[id] = &pi
+			s.queueText(id, t.TextHash, t.TextLen, cost.Dest)
+		}
 	case types.TxLike:
 		s.Likes[likeKey(t.Target, from)] = true
 		pi := *s.Posts[t.Target]
 		pi.Likes++
 		s.Posts[t.Target] = &pi
-	case types.TxUpload, types.TxExtend:
+	case types.TxUpload:
 		s.placeData(t, h)
+	case types.TxExtend:
+		if t.Target.IsZero() {
+			s.placeData(t, h)
+		} else {
+			s.applyPostExtend(t, cost.Dest)
+		}
 	case types.TxRegister:
 		if e := s.Epoch(h); acc.PartsEpoch != e+1 {
 			acc.ProveParts = acc.Partitions
@@ -657,6 +686,9 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 			return fmt.Errorf("tx %d (%s): %w", i, t.Kind, err)
 		}
 	}
+	if err := s.seal(hd, h); err != nil {
+		return err
+	}
 	return s.finish(b, ctx, target)
 }
 
@@ -711,8 +743,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	if ctx.FreeStorage > reward {
 		return errors.New("free-lane storage exceeds block reward")
 	}
-	s.Supply += reward
-	s.Endowment += ctx.FreeStorage
+	s.Supply += reward // the anonymous lane's storage is already in escrow
 	s.Supply -= ctx.Burn
 	s.Burned += ctx.Burn
 

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version = "0.2.0"
+	Version = "0.3.0"
 
 	Coin = 100_000_000 // units per coin
 
@@ -24,10 +24,12 @@ const (
 	GB = 1_000_000_000
 
 	TierPermanent uint16 = 0xFFFF // retention tier code for permanent storage
+	TierFree      uint16 = 1      // the only tier of anonymous (free) posts: one month
 
 	MaxPostBytes   = 1024 // text of one post, UTF-8 bytes
 	MaxBoardBytes  = 32
 	MaxAttachments = 4
+	MaxTextBundles = 256 // text bundles one seal block may place
 )
 
 // Params is one network's consensus configuration.
@@ -83,6 +85,20 @@ type Params struct {
 	StakeAgingBlocks  uint64
 	UnbondBlocks      uint64
 	DupWindowBlocks   uint64
+	DupMinBytes       uint64 // shorter texts are not counted as repeats
+
+	// Burst surcharge. Each account has a score that rises by one per signed
+	// transaction and decays by a factor e every BurstTauBlocks, so a steady
+	// rate of r per BurstTauBlocks settles near r. Above BurstFree the base
+	// fee doubles every BurstStep points.
+	BurstTauBlocks uint64
+	BurstFree      uint64
+	BurstStep      uint64
+
+	// Text storage. Post bodies are not in blocks: transactions carry their
+	// hash, and every TextSealBlocks the texts of that window are bundled per
+	// retention bucket into the weave like uploads.
+	TextSealBlocks uint64
 
 	// Anonymous lane (RLN). A membership bonds stake for a per-epoch message
 	// limit; posts prove membership without revealing which member wrote them.
@@ -110,7 +126,7 @@ func mustHex(s string) *big.Int {
 func Testnet() *Params {
 	p := &Params{
 		Name:              "testnet",
-		Magic:             0xCB0A0002, // 0.2.0: new genesis (packing and RLN rules changed)
+		Magic:             0xCB0A0003, // 0.3.0: new genesis (texts moved off-chain)
 		BlockTime:         60 * time.Second,
 		VDFIterations:     400_000,
 		ChallengesPerStep: 4,
@@ -131,7 +147,7 @@ func Testnet() *Params {
 func Devnet() *Params {
 	p := &Params{
 		Name:              "devnet",
-		Magic:             0xCB0D0002,
+		Magic:             0xCB0D0003,
 		BlockTime:         2 * time.Second,
 		VDFIterations:     100_000,
 		ChallengesPerStep: 4,
@@ -153,6 +169,8 @@ func Devnet() *Params {
 	p.RampBlocks = 20
 	p.DupWindowBlocks = 30
 	p.RLNEpochBlocks = 30 // one minute
+	p.TextSealBlocks = 10
+	p.BurstTauBlocks = 30
 	return p
 }
 
@@ -191,6 +209,11 @@ func (p *Params) setEconomics() {
 	p.StakeAgingBlocks = 7 * p.BlocksPerDay
 	p.UnbondBlocks = 30 * p.BlocksPerDay
 	p.DupWindowBlocks = p.BlocksPerDay
+	p.DupMinBytes = 32 // about ten Korean characters
+	p.BurstTauBlocks = p.BlocksPerDay / 24
+	p.BurstFree = 30 // the honest ceiling: 30 an hour
+	p.BurstStep = 10
+	p.TextSealBlocks = p.BlocksPerDay / 24 // hourly bundles
 	p.MinMediaPerBlock = 4 * 1024 * 1024
 	p.MediaHeadroomPerm = 500
 	p.FileCapDivisor = 100

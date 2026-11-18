@@ -14,6 +14,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,6 +53,9 @@ type Config struct {
 	Logf    func(string, ...any)
 	// Embargo overrides the Dandelion++ embargo (tests).
 	Embargo time.Duration
+	// Text finds a post body to serve to a peer: from the text store, or
+	// cut out of a sealed bundle. Defaults to the text store.
+	Text func(Hash) ([]byte, bool)
 }
 
 // Host is the p2p node.
@@ -69,6 +73,8 @@ type Host struct {
 	embargo  map[Hash]*time.Timer
 	fetching map[string]time.Time
 	waiting  map[Hash]*types.Tx // uploads whose chunks are being fetched
+	parked   map[Hash]*parkedBlock
+	askedTxt map[Hash]time.Time // bodies requested, by hash
 
 	ln   net.Listener
 	quit chan struct{}
@@ -106,6 +112,7 @@ func New(cfg Config) (*Host, error) {
 	return &Host{cfg: cfg, tls: tc, nonce: binary.BigEndian.Uint64(nb[:]),
 		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]time.Time{},
 		embargo: map[Hash]*time.Timer{}, fetching: map[string]time.Time{}, waiting: map[Hash]*types.Tx{},
+		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{},
 		quit: make(chan struct{})}, nil
 }
 
@@ -196,6 +203,7 @@ func (h *Host) maintain() {
 	for {
 		h.dialMore()
 		h.refetchWaiting()
+		h.retryParked()
 		select {
 		case <-h.quit:
 			return
@@ -415,9 +423,12 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		if !h.markSeen(blk.Hash()) {
 			return nil
 		}
+		var mt *chain.MissingTextsError
 		switch err := h.cfg.Chain.Add(blk); {
 		case err == nil:
 			h.broadcast(msgBlock, b, p)
+		case errors.As(err, &mt):
+			h.park(blk, b, mt.Hashes, p)
 		case errors.Is(err, chain.ErrOrphan):
 			h.requestSync(p)
 		case errors.Is(err, chain.ErrInvalid):
@@ -459,6 +470,11 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 			if errors.Is(err, chain.ErrInvalid) {
 				return err
 			}
+			var mt *chain.MissingTextsError
+			if errors.As(err, &mt) {
+				// Later blocks of the batch wait as orphans behind this one.
+				h.park(blk, raw, mt.Hashes, p)
+			}
 			if err == nil {
 				added++
 			}
@@ -467,17 +483,66 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 			h.requestSync(p)
 		}
 	case msgTx:
-		t, err := types.DecodeTx(b)
+		t, err := types.DecodeWire(b)
 		if err != nil {
 			return err
 		}
 		h.receiveFluff(p, t, b)
 	case msgStemTx:
-		t, err := types.DecodeTx(b)
+		t, err := types.DecodeWire(b)
 		if err != nil {
 			return err
 		}
 		h.receiveStem(t, b)
+	case msgGetTexts:
+		r := codec.NewReader(b)
+		n := r.Count(maxTextsPerMsg)
+		var w codec.Writer
+		var bodies [][]byte
+		for i := 0; i < n && r.Err == nil; i++ {
+			var x Hash
+			r.Fixed(x[:])
+			if body, ok := h.textFor(x); ok {
+				bodies = append(bodies, body)
+			}
+		}
+		if err := r.Done(); err != nil {
+			return err
+		}
+		if len(bodies) > 0 {
+			w.Var(uint64(len(bodies)))
+			for _, body := range bodies {
+				w.Bytes(body)
+			}
+			p.send(msgTexts, w.B)
+		}
+	case msgTexts:
+		r := codec.NewReader(b)
+		n := r.Count(maxTextsPerMsg)
+		got := 0
+		for i := 0; i < n && r.Err == nil; i++ {
+			body := r.Bytes(params.MaxPostBytes)
+			if r.Err != nil {
+				break
+			}
+			x := types.TextHashOf(body)
+			h.mu.Lock()
+			_, asked := h.askedTxt[x]
+			delete(h.askedTxt, x)
+			h.mu.Unlock()
+			if !asked {
+				continue // unsolicited bodies are not stored
+			}
+			if _, err := h.cfg.Store.PutText(body); err == nil {
+				got++
+			}
+		}
+		if err := r.Done(); err != nil {
+			return err
+		}
+		if got > 0 {
+			h.retryParked()
+		}
 	case msgGetChunk:
 		r := codec.NewReader(b)
 		var root Hash
@@ -578,3 +643,99 @@ func (h *Host) wanted(root Hash, size uint64) bool {
 	}
 	return false
 }
+
+// maxTextsPerMsg bounds the bodies asked for or sent in one message.
+const maxTextsPerMsg = 512
+
+// parkedBlock is a recent block waiting for post bodies.
+type parkedBlock struct {
+	blk  *types.Block
+	raw  []byte
+	from *peer
+	at   time.Time
+}
+
+func (h *Host) textFor(x Hash) ([]byte, bool) {
+	if h.cfg.Text != nil {
+		return h.cfg.Text(x)
+	}
+	return h.cfg.Store.Text(x)
+}
+
+// park keeps a block until its bodies arrive and asks for them.
+func (h *Host) park(blk *types.Block, raw []byte, missing []Hash, from *peer) {
+	h.mu.Lock()
+	if len(h.parked) < maxOrphanBlocks {
+		h.parked[blk.Hash()] = &parkedBlock{blk: blk, raw: raw, from: from, at: time.Now()}
+	}
+	h.mu.Unlock()
+	h.FetchTexts(missing, from)
+}
+
+// retryParked offers parked blocks to the chain again; ones still missing
+// bodies ask again, and ones parked too long are dropped (sync refetches).
+func (h *Host) retryParked() {
+	h.mu.Lock()
+	var ps []*parkedBlock
+	for id, pb := range h.parked {
+		if time.Since(pb.at) > 10*time.Minute {
+			delete(h.parked, id)
+			continue
+		}
+		ps = append(ps, pb)
+	}
+	h.mu.Unlock()
+	sort.Slice(ps, func(i, j int) bool { return ps[i].blk.Height < ps[j].blk.Height })
+	for _, pb := range ps {
+		err := h.cfg.Chain.Add(pb.blk)
+		var mt *chain.MissingTextsError
+		if errors.As(err, &mt) {
+			h.FetchTexts(mt.Hashes, nil)
+			continue
+		}
+		h.mu.Lock()
+		delete(h.parked, pb.blk.Hash())
+		h.mu.Unlock()
+		if err == nil {
+			h.broadcast(msgBlock, pb.raw, pb.from)
+		}
+	}
+}
+
+// FetchTexts asks peers for post bodies: the preferred peer first, then
+// everyone. A body asked for in the last few seconds is not asked again.
+func (h *Host) FetchTexts(hs []Hash, prefer *peer) {
+	h.mu.Lock()
+	var want []Hash
+	for _, x := range hs {
+		if at, ok := h.askedTxt[x]; ok && time.Since(at) < refetchAfter {
+			continue
+		}
+		h.askedTxt[x] = time.Now()
+		want = append(want, x)
+	}
+	if len(h.askedTxt) > 100_000 {
+		for k, at := range h.askedTxt {
+			if time.Since(at) > time.Minute {
+				delete(h.askedTxt, k)
+			}
+		}
+	}
+	h.mu.Unlock()
+	for len(want) > 0 {
+		n := min(len(want), maxTextsPerMsg)
+		var w codec.Writer
+		w.Var(uint64(n))
+		for _, x := range want[:n] {
+			w.Fixed(x[:])
+		}
+		if prefer != nil {
+			prefer.send(msgGetTexts, w.B)
+		}
+		h.broadcast(msgGetTexts, w.B, prefer)
+		want = want[n:]
+	}
+}
+
+// maxOrphanBlocks bounds parked blocks.
+const maxOrphanBlocks = 512

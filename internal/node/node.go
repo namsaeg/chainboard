@@ -39,8 +39,15 @@ type Config struct {
 	PledgeBytes  uint64
 	SendDelayMax time.Duration // own transactions leave after a random delay up to this
 	Embargo      time.Duration // Dandelion++ embargo override (tests)
-	Params       *params.Params
-	Logf         func(string, ...any)
+	// TextCacheDays is how long post bodies (and data) are kept locally when
+	// this node does not store them as a miner; older ones are fetched when
+	// opened. 0 means 30.
+	TextCacheDays uint64
+	// TextWindowSec overrides how recent a block must be to need its
+	// bodies before it is accepted (tests).
+	TextWindowSec int64
+	Params        *params.Params
+	Logf          func(string, ...any)
 }
 
 // Node is a running chainboard node.
@@ -57,9 +64,14 @@ type Node struct {
 
 	dir        string
 	mu         sync.Mutex
+	sendMu     sync.Mutex         // held from choosing a nonce until the tx is queued or sent
 	queue      []queued           // own transactions waiting for their send time
 	sent       map[uint64]*sentTx // own account transactions sent but not yet mined, by nonce
 	lastOutbox []byte             // outbox.json as last written
+	unrefData  map[cryptox.Hash]bool
+	unrefText  map[cryptox.Hash]bool
+	foreign    bool // guarded by rlnMu: another device posts with our key
+	foreignAt  time.Time
 	nextFree   time.Time
 	regFor     []uint64 // partitions we last registered
 	cancel     context.CancelFunc
@@ -150,8 +162,13 @@ func New(cfg Config) (*Node, error) {
 	}
 	n.Pool = mempool.New(ch.Tip(), n.checkUpload)
 	n.Pool.OnDoubleSignal = n.onDoubleSignal
+	n.Pool.Bodies = st
+	ch.Texts = st
+	ch.TextWindowSec = cfg.TextWindowSec
+	ch.KeepBundle = func(data []byte) { _, _ = st.PutData(data) }
 	host, err := p2p.New(p2p.Config{P: p, Chain: ch, Pool: n.Pool, Store: st,
-		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo})
+		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo,
+		Text: n.textBody})
 	if err != nil {
 		return nil, err
 	}
@@ -193,9 +210,10 @@ func (n *Node) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
 	tips := n.Chain.Subscribe()
-	n.wg.Add(2)
+	n.wg.Add(3)
 	go n.tipLoop(ctx, tips)
 	go n.sendLoop(ctx)
+	go n.textLoop(ctx)
 	if n.cfg.Mine {
 		n.wg.Add(1)
 		go func() { defer n.wg.Done(); n.Miner.Run(ctx) }()
@@ -230,6 +248,7 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 			n.syncPool()
 			n.Index.Sync(n.Chain)
 			n.tendSent(st)
+			n.checkForeign(st)
 			n.tendOutbox(st)
 			n.storageDuties(st)
 		case <-t.C:
@@ -259,6 +278,8 @@ func (n *Node) storageDuties(st *state.State) {
 	if n.proofTravelling(st.Epoch(st.Height + 1)) {
 		return
 	}
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
 	if tx, ok := n.Miner.EpochProof(st, n.nextNonce()); ok {
 		_ = n.submit(tx)
 	}
@@ -398,6 +419,15 @@ func (n *Node) tendSent(tip *state.State) {
 
 // prepare fills in nonce and fee and signs.
 func (n *Node) prepare(t *types.Tx) error {
+	if t.Kind == types.TxPost && len(t.Text) > 0 {
+		t.SetText(t.Text)
+		if t.Tier == 0 {
+			t.Tier = params.TierFree
+		}
+	}
+	if err := n.keepBody(t); err != nil {
+		return err
+	}
 	n.syncPool()
 	t.Nonce = n.nextNonce()
 	return n.finish(t)
@@ -447,6 +477,8 @@ func (n *Node) Quote(t *types.Tx) (uint64, error) {
 // first-in first-out so nonces stay in order, and several transactions written
 // close together leave together.
 func (n *Node) Send(t *types.Tx) error {
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
 	if err := n.prepare(t); err != nil {
 		return err
 	}
@@ -462,6 +494,8 @@ func (n *Node) Send(t *types.Tx) error {
 }
 
 func (n *Node) sendNow(t *types.Tx) error {
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
 	if err := n.prepare(t); err != nil {
 		return err
 	}
@@ -485,8 +519,14 @@ func (n *Node) sendLoop(ctx context.Context) {
 		var due []queued
 		n.mu.Lock()
 		for len(n.queue) > 0 && !n.queue[0].sendAt.After(now) {
-			due = append(due, n.queue[0])
+			q := n.queue[0]
+			due = append(due, q)
 			n.queue = n.queue[1:]
+			if q.tx != nil {
+				// Counted as travelling from here on, so its nonce is
+				// never handed out again while it is being sent.
+				n.sent[q.tx.Nonce] = &sentTx{tx: q.tx, at: now}
+			}
 		}
 		n.mu.Unlock()
 		for _, q := range due {
@@ -494,7 +534,7 @@ func (n *Node) sendLoop(ctx context.Context) {
 				n.leaveAnon(*q.anon)
 				continue
 			}
-			if err := n.submit(q.tx); err != nil {
+			if err := n.Host.SubmitOwn(q.tx); err != nil {
 				n.cfg.Logf("node: send %s: %v", q.tx.Kind, err)
 			}
 		}
@@ -558,7 +598,7 @@ func (n *Node) trialState() *state.State {
 // Upload re-encodes an image and stores it. Data already on chain is not
 // uploaded again: if it is kept at least as long as the chosen tier it is
 // simply reused, otherwise an extend lengthens its retention.
-func (n *Node) Upload(raw []byte, tier uint16) (UploadResult, error) {
+func (n *Node) Upload(raw []byte, tier uint16, confirm bool) (UploadResult, error) {
 	months, perm, ok := params.TierMonths(tier)
 	if !ok {
 		return UploadResult{}, errors.New("bad retention tier")
@@ -579,13 +619,13 @@ func (n *Node) Upload(raw []byte, tier uint16) (UploadResult, error) {
 			return UploadResult{Root: root, Action: "reuse", Until: until}, nil
 		}
 		t := &types.Tx{Kind: types.TxExtend, DataRoot: root, Tier: tier}
-		if err := n.Send(t); err != nil {
+		if err := n.SendChecked(t, confirm); err != nil {
 			return UploadResult{Root: root}, err
 		}
 		return UploadResult{Root: root, Action: "extend", Until: st.BucketExpiry(st.BucketFor(st.Height+1, months, perm))}, nil
 	}
 	t := &types.Tx{Kind: types.TxUpload, DataRoot: root, Size: uint64(len(data)), Tier: tier, Media: class}
-	if err := n.Send(t); err != nil {
+	if err := n.SendChecked(t, confirm); err != nil {
 		return UploadResult{Root: root}, err
 	}
 	return UploadResult{Root: root, Action: "upload", Until: st.BucketExpiry(st.BucketFor(st.Height+1, months, perm))}, nil

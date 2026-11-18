@@ -24,6 +24,16 @@ type PostView struct {
 	Lane     string   `json:"lane"`                // "anon" or "fee"
 	Pseudo   bool     `json:"pseudonym,omitempty"` // author is a pseudonym key
 	Pending  bool     `json:"pending,omitempty"`
+	// Retention of the text: tier code, the height it is kept until (0 is
+	// permanent) and whether the body is here ("ok"), being fetched
+	// ("loading") or past its retention ("expired").
+	Tier      uint16 `json:"tier,omitempty"`
+	Until     uint64 `json:"until,omitempty"`
+	TextState string `json:"text_state"`
+
+	id       cryptox.Hash
+	textHash cryptox.Hash
+	textLen  uint16
 }
 
 // Index keeps the posts of the best chain, rebuilt when the chain reorganises.
@@ -33,6 +43,9 @@ type Index struct {
 	posts    map[cryptox.Hash]*PostView
 	byBoard  map[string][]cryptox.Hash
 	comments map[cryptox.Hash][]cryptox.Hash
+	byText   map[cryptox.Hash][]cryptox.Hash // text hash -> posts
+	dataAt   map[cryptox.Hash]uint64         // upload and bundle roots -> height first placed
+	needText []cryptox.Hash                  // posts whose bodies may still be missing
 }
 
 // NewIndex returns an empty index.
@@ -47,12 +60,18 @@ func (ix *Index) reset() {
 	ix.posts = map[cryptox.Hash]*PostView{}
 	ix.byBoard = map[string][]cryptox.Hash{}
 	ix.comments = map[cryptox.Hash][]cryptox.Hash{}
+	ix.byText = map[cryptox.Hash][]cryptox.Hash{}
+	ix.dataAt = map[cryptox.Hash]uint64{}
+	ix.needText = nil
 }
 
 // View converts a post transaction.
 func View(t *types.Tx, height uint64, tm int64) *PostView {
 	v := &PostView{ID: t.ID().String(), Board: t.Board, Text: string(t.Text), Author: t.Author().String(),
-		Height: height, Time: tm, Lane: "fee"}
+		Height: height, Time: tm, Lane: "fee", Tier: t.Tier, TextState: "ok", id: t.ID(), textHash: t.TextHash, textLen: t.TextLen}
+	if t.TextLen > 0 && len(t.Text) == 0 {
+		v.TextState = "loading"
+	}
 	if t.Kind == types.TxAnonPost {
 		v.Lane = "anon"
 		v.Author = ""
@@ -87,12 +106,26 @@ func (ix *Index) Sync(c *chain.Chain) {
 		if b == nil {
 			break
 		}
+		for _, tb := range b.TextBundles {
+			if _, ok := ix.dataAt[tb.Root]; !ok {
+				ix.dataAt[tb.Root] = height
+			}
+		}
 		for _, t := range b.Txs {
+			if t.Kind == types.TxUpload {
+				if _, ok := ix.dataAt[t.DataRoot]; !ok {
+					ix.dataAt[t.DataRoot] = height
+				}
+			}
 			if !t.IsPost() {
 				continue
 			}
 			id := t.ID()
 			ix.posts[id] = View(t, height, b.Time)
+			if t.TextLen > 0 {
+				ix.byText[t.TextHash] = append(ix.byText[t.TextHash], id)
+				ix.needText = append(ix.needText, id)
+			}
 			if t.Parent.IsZero() {
 				ix.byBoard[t.Board] = append(ix.byBoard[t.Board], id)
 			} else {
@@ -107,6 +140,49 @@ func (ix *Index) Sync(c *chain.Chain) {
 			v.Likes, v.Comments = info.Likes, info.Comments
 		}
 	}
+}
+
+// postsWithText lists the posts committing to a body.
+func (ix *Index) postsWithText(x cryptox.Hash) []cryptox.Hash {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return append([]cryptox.Hash(nil), ix.byText[x]...)
+}
+
+// dataHeight is when a data root was first placed (upload or seal).
+func (ix *Index) dataHeight(root cryptox.Hash) (uint64, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	h, ok := ix.dataAt[root]
+	return h, ok
+}
+
+// takeNeedText returns up to n posts whose bodies may be missing, oldest
+// queued first; keep says whether to look at a post again later.
+func (ix *Index) takeNeedText(n int) []cryptox.Hash {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	n = min(n, len(ix.needText))
+	out := append([]cryptox.Hash(nil), ix.needText[:n]...)
+	ix.needText = ix.needText[n:]
+	return out
+}
+
+func (ix *Index) requeueNeedText(ids []cryptox.Hash) {
+	ix.mu.Lock()
+	ix.needText = append(ix.needText, ids...)
+	ix.mu.Unlock()
+}
+
+// post returns a copy of an indexed post.
+func (ix *Index) post(id cryptox.Hash) (PostView, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	v, ok := ix.posts[id]
+	if !ok {
+		return PostView{}, false
+	}
+	return *v, true
 }
 
 // Boards lists boards with their post counts.

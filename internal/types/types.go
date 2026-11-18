@@ -106,17 +106,24 @@ type Tx struct {
 	To     Address // transfer
 	Amount uint64  // transfer, stake, unstake
 
-	Board  string // post
-	Text   []byte
-	Parent Hash   // post: zero for a top-level post, else the post commented on
-	Attach []Hash // post: data roots
+	Board    string // post
+	TextHash Hash   // post, extend of a post: hash of the body (zero: no text)
+	TextLen  uint16 // post, extend of a post: body length in bytes
+	Parent   Hash   // post: zero for a top-level post, else the post commented on
+	Attach   []Hash // post: data roots
 
-	DataRoot Hash // upload, extend
+	DataRoot Hash // upload, extend of data
 	Size     uint64
-	Tier     uint16
+	Tier     uint16 // upload, extend, post (retention of the body)
 	Media    uint8
 
-	Target Hash // like
+	Target Hash // like; extend of a post (the post id)
+
+	// Text is the body of a post. It is not part of the encoding, ID or
+	// signature, which commit to TextHash: it travels next to the
+	// transaction on the network and is stored off-chain, bundled into the
+	// weave with the retention tier the post paid for.
+	Text []byte
 
 	Partitions []uint64 // register
 
@@ -151,7 +158,9 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 		w.Var(t.Amount)
 	case TxPost:
 		w.Bytes([]byte(t.Board))
-		w.Bytes(t.Text)
+		w.Fixed(t.TextHash[:])
+		w.U16(t.TextLen)
+		w.U16(t.Tier)
 		w.Fixed(t.Parent[:])
 		w.Var(uint64(len(t.Attach)))
 		for _, a := range t.Attach {
@@ -165,6 +174,9 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 	case TxExtend:
 		w.Fixed(t.DataRoot[:])
 		w.U16(t.Tier)
+		w.Fixed(t.Target[:])
+		w.Fixed(t.TextHash[:])
+		w.U16(t.TextLen)
 	case TxLike:
 		w.Fixed(t.Target[:])
 	case TxRegister:
@@ -203,11 +215,13 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 	}
 }
 
-// encodeAnonContent is what an anonymous post says: board, text, parent and
-// the optional pseudonym key.
+// encodeAnonContent is what an anonymous post says: board, text (by hash),
+// tier, parent and the optional pseudonym key.
 func (t *Tx) encodeAnonContent(w *codec.Writer) {
 	w.Bytes([]byte(t.Board))
-	w.Bytes(t.Text)
+	w.Fixed(t.TextHash[:])
+	w.U16(t.TextLen)
+	w.U16(t.Tier)
 	w.Fixed(t.Parent[:])
 	if len(t.PseudoPub) > 0 {
 		w.Fixed(t.PseudoPub)
@@ -299,7 +313,9 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		t.Amount = r.Var()
 	case TxPost:
 		t.Board = string(r.Bytes(params.MaxBoardBytes))
-		t.Text = r.Bytes(params.MaxPostBytes)
+		r.Fixed(t.TextHash[:])
+		t.TextLen = r.U16()
+		t.Tier = r.U16()
 		r.Fixed(t.Parent[:])
 		n := r.Count(params.MaxAttachments)
 		for i := 0; i < n; i++ {
@@ -315,6 +331,9 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 	case TxExtend:
 		r.Fixed(t.DataRoot[:])
 		t.Tier = r.U16()
+		r.Fixed(t.Target[:])
+		r.Fixed(t.TextHash[:])
+		t.TextLen = r.U16()
 	case TxLike:
 		r.Fixed(t.Target[:])
 	case TxRegister:
@@ -333,7 +352,9 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		t.Proof = p
 	case TxAnonPost:
 		t.Board = string(r.Bytes(params.MaxBoardBytes))
-		t.Text = r.Bytes(params.MaxPostBytes)
+		r.Fixed(t.TextHash[:])
+		t.TextLen = r.U16()
+		t.Tier = r.U16()
 		r.Fixed(t.Parent[:])
 		pub := make([]byte, ed25519.PublicKeySize)
 		r.Fixed(pub)
@@ -388,20 +409,121 @@ func DecodeTx(b []byte) (*Tx, error) {
 	return t, r.Done()
 }
 
+// TextHashOf is the commitment a post makes to its body.
+func TextHashOf(body []byte) Hash { return cryptox.Tagged("cb/text", body) }
+
+// SetText attaches a body and commits to it.
+func (t *Tx) SetText(body []byte) {
+	t.Text = append([]byte(nil), body...)
+	t.TextLen = uint16(len(body))
+	t.TextHash = Hash{}
+	if len(body) > 0 {
+		t.TextHash = TextHashOf(body)
+	}
+}
+
+// NeedsBody reports whether the transaction commits to a body that must
+// travel with it: a post with text, or the extension of a post.
+func (t *Tx) NeedsBody() bool {
+	switch t.Kind {
+	case TxPost, TxAnonPost:
+		return t.TextLen > 0
+	case TxExtend:
+		return !t.Target.IsZero()
+	}
+	return false
+}
+
+// CheckBody verifies the attached body against the commitment.
+func (t *Tx) CheckBody() error {
+	if len(t.Text) != int(t.TextLen) {
+		return errors.New("text body has the wrong length")
+	}
+	if len(t.Text) > 0 && TextHashOf(t.Text) != t.TextHash {
+		return errors.New("text body does not match its hash")
+	}
+	if !utf8.Valid(t.Text) {
+		return errors.New("post text must be UTF-8")
+	}
+	return nil
+}
+
+func checkTextCommitment(t *Tx) error {
+	if t.TextLen > params.MaxPostBytes {
+		return fmt.Errorf("text longer than %d bytes", params.MaxPostBytes)
+	}
+	if (t.TextLen == 0) != t.TextHash.IsZero() {
+		return errors.New("text hash and length disagree")
+	}
+	if t.Text != nil {
+		return t.CheckBody()
+	}
+	return nil
+}
+
 func checkPostContent(t *Tx) error {
-	if !utf8.Valid(t.Text) || !utf8.ValidString(t.Board) {
-		return errors.New("post text and board must be UTF-8")
+	if !utf8.ValidString(t.Board) {
+		return errors.New("board must be UTF-8")
 	}
 	if len(t.Board) == 0 {
 		return errors.New("post needs a board")
 	}
-	if len(t.Text) == 0 && len(t.Attach) == 0 {
-		return errors.New("empty post")
+	if err := checkTextCommitment(t); err != nil {
+		return err
+	}
+	if t.TextLen == 0 {
+		if len(t.Attach) == 0 {
+			return errors.New("empty post")
+		}
+		if t.Tier != 0 {
+			return errors.New("retention tier without text")
+		}
+	} else if _, _, ok := params.TierMonths(t.Tier); !ok {
+		return errors.New("bad text retention tier")
 	}
 	if !t.Parent.IsZero() && len(t.Attach) > 0 {
 		return errors.New("comments cannot carry attachments")
 	}
 	return nil
+}
+
+// LaneSize is what a transaction takes from its lane: its encoding plus its
+// body, which nodes relay and the weave stores.
+func (t *Tx) LaneSize() int { return t.EncodedSize() + int(t.TextLen) }
+
+// maxTxBytes bounds one encoded transaction (proofs are the largest).
+const maxTxBytes = 1 << 20
+
+// EncodeWire is the network form: the encoding and then the body.
+func (t *Tx) EncodeWire() []byte {
+	var w codec.Writer
+	w.Bytes(t.Encode())
+	w.Bytes(t.Text)
+	return w.B
+}
+
+// DecodeWire parses the network form and checks the body.
+func DecodeWire(b []byte) (*Tx, error) {
+	r := codec.NewReader(b)
+	raw := r.Bytes(maxTxBytes)
+	body := r.Bytes(params.MaxPostBytes)
+	if err := r.Done(); err != nil {
+		return nil, err
+	}
+	t, err := DecodeTx(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > 0 || t.NeedsBody() {
+		t.Text = body
+		if t.Text == nil {
+			t.Text = []byte{}
+		}
+		if err := t.CheckBody(); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
 }
 
 // CheckStateless validates everything that does not need chain state.
@@ -412,8 +534,11 @@ func (t *Tx) CheckStateless() error {
 		if t.RLN == nil || len(t.RLN.Proof) == 0 || len(t.RLN.Proof) > MaxRLNProof {
 			return errors.New("anonymous post needs an RLN proof")
 		}
-		if len(t.Attach) > 0 {
+		if len(t.Attach) > 0 || t.TextLen == 0 {
 			return errors.New("anonymous posts are text only")
+		}
+		if t.Tier != params.TierFree {
+			return errors.New("anonymous posts are kept for one month")
 		}
 		if err := checkPostContent(t); err != nil {
 			return err
@@ -452,6 +577,20 @@ func (t *Tx) CheckStateless() error {
 		if _, _, ok := params.TierMonths(t.Tier); !ok {
 			return errors.New("bad tier")
 		}
+		if t.DataRoot.IsZero() == t.Target.IsZero() {
+			return errors.New("extend names either a data root or a post")
+		}
+		if t.Target.IsZero() && (t.TextLen != 0 || !t.TextHash.IsZero()) {
+			return errors.New("extend of data carries no text")
+		}
+		if !t.Target.IsZero() {
+			if t.TextLen == 0 {
+				return errors.New("extend of a post without text")
+			}
+			if err := checkTextCommitment(t); err != nil {
+				return err
+			}
+		}
 	case TxRLNJoin:
 		if t.Limit == 0 || t.Amount == 0 {
 			return errors.New("membership needs a limit and a bond")
@@ -489,21 +628,32 @@ type Solution struct {
 
 // Header is a block header.
 type Header struct {
-	Version    uint32
-	Height     uint64
-	Prev       Hash
-	Time       int64
-	Target     Hash // big-endian
-	TxRoot     Hash
-	BoardRoot  Hash
-	VDFStep    uint64 // global index of the last VDF output
-	VDFOutputs []Hash // outputs since the parent; the last one seeds the challenge
-	Sol        Solution
-	Miner      []byte // Ed25519 public key
-	Sig        []byte
+	Version   uint32
+	Height    uint64
+	Prev      Hash
+	Time      int64
+	Target    Hash // big-endian
+	TxRoot    Hash
+	BoardRoot Hash
+	// TextBundles places the texts of the closing seal window into the
+	// weave, one bundle per retention bucket. Empty except in seal blocks.
+	TextBundles []TextBundle
+	VDFStep     uint64 // global index of the last VDF output
+	VDFOutputs  []Hash // outputs since the parent; the last one seeds the challenge
+	Sol         Solution
+	Miner       []byte // Ed25519 public key
+	Sig         []byte
 }
 
 const maxVDFOutputs = 100_000
+
+// TextBundle is the data root and size of the bodies a seal block places in
+// one bucket: the bodies of that bucket's queued texts, concatenated.
+type TextBundle struct {
+	Bucket uint32
+	Root   Hash
+	Size   uint64
+}
 
 func (h *Header) encodeBody(w *codec.Writer) {
 	w.U32(h.Version)
@@ -513,6 +663,12 @@ func (h *Header) encodeBody(w *codec.Writer) {
 	w.Fixed(h.Target[:])
 	w.Fixed(h.TxRoot[:])
 	w.Fixed(h.BoardRoot[:])
+	w.Var(uint64(len(h.TextBundles)))
+	for _, tb := range h.TextBundles {
+		w.U32(tb.Bucket)
+		w.Fixed(tb.Root[:])
+		w.Var(tb.Size)
+	}
 	w.Var(h.VDFStep)
 	w.Var(uint64(len(h.VDFOutputs)))
 	for _, o := range h.VDFOutputs {
@@ -579,6 +735,14 @@ func DecodeBlock(b []byte) (*Block, error) {
 	r.Fixed(h.Target[:])
 	r.Fixed(h.TxRoot[:])
 	r.Fixed(h.BoardRoot[:])
+	nb := r.Count(params.MaxTextBundles)
+	for i := 0; i < nb && r.Err == nil; i++ {
+		var tb TextBundle
+		tb.Bucket = r.U32()
+		r.Fixed(tb.Root[:])
+		tb.Size = r.Var()
+		h.TextBundles = append(h.TextBundles, tb)
+	}
 	h.VDFStep = r.Var()
 	n := r.Count(maxVDFOutputs)
 	for i := 0; i < n; i++ {
@@ -598,7 +762,7 @@ func DecodeBlock(b []byte) (*Block, error) {
 	r.Fixed(h.Sig)
 	nt := r.Count(maxBlockTxs)
 	for i := 0; i < nt && r.Err == nil; i++ {
-		tb := r.Bytes(1 << 20)
+		tb := r.Bytes(maxTxBytes)
 		if r.Err != nil {
 			break
 		}

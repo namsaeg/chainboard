@@ -42,7 +42,7 @@ func (n *Node) outboxSnapshot() []byte {
 	n.mu.Lock()
 	for _, q := range n.queue {
 		if q.tx != nil {
-			f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(q.tx.Encode()), SendAt: q.sendAt.Unix()})
+			f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(q.tx.EncodeWire()), SendAt: q.sendAt.Unix()})
 		}
 	}
 	var sent []*types.Tx
@@ -52,7 +52,7 @@ func (n *Node) outboxSnapshot() []byte {
 	n.mu.Unlock()
 	sort.Slice(sent, func(i, j int) bool { return sent[i].Nonce < sent[j].Nonce })
 	for _, t := range sent {
-		f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(t.Encode()), Sent: true})
+		f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(t.EncodeWire()), Sent: true})
 	}
 	for _, r := range n.QueuedAnon() {
 		a := outboxAnon{Board: r.Board, Text: r.Text, Pseudo: r.Pseudo}
@@ -96,7 +96,7 @@ func (n *Node) loadOutbox() {
 		if err != nil {
 			continue
 		}
-		t, err := types.DecodeTx(raw)
+		t, err := types.DecodeWire(raw)
 		if err != nil || t.Nonce < mined {
 			continue
 		}

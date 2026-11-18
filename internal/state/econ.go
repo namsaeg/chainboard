@@ -53,11 +53,6 @@ func StorageFee(p *params.Params, price, bytes, replicas, months uint64, perm bo
 	return x.Uint64()
 }
 
-// TextStorageFee prices a text transaction as permanent, text-replicated data.
-func TextStorageFee(p *params.Params, price uint64, size int) uint64 {
-	return StorageFee(p, price, uint64(size), p.TextReplicas, 0, true)
-}
-
 // BaseReward is the bootstrap schedule: a linear ramp, then halvings.
 func BaseReward(p *params.Params, h uint64) uint64 {
 	if h == 0 {

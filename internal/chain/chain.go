@@ -15,6 +15,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -42,10 +43,37 @@ type entry struct {
 	parent Hash
 }
 
+// TextSource gives the post bodies a node holds.
+type TextSource interface {
+	Text(Hash) ([]byte, bool)
+}
+
+// MissingTextsError: a recent block cannot be accepted until these bodies
+// are here. The block is not invalid; it waits.
+type MissingTextsError struct{ Hashes []Hash }
+
+func (e *MissingTextsError) Error() string {
+	return fmt.Sprintf("chain: waiting for %d post bodies", len(e.Hashes))
+}
+
+// TextWindow is how recent (by block time) a block must be for this node to
+// demand its post bodies. Bodies of older blocks may have expired; they are
+// fetched for display when wanted, not for validation.
+const TextWindow = 24 * 3600
+
 // Chain is safe for concurrent use.
 type Chain struct {
 	P           *params.Params
 	GenesisData []byte
+	// Texts, if set, holds the bodies that recent blocks must come with: a
+	// node accepts a recent block only with all of its bodies, and a seal
+	// block only if its bundles match them.
+	Texts TextSource
+	// TextWindowSec overrides TextWindow (tests).
+	TextWindowSec int64
+	// KeepBundle, if set, receives each text bundle a seal check rebuilt,
+	// so the node can serve its chunks to miners right away.
+	KeepBundle func([]byte)
 
 	mu       sync.RWMutex
 	db       *bolt.DB // nil for an in-memory chain
@@ -267,8 +295,27 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 	if !persist {
 		// Read back from our own database: validated before it was stored.
 		apply = func() error { return st.ReplayBlock(b) }
+	} else if c.Texts != nil && now > 0 && b.Time >= now-c.textWindow() {
+		var missing []Hash
+		for _, t := range b.Txs {
+			if t.NeedsBody() {
+				if _, ok := c.Texts.Text(t.TextHash); !ok {
+					missing = append(missing, t.TextHash)
+				}
+			}
+		}
+		if len(missing) > 0 {
+			return &MissingTextsError{Hashes: missing}
+		}
+		st.SetTextCheck(c.checkBundle)
 	}
-	if err := apply(); err != nil {
+	err = apply()
+	st.SetTextCheck(nil)
+	var mt *MissingTextsError
+	if errors.As(err, &mt) {
+		return mt
+	}
+	if err != nil {
 		c.bad[h] = err
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
@@ -366,4 +413,27 @@ func (c *Chain) Work() *big.Int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return new(big.Int).Set(c.blocks[c.best].work)
+}
+
+func (c *Chain) textWindow() int64 {
+	if c.TextWindowSec > 0 {
+		return c.TextWindowSec
+	}
+	return TextWindow
+}
+
+// checkBundle rebuilds a seal block's text bundle from our bodies and
+// compares its data root with the header's.
+func (c *Chain) checkBundle(b state.BundleSpec, root Hash) error {
+	data, missing := state.BundleBytes(b, c.Texts.Text)
+	if len(missing) > 0 {
+		return &MissingTextsError{Hashes: missing}
+	}
+	if r, _ := chunk.Root(data); r != root {
+		return fmt.Errorf("text bundle for bucket %d does not match its bodies", b.Bucket)
+	}
+	if c.KeepBundle != nil {
+		c.KeepBundle(data)
+	}
+	return nil
 }

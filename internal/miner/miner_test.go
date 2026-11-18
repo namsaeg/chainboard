@@ -51,10 +51,19 @@ func newRig(t *testing.T, p *params.Params, seed byte) *rig {
 	}
 	r := &rig{p: p, c: c, st: st, clock: state.GenesisTime}
 	r.pool = mempool.New(c.Tip(), nil)
+	r.pool.Bodies = st
+	c.Texts = st
 	key := cryptox.KeyFromSeed(append(make([]byte, 31), seed))
 	r.m = &Miner{Chain: c, Pool: r.pool, Store: st, Key: key, PledgeBytes: 1 << 40,
 		Logf: t.Logf, Now: func() int64 { r.clock += int64(p.BlockTime.Seconds()); return r.clock }}
 	return r
+}
+
+// textPost is a fee-lane post kept for a month.
+func textPost(board, text string, parent types.Hash) *types.Tx {
+	t := &types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: board, Tier: params.TierFree, Parent: parent}
+	t.SetText([]byte(text))
+	return t
 }
 
 // mineTo mines until the chain reaches height h.
@@ -86,8 +95,8 @@ func TestMineAndPost(t *testing.T) {
 		t.Fatalf("miner got no income: %+v", acc)
 	}
 	// Fee-lane post.
-	post := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce, Lane: types.LaneFee, MaxFee: 10 * params.Coin,
-		Board: "free", Text: []byte("안녕하세요 chainboard")}
+	post := textPost("free", "안녕하세요 chainboard", types.Hash{})
+	post.Nonce, post.MaxFee = acc.Nonce, 10*params.Coin
 	post.Sign(r.m.Key)
 	r.pool.Reset(tip)
 	if err := r.pool.Add(post); err != nil {
@@ -100,15 +109,15 @@ func TestMineAndPost(t *testing.T) {
 	}
 	// A comment, and a reply to that comment (not allowed).
 	acc = tip.Peek(addr)
-	cm := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce, MaxFee: 10 * params.Coin, Board: "free",
-		Text: []byte("댓글"), Parent: post.ID()}
+	cm := textPost("free", "댓글", post.ID())
+	cm.Nonce, cm.MaxFee = acc.Nonce, 10*params.Coin
 	cm.Sign(r.m.Key)
 	r.pool.Reset(tip)
 	if err := r.pool.Add(cm); err != nil {
 		t.Fatal(err)
 	}
-	bad := &types.Tx{Kind: types.TxPost, Nonce: acc.Nonce + 1, MaxFee: 10 * params.Coin, Board: "free",
-		Text: []byte("답글"), Parent: cm.ID()}
+	bad := textPost("free", "답글", cm.ID())
+	bad.Nonce, bad.MaxFee = acc.Nonce+1, 10*params.Coin
 	bad.Sign(r.m.Key)
 	if err := r.pool.Add(bad); err == nil {
 		t.Fatal("reply to a comment accepted")

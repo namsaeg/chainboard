@@ -34,6 +34,8 @@ type AnonRequest struct {
 	Text   string
 	Parent cryptox.Hash
 	Pseudo bool
+	// Confirm accepts the warning shown before the epoch's last post.
+	Confirm bool
 }
 
 type rlnIdentity struct {
@@ -157,6 +159,8 @@ type RLNInfo struct {
 	EpochLeft  uint64 `json:"epoch_blocks_left"`
 	Members    int    `json:"members"`
 	Pseudonym  string `json:"pseudonym,omitempty"`
+	Remaining  uint64 `json:"remaining"`   // anonymous posts left this epoch
+	ForeignUse bool   `json:"foreign_use"` // another device uses this key
 }
 
 // RLNStatus reports the membership. Active means mined: proofs are made
@@ -180,6 +184,7 @@ func (n *Node) RLNStatus() RLNInfo {
 		info.Pseudonym = n.pseudo.Address().String()
 	}
 	info.Used = len(n.usage.Epochs[e])
+	info.ForeignUse = n.foreign
 	idc, ok := n.commitment()
 	if !ok {
 		return info
@@ -200,6 +205,9 @@ func (n *Node) RLNStatus() RLNInfo {
 	}
 	if found {
 		info.Limit, info.Bond = uint64(m.Limit), m.Bond
+		if lim := min(uint64(m.Limit), cap); lim > uint64(info.Used) && m.Status != state.MemberGone {
+			info.Remaining = lim - uint64(info.Used)
+		}
 	}
 	return info
 }
@@ -267,6 +275,31 @@ func (n *Node) joining() bool {
 	return pooled
 }
 
+// joinLimit is the message limit our travelling or pooled join asks for.
+func (n *Node) joinLimit(idc cryptox.Hash) (uint64, bool) {
+	isJoin := func(t *types.Tx) bool { return t != nil && t.Kind == types.TxRLNJoin && t.Commitment == idc }
+	n.mu.Lock()
+	for _, q := range n.queue {
+		if isJoin(q.tx) {
+			n.mu.Unlock()
+			return uint64(q.tx.Limit), true
+		}
+	}
+	for _, s := range n.sent {
+		if isJoin(s.tx) {
+			n.mu.Unlock()
+			return uint64(s.tx.Limit), true
+		}
+	}
+	n.mu.Unlock()
+	for _, t := range n.Pool.Pending() {
+		if isJoin(t) {
+			return uint64(t.Limit), true
+		}
+	}
+	return 0, false
+}
+
 // LeaveRLN starts the exit of the membership; the bond returns after the
 // unbonding period, during which the membership can still be slashed.
 func (n *Node) LeaveRLN() error {
@@ -307,22 +340,67 @@ func (n *Node) AnonPost(req AnonRequest) error {
 	case !found && !n.joining():
 		return errors.New("join the anonymous lane first (bond some mature stake)")
 	}
-	if found {
-		// Spare the user a post that cannot leave this epoch.
-		e, cap := tip.AnonEpochCap()
-		n.rlnMu.Lock()
-		used := len(n.usage.Epochs[e])
-		n.rlnMu.Unlock()
-		if uint64(used+n.queuedAnon()) >= min(uint64(m.Limit), cap) {
-			return fmt.Errorf("%w (%d); the next epoch starts in %d blocks", errLimit, min(uint64(m.Limit), cap),
-				(e+1)*tip.P.RLNEpochBlocks-(tip.Height+1))
-		}
+	n.checkForeign(tip) // the tip watcher may not have looked yet
+	n.rlnMu.Lock()
+	foreign := n.foreign
+	n.rlnMu.Unlock()
+	if foreign {
+		return ErrForeignUse
 	}
 	// Build a draft to surface content errors now rather than after the delay.
-	draft := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Text: []byte(req.Text), Parent: req.Parent,
-		RLN: &types.RLNProof{Proof: []byte{0}}}
-	if err := draft.CheckStateless(); err != nil {
+	draft := newAnonTx(req)
+	if req.Pseudo && n.pseudo != nil {
+		draft.PseudoPub = append([]byte(nil), n.pseudo.Pub...)
+	}
+	draft.RLN = &types.RLNProof{Proof: []byte{0}}
+	if err := checkAnonContent(draft); err != nil {
 		return err
+	}
+	if found {
+		// Reserve the message id now, so the count is exact however many
+		// posts wait in the queue, and warn before the epoch's last one.
+		e, cap := tip.AnonEpochCap()
+		limit := min(uint64(m.Limit), cap)
+		left := (e+1)*tip.P.RLNEpochBlocks - (tip.Height + 1)
+		mins := (time.Duration(left)*tip.P.BlockTime + time.Minute - 1) / time.Minute
+		sig := draft.Signal()
+		n.rlnMu.Lock()
+		used := uint64(len(n.usage.Epochs[e]))
+		again := false
+		for _, s := range n.usage.Epochs[e] {
+			again = again || s == sig.String()
+		}
+		if !again {
+			if used >= limit {
+				n.rlnMu.Unlock()
+				return fmt.Errorf("%w (%d); the next epoch starts in %d blocks", errLimit, limit, left)
+			}
+			if used+1 == limit && !req.Confirm {
+				n.rlnMu.Unlock()
+				return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
+					"이번 에포크에 쓸 수 있는 마지막 익명 글이에요(%d/%d). 보내면 약 %d분(%d블록) 뒤 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
+					limit, limit, mins, left)}}}
+			}
+		}
+		_, err := n.allocMsgID(e, limit, sig)
+		n.rlnMu.Unlock()
+		if err != nil {
+			return err
+		}
+	} else if limit, ok := n.joinLimit(idc); ok {
+		// Joining: posts wait for the join. Count them against the limit
+		// the join asks for, so the warning still comes first.
+		_, cap := tip.AnonEpochCap()
+		limit = min(limit, cap)
+		waiting := uint64(len(n.unsentAnon()))
+		if waiting >= limit {
+			return fmt.Errorf("%w (%d): this many posts already wait for the membership", errLimit, limit)
+		}
+		if waiting+1 == limit && !req.Confirm {
+			return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
+				"가입이 처리되면 이 글이 이번 에포크의 마지막 익명 글이 돼요(%d/%d). 그 뒤로는 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
+				limit, limit)}}}
+		}
 	}
 	n.enqueue(queued{anon: &req})
 	return nil
@@ -369,11 +447,7 @@ func (n *Node) allocMsgID(epoch, max uint64, signal cryptox.Hash) (uint64, error
 				delete(n.usage.Epochs, e)
 			}
 		}
-		b, err := json.Marshal(n.usage)
-		if err != nil {
-			return 0, err
-		}
-		if err := writeFileAtomic(n.rlnPath("rln_used.json"), b); err != nil {
+		if err := n.saveUsageLocked(); err != nil {
 			delete(used, uint16(id))
 			return 0, err
 		}
@@ -382,10 +456,24 @@ func (n *Node) allocMsgID(epoch, max uint64, signal cryptox.Hash) (uint64, error
 	return 0, fmt.Errorf("%w (%d)", errLimit, max)
 }
 
+// saveUsageLocked writes the message-id ledger (rlnMu held).
+func (n *Node) saveUsageLocked() error {
+	b, err := json.Marshal(n.usage)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(n.rlnPath("rln_used.json"), b)
+}
+
 // buildAnon proves an anonymous post against st. The message id is chosen
 // and recorded under the lock; the slow proving runs outside it.
 func (n *Node) buildAnon(req AnonRequest, st *state.State) (*types.Tx, error) {
+	n.checkForeign(st)
 	n.rlnMu.Lock()
+	if n.foreign {
+		n.rlnMu.Unlock()
+		return nil, ErrForeignUse
+	}
 	idc, ok := n.commitment()
 	if !ok {
 		n.rlnMu.Unlock()
@@ -397,7 +485,7 @@ func (n *Node) buildAnon(req AnonRequest, st *state.State) (*types.Tx, error) {
 		return nil, state.ErrNotMember
 	}
 	epoch, cap := st.AnonEpochCap()
-	t := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Text: []byte(req.Text), Parent: req.Parent}
+	t := newAnonTx(req)
 	if req.Pseudo && n.pseudo != nil {
 		t.PseudoPub = append([]byte(nil), n.pseudo.Pub...)
 		ph := t.PseudoHash()
@@ -412,20 +500,27 @@ func (n *Node) buildAnon(req AnonRequest, st *state.State) (*types.Tx, error) {
 	if err := st.ProveAnon(t, secret, msgID); err != nil {
 		return nil, err
 	}
+	if err := n.keepBody(t); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
-// queuedAnon counts anonymous posts waiting in the send queue.
-func (n *Node) queuedAnon() int {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	c := 0
-	for _, q := range n.queue {
-		if q.anon != nil {
-			c++
-		}
+// checkAnonContent checks a draft's content (its proof is a placeholder).
+func checkAnonContent(t *types.Tx) error {
+	if len(t.PseudoPub) > 0 {
+		c := *t
+		c.PseudoPub, c.PseudoSig = nil, nil
+		return c.CheckStateless()
 	}
-	return c
+	return t.CheckStateless()
+}
+
+// newAnonTx is an anonymous post's content: kept for one month.
+func newAnonTx(req AnonRequest) *types.Tx {
+	t := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Parent: req.Parent, Tier: params.TierFree}
+	t.SetText([]byte(req.Text))
+	return t
 }
 
 // leaveAnon sends a due anonymous post. One written while the join was
@@ -442,7 +537,7 @@ func (n *Node) leaveAnon(req AnonRequest) {
 		return
 	}
 	n.cfg.Logf("node: anonymous post: %v", err)
-	if errors.Is(err, errLimit) || errors.Is(err, state.ErrNotMember) {
+	if errors.Is(err, errLimit) || errors.Is(err, state.ErrNotMember) || errors.Is(err, ErrForeignUse) {
 		return
 	}
 	n.rlnMu.Lock()
@@ -510,7 +605,8 @@ func (n *Node) tendOutbox(st *state.State) {
 	for _, it := range again {
 		if err := n.sendAnon(it.req, it.tries+1); err != nil {
 			n.cfg.Logf("node: resend anonymous post: %v", err)
-			if !errors.Is(err, errLimit) && !errors.Is(err, state.ErrNotMember) && it.tries+1 < maxTries {
+			if !errors.Is(err, errLimit) && !errors.Is(err, state.ErrNotMember) && !errors.Is(err, ErrForeignUse) &&
+				it.tries+1 < maxTries {
 				n.rlnMu.Lock()
 				n.outbox = append(n.outbox, &outboxItem{req: it.req, sentAt: st.Height, tries: it.tries + 1, since: time.Now()})
 				n.rlnMu.Unlock()

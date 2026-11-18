@@ -5,6 +5,7 @@ package miner
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/big"
 	"sort"
@@ -250,6 +251,11 @@ func (m *Miner) build(tip *state.State, target *big.Int, outputs []cryptox.Hash,
 	}
 	b := &types.Block{Txs: txs}
 	hd := &b.Header
+	bundles, err := m.sealBundles(tip, txs)
+	if err != nil {
+		return nil, err
+	}
+	hd.TextBundles = bundles
 	hd.Version = 1
 	hd.Height = tip.Height + 1
 	hd.Prev = tip.Tip
@@ -265,6 +271,35 @@ func (m *Miner) build(tip *state.State, target *big.Int, outputs []cryptox.Hash,
 	sh := hd.SigHash()
 	hd.Sig = m.Key.Sign(sh[:])
 	return b, nil
+}
+
+// sealBundles builds the text bundles of a seal block from the bodies in the
+// store, and keeps each bundle as data so it can be served and packed.
+func (m *Miner) sealBundles(tip *state.State, txs []*types.Tx) ([]types.TextBundle, error) {
+	h := tip.Height + 1
+	if !tip.SealsAt(h) {
+		return nil, nil
+	}
+	st := tip.Clone()
+	ctx := st.NewCtx()
+	for _, t := range txs {
+		if err := st.ApplyTx(t, ctx); err != nil {
+			return nil, fmt.Errorf("template tx no longer applies: %w", err)
+		}
+	}
+	var out []types.TextBundle
+	for _, spec := range st.PendingBundles(h) {
+		data, missing := state.BundleBytes(spec, m.Store.Text)
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("seal needs %d post bodies this node lacks", len(missing))
+		}
+		root, err := m.Store.PutData(data)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, types.TextBundle{Bucket: spec.Bucket, Root: root, Size: spec.Size})
+	}
+	return out, nil
 }
 
 // EpochProof builds this epoch's storage proof transaction, if one is due.

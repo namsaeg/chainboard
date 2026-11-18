@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/merkle"
 	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/types"
 )
 
 type Hash = cryptox.Hash
@@ -27,6 +29,7 @@ var (
 	bMeta   = []byte("meta")   // root -> size (u64)
 	bChunks = []byte("chunks") // root || index (u64) -> raw chunk
 	bPacked = []byte("packed") // miner || bucket (u32) || position (u64) -> packed replica
+	bTexts  = []byte("texts")  // text hash -> post body
 )
 
 // Store is safe for concurrent use.
@@ -47,7 +50,7 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bMeta, bChunks, bPacked} {
+		for _, b := range [][]byte{bMeta, bChunks, bPacked, bTexts} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -385,3 +388,104 @@ func (s *Store) ImportV010(dir string) (int, error) {
 
 // HexRoot formats a root for logs.
 func HexRoot(h Hash) string { return hex.EncodeToString(h[:8]) }
+
+// PutText keeps a post body, keyed by its hash. Bodies are checked here, so
+// a stored body always matches its key.
+func (s *Store) PutText(body []byte) (Hash, error) {
+	if len(body) == 0 || len(body) > params.MaxPostBytes || !utf8.Valid(body) {
+		return Hash{}, errors.New("store: not a valid post body")
+	}
+	h := types.TextHashOf(body)
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bTexts)
+		if b.Get(h[:]) != nil {
+			return nil
+		}
+		return b.Put(h[:], body)
+	})
+	return h, err
+}
+
+// Text reads a post body.
+func (s *Store) Text(h Hash) ([]byte, bool) {
+	var out []byte
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(bTexts).Get(h[:]); v != nil {
+			out = append([]byte(nil), v...)
+		}
+		return nil
+	})
+	return out, out != nil
+}
+
+// HasText reports whether a body is stored.
+func (s *Store) HasText(h Hash) bool {
+	ok := false
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(bTexts).Get(h[:]) != nil
+		return nil
+	})
+	return ok
+}
+
+// TextHashes lists the stored bodies.
+func (s *Store) TextHashes() []Hash {
+	var out []Hash
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bTexts).ForEach(func(k, _ []byte) error {
+			var h Hash
+			copy(h[:], k)
+			out = append(out, h)
+			return nil
+		})
+	})
+	return out
+}
+
+// DeleteTexts removes bodies.
+func (s *Store) DeleteTexts(hs []Hash) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bTexts)
+		for _, h := range hs {
+			if err := b.Delete(h[:]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Roots lists the data roots this store knows (complete or not).
+func (s *Store) Roots() []Hash {
+	var out []Hash
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bMeta).ForEach(func(k, _ []byte) error {
+			var h Hash
+			copy(h[:], k)
+			out = append(out, h)
+			return nil
+		})
+	})
+	return out
+}
+
+// DeleteData removes data and its chunks (not packed replicas).
+func (s *Store) DeleteData(root Hash) error {
+	size, ok := s.Size(root)
+	if !ok {
+		return nil
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		cb := tx.Bucket(bChunks)
+		for i := uint64(0); i < chunk.Count(size); i++ {
+			if err := cb.Delete(chunkKey(root, i)); err != nil {
+				return err
+			}
+		}
+		return tx.Bucket(bMeta).Delete(root[:])
+	})
+	s.mu.Lock()
+	delete(s.leaves, root)
+	s.mu.Unlock()
+	return err
+}

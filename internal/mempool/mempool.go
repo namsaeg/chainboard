@@ -5,6 +5,7 @@ package mempool
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -27,6 +28,11 @@ type Pool struct {
 	// anonymous post double-signals: the member's secret can be recovered
 	// and the member slashed.
 	OnDoubleSignal func(*state.DoubleSignal)
+	// Bodies, if set, keeps the post bodies of accepted transactions, so
+	// blocks that include them can be checked and sealed.
+	Bodies interface {
+		PutText([]byte) (Hash, error)
+	}
 
 	mu      sync.Mutex
 	txs     map[Hash]*item
@@ -56,6 +62,11 @@ var ErrWaitingData = errors.New("mempool: waiting for data chunks")
 // Add validates a transaction against the pending state and keeps it.
 func (p *Pool) Add(t *types.Tx) error {
 	err := p.add(t)
+	if err == nil && t.NeedsBody() && p.Bodies != nil {
+		if _, err := p.Bodies.PutText(t.Text); err != nil {
+			return err
+		}
+	}
 	var ds *state.DoubleSignal
 	if errors.As(err, &ds) && p.OnDoubleSignal != nil {
 		p.OnDoubleSignal(ds)
@@ -72,6 +83,11 @@ func (p *Pool) add(t *types.Tx) error {
 	}
 	if len(p.txs) >= maxPool {
 		return errors.New("mempool: full")
+	}
+	if t.NeedsBody() {
+		if err := t.CheckBody(); err != nil {
+			return fmt.Errorf("mempool: %w", err)
+		}
 	}
 	if t.Kind == types.TxUpload && p.check != nil {
 		if err := p.check(t); err != nil {
@@ -151,7 +167,7 @@ func (p *Pool) Template(tip *state.State) []*types.Tx {
 	var out []*types.Tx
 	for _, it := range items {
 		if it.tx.Kind == types.TxAnonPost &&
-			ctx.FreeStorage+state.TextStorageFee(st.P, st.Price, it.tx.EncodedSize()) > rewardCap {
+			ctx.FreeStorage+st.AnonTextFee(it.tx) > rewardCap {
 			continue // anonymous-lane storage is paid from this block's issuance
 		}
 		if st.ApplyTx(it.tx, ctx) == nil {

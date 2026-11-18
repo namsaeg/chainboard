@@ -49,6 +49,9 @@ type Account struct {
 	// during the epoch it changed in (PartsEpoch-1), ProveParts are challenged.
 	ProveParts []uint64
 	PartsEpoch uint64
+	// Burst score in thousandths of a point, as of BurstAt (see params).
+	Burst   uint64
+	BurstAt uint64
 }
 
 func (a *Account) clone() *Account {
@@ -105,6 +108,15 @@ type PostInfo struct {
 	Height   uint64
 	Likes    uint64
 	Comments uint64
+
+	// The body: its commitment, retention, and where the seal put it
+	// (TextRoot is zero until the window's seal block).
+	TextHash   Hash
+	TextLen    uint16
+	TextTier   uint16
+	TextBucket uint32
+	TextRoot   Hash
+	TextOff    uint32
 }
 
 type dupEntry struct{ Count, Last uint64 }
@@ -121,6 +133,8 @@ type State struct {
 	// replay is set while re-applying a block this node already validated:
 	// the expensive proofs are not checked again (see ReplayBlock).
 	replay bool
+	// textCheck, while set, verifies each text bundle a seal places.
+	textCheck func(BundleSpec, Hash) error
 
 	P         *params.Params
 	Height    uint64
@@ -135,6 +149,8 @@ type State struct {
 	Posts    map[Hash]*PostInfo
 	Likes    map[[52]byte]bool
 	dups     map[Hash]dupEntry
+
+	TextQueue []TextEntry // bodies waiting for the next seal block
 
 	Supply     uint64 // minted minus burned
 	Burned     uint64
@@ -165,6 +181,8 @@ type State struct {
 func (s *State) Clone() *State {
 	c := *s
 	c.replay = false
+	c.textCheck = nil
+	c.TextQueue = append([]TextEntry(nil), s.TextQueue...)
 	c.Accounts = make(map[Address]*Account, len(s.Accounts))
 	for k, v := range s.Accounts {
 		c.Accounts[k] = v.clone()

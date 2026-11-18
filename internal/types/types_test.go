@@ -3,23 +3,46 @@ package types
 import (
 	"testing"
 
+	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 )
 
 func TestTxRoundTripAndSignature(t *testing.T) {
 	k := cryptox.KeyFromSeed(make([]byte, 32))
-	tx := &Tx{Kind: TxPost, Nonce: 3, Lane: LaneFee, Board: "자유", Text: []byte("글"), Attach: []Hash{{1}}}
+	tx := &Tx{Kind: TxPost, Nonce: 3, Lane: LaneFee, Board: "자유", Tier: 1, Attach: []Hash{{1}}}
+	tx.SetText([]byte("글"))
 	tx.Sign(k)
 	got, err := DecodeTx(tx.Encode())
 	if err != nil || got.ID() != tx.ID() {
 		t.Fatalf("roundtrip: %v", err)
 	}
+	if got.Text != nil {
+		t.Fatal("the body must not be part of the encoding")
+	}
 	if err := got.CheckStateless(); err != nil {
 		t.Fatal(err)
 	}
-	got.Text = []byte("변조")
-	if got.CheckStateless() == nil {
-		t.Fatal("tampered tx accepted")
+	// The network form carries the body, checked against the hash.
+	w, err := DecodeWire(tx.EncodeWire())
+	if err != nil || string(w.Text) != "글" || w.ID() != tx.ID() {
+		t.Fatalf("wire roundtrip: %v", err)
+	}
+	w.Text = []byte("변조")
+	if w.CheckStateless() == nil {
+		t.Fatal("tampered body accepted")
+	}
+	noBody := tx.Encode()
+	var cw codec.Writer
+	cw.Bytes(noBody)
+	cw.Bytes(nil)
+	if _, err := DecodeWire(cw.B); err == nil {
+		t.Fatal("post without its body accepted from the network")
+	}
+	tx2 := *tx
+	tx2.Tier = 0
+	tx2.Sign(k)
+	if tx2.CheckStateless() == nil {
+		t.Fatal("text without a retention tier accepted")
 	}
 	if _, err := DecodeTx(append(tx.Encode(), 0)); err == nil {
 		t.Fatal("trailing byte accepted")
@@ -38,8 +61,9 @@ func TestTxRoundTripAndSignature(t *testing.T) {
 
 func TestUnsignedKinds(t *testing.T) {
 	pseudo := cryptox.KeyFromSeed(append(make([]byte, 31), 5))
-	a := &Tx{Kind: TxAnonPost, Board: "익명", Text: []byte("안녕"), Parent: Hash{3},
+	a := &Tx{Kind: TxAnonPost, Board: "익명", Tier: 1, Parent: Hash{3},
 		RLN: &RLNProof{Root: Hash{1}, Epoch: 9, Nullifier: Hash{2}, Y: Hash{4}, Proof: make([]byte, 164)}}
+	a.SetText([]byte("안녕"))
 	plainSignal := a.Signal()
 	a.PseudoPub = pseudo.Pub
 	h := a.PseudoHash()
@@ -54,9 +78,14 @@ func TestUnsignedKinds(t *testing.T) {
 	if err := got.CheckStateless(); err != nil {
 		t.Fatal(err)
 	}
-	got.Text = []byte("변조")
+	got.SetText([]byte("변조"))
 	if got.CheckStateless() == nil {
 		t.Fatal("pseudonym signature survived a text change")
+	}
+	long := *a
+	long.Tier = 12
+	if long.CheckStateless() == nil {
+		t.Fatal("anonymous post kept longer than a month")
 	}
 	a.PseudoPub, a.PseudoSig = nil, nil
 	got, err = DecodeTx(a.Encode())
