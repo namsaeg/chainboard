@@ -122,3 +122,17 @@ func TestTreeCloneIsolation(t *testing.T) {
 		t.Fatal("copy-on-write tree root differs from a fresh build")
 	}
 }
+
+// nodes counts stored (non-zero) nodes.
+func (t *Tree) nodes() int {
+	n := 0
+	t.pages.Range(func(_ uint64, p *page) bool {
+		for _, w := range p.present {
+			for ; w != 0; w &= w - 1 {
+				n++
+			}
+		}
+		return true
+	})
+	return n
+}

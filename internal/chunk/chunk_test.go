@@ -1,11 +1,11 @@
 package chunk
 
 import (
-	"bytes"
 	"crypto/rand"
 	"testing"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/merkle"
 	"github.com/namsaeg/chainboard/internal/pack"
 	"github.com/namsaeg/chainboard/internal/params"
 )
@@ -22,15 +22,12 @@ func TestSubProofsAndPacking(t *testing.T) {
 		}
 		miner := cryptox.Address{1}
 		for i, c := range chunks {
-			cp, _ := ChunkProof(leaves, i)
+			cp, _ := merkle.Prove(leaves, i)
 			if !VerifyChunk(root, uint64(size), uint64(i), c, cp) {
 				t.Fatal("chunk verify")
 			}
 			seed := pack.Seed(p, 3, uint64(100+i), miner)
 			packed := pack.Pack(seed, c)
-			if !bytes.Equal(pack.Unpack(seed, packed, len(c)), c) {
-				t.Fatal("pack roundtrip")
-			}
 			for s := 0; s < SubCount(uint64(size), uint64(i)); s++ {
 				pr, err := ProveSub(leaves, i, c, s)
 				if err != nil {

@@ -90,9 +90,6 @@ type Proof struct {
 	ChunkPath merkle.Proof
 }
 
-// ChunkProof proves a whole chunk (used when chunks are exchanged between nodes).
-func ChunkProof(leaves []Hash, i int) (merkle.Proof, error) { return merkle.Prove(leaves, i) }
-
 // VerifyChunk checks a whole chunk against a data root.
 func VerifyChunk(root Hash, size uint64, i uint64, c []byte, path merkle.Proof) bool {
 	if uint64(len(c)) != Len(size, i) || len(c) == 0 {

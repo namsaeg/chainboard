@@ -4,8 +4,8 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +30,7 @@ var (
 	bChunks = []byte("chunks") // root || index (u64) -> raw chunk
 	bPacked = []byte("packed") // miner || bucket (u32) || position (u64) -> packed replica
 	bTexts  = []byte("texts")  // text hash -> post body
+	bInfo   = []byte("info")   // "genesis" -> genesis the packed replicas belong to
 )
 
 // Store is safe for concurrent use.
@@ -349,45 +350,33 @@ func (s *Store) DropBucket(miner cryptox.Address, bucket uint32) error {
 	})
 }
 
-// ImportV010 copies the complete data of a 0.1.0 file store (dir/data/<root>/
-// with meta.json and N.chunk files) into this store and returns how many
-// data roots it imported. Each imported file is re-verified against its root.
-// Packed replicas are not imported: 0.2.0 packs with a different function.
-func (s *Store) ImportV010(dir string) (int, error) {
-	entries, err := os.ReadDir(filepath.Join(dir, "data"))
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, e := range entries {
-		want, err := cryptox.ParseHash(e.Name())
-		if err != nil || !e.IsDir() {
-			continue
+// UseGenesis binds the store to a chain. Packed replicas and post bodies of
+// another genesis (an older testnet) are dropped: positions and posts no
+// longer mean the same thing. Raw data is kept; the node's sweep removes
+// what the new chain does not reference. It reports whether it dropped any.
+func (s *Store) UseGenesis(g Hash) (bool, error) {
+	dropped := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bInfo)
+		if err != nil {
+			return err
 		}
-		var data []byte
-		for i := 0; ; i++ {
-			c, err := os.ReadFile(filepath.Join(dir, "data", e.Name(), fmt.Sprintf("%d.chunk", i)))
-			if err != nil {
-				break
+		old := b.Get([]byte("genesis"))
+		if old != nil && !bytes.Equal(old, g[:]) {
+			for _, name := range [][]byte{bPacked, bTexts} {
+				if err := tx.DeleteBucket(name); err != nil {
+					return err
+				}
+				if _, err := tx.CreateBucket(name); err != nil {
+					return err
+				}
 			}
-			data = append(data, c...)
+			dropped = true
 		}
-		if len(data) == 0 {
-			continue
-		}
-		if root, _ := chunk.Root(data); root != want {
-			continue // incomplete or damaged: the network will refill it
-		}
-		if _, err := s.PutData(data); err != nil {
-			return n, err
-		}
-		n++
-	}
-	return n, nil
+		return b.Put([]byte("genesis"), g[:])
+	})
+	return dropped, err
 }
-
-// HexRoot formats a root for logs.
-func HexRoot(h Hash) string { return hex.EncodeToString(h[:8]) }
 
 // PutText keeps a post body, keyed by its hash. Bodies are checked here, so
 // a stored body always matches its key.

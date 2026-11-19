@@ -1,6 +1,7 @@
 package rln
 
 import (
+	"github.com/namsaeg/chainboard/internal/pmap"
 	"sync/atomic"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -27,17 +28,17 @@ var treeIDs atomic.Uint64
 // Tree is a sparse Merkle tree of member leaves. Removed members are
 // overwritten with the zero leaf; indices are never reused.
 //
-// Clones share storage copy-on-write in pages of 256 nodes, so cloning a
-// state with many members is cheap.
+// Pages of 256 nodes sit in a persistent map and are copied on first
+// write, so cloning is O(1) and a write copies one page and a short path.
 type Tree struct {
 	Next  uint32
 	id    atomic.Uint64
-	pages map[uint64]*page
+	pages pmap.Map[uint64, *page]
 }
 
 // NewTree returns an empty tree.
 func NewTree() *Tree {
-	t := &Tree{pages: map[uint64]*page{}}
+	t := &Tree{pages: pmap.New[uint64, *page](pmap.Uint64)}
 	t.id.Store(treeIDs.Add(1))
 	return t
 }
@@ -48,7 +49,7 @@ func pageKey(level int, idx uint64) (uint64, int) {
 
 func (t *Tree) get(level int, idx uint64) fr.Element {
 	k, slot := pageKey(level, idx)
-	if p, ok := t.pages[k]; ok && p.present[slot/64]&(1<<(slot%64)) != 0 {
+	if p, ok := t.pages.Get(k); ok && p.present[slot/64]&(1<<(slot%64)) != 0 {
 		return p.v[slot]
 	}
 	return zeros[level]
@@ -56,16 +57,16 @@ func (t *Tree) get(level int, idx uint64) fr.Element {
 
 func (t *Tree) put(level int, idx uint64, v fr.Element) {
 	k, slot := pageKey(level, idx)
-	p, ok := t.pages[k]
+	p, ok := t.pages.Get(k)
 	id := t.id.Load()
 	if !ok {
 		p = &page{owner: id}
-		t.pages[k] = p
+		t.pages.Set(k, p)
 	} else if p.owner != id {
 		c := *p
 		c.owner = id
 		p = &c
-		t.pages[k] = p
+		t.pages.Set(k, p)
 	}
 	if v == zeros[level] {
 		p.present[slot/64] &^= 1 << (slot % 64)
@@ -78,10 +79,7 @@ func (t *Tree) put(level int, idx uint64, v fr.Element) {
 // Clone returns an independent tree. Both trees stop owning their pages, so
 // the first write to a shared page copies it.
 func (t *Tree) Clone() *Tree {
-	c := &Tree{Next: t.Next, pages: make(map[uint64]*page, len(t.pages))}
-	for k, v := range t.pages {
-		c.pages[k] = v
-	}
+	c := &Tree{Next: t.Next, pages: t.pages}
 	c.id.Store(treeIDs.Add(1))
 	t.id.Store(treeIDs.Add(1))
 	return c
@@ -132,17 +130,4 @@ func (t *Tree) Path(i uint32) (path [Depth]fr.Element, bits [Depth]uint8) {
 		idx >>= 1
 	}
 	return
-}
-
-// nodes counts stored (non-zero) nodes; for tests.
-func (t *Tree) nodes() int {
-	n := 0
-	for _, p := range t.pages {
-		for _, w := range p.present {
-			for ; w != 0; w &= w - 1 {
-				n++
-			}
-		}
-	}
-	return n
 }

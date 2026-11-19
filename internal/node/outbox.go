@@ -54,7 +54,7 @@ func (n *Node) outboxSnapshot() []byte {
 	for _, t := range sent {
 		f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(t.EncodeWire()), Sent: true})
 	}
-	for _, r := range n.QueuedAnon() {
+	for _, r := range n.ownAnon(true) {
 		a := outboxAnon{Board: r.Board, Text: r.Text, Pseudo: r.Pseudo}
 		if !r.Parent.IsZero() {
 			a.Parent = r.Parent.String()

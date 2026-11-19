@@ -52,6 +52,8 @@ go build -o chainboard.exe ./cmd/chainboard
 | `rln_used.json` | 이번 시간에 쓴 메시지 번호. **지우거나 다른 PC로 rln.key만 옮겨 쓰면 같은 번호를 다시 써서 보증금을 잃을 수 있어요** |
 | `pseudonym.key` | 가명 서명 키(처음 가명으로 쓸 때 생김) |
 | `chain.db`, `store.db` | 블록, 데이터 청크·패킹된 사본·글 본문 |
+| `index.db` | 게시판·스레드 색인. 지워도 다음 실행 때 체인에서 다시 만듭니다 |
+| `chain.db.xxxx.old` | 다른 네트워크(예: 이전 테스트넷)의 블록. 필요 없으면 지워도 됩니다 |
 | `outbox.json` | 아직 나가지 않은 내 트랜잭션과 익명 글 |
 
 ## 무엇이 들어 있나
@@ -102,6 +104,7 @@ internal/rln       RLN 회로, 증명·검증, 회원 트리
 internal/types     트랜잭션과 블록
 internal/state     상태와 상태 전이 함수 (합의 규칙 전부)
 internal/chain     블록 보관(bbolt), 가장 무거운 체인 선택, 재구성
+internal/pmap      퍼시스턴트 해시 트라이와 청크 벡터 (상태 버전을 O(1)로 복사)
 internal/mempool   대기 트랜잭션, 이중 신호 감지
 internal/store     청크와 패킹된 사본 저장(bbolt)
 internal/miner     파티션 할당·패킹·채굴·에포크 증명

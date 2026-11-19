@@ -18,7 +18,7 @@ func TestPackRoundTrip(t *testing.T) {
 	}
 	raw := bytes.Repeat([]byte("chainboard"), 3000)
 	pk := Pack(s1, raw)
-	if len(pk) != params.ChunkSize || !bytes.Equal(Unpack(s1, pk, len(raw)), raw) {
+	if len(pk) != params.ChunkSize || !bytes.Equal(xorAt(s1, 0, pk)[:len(raw)], raw) {
 		t.Fatal("unpack")
 	}
 	sub := UnpackSub(s1, 1, pk[params.SubChunkSize:2*params.SubChunkSize], params.SubChunkSize)

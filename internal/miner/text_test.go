@@ -61,17 +61,17 @@ func TestTextSealExtendExpire(t *testing.T) {
 		t.Fatal("a block carries a post body")
 	}
 	tip := r.c.Tip()
-	if !tip.Posts[short.ID()].TextRoot.IsZero() {
+	if !postOf(tip, short.ID()).TextRoot.IsZero() {
 		t.Fatal("sealed before the seal block")
 	}
 	r.mineToSeal(t)
 	tip = r.c.Tip()
 	for _, tx := range []*types.Tx{short, keep, later} {
-		if got := bodyAt(t, r.st, tip.Posts[tx.ID()]); got != string(tx.Text) {
+		if got := bodyAt(t, r.st, postOf(tip, tx.ID())); got != string(tx.Text) {
 			t.Fatalf("sealed body %q, want %q", got, tx.Text)
 		}
 	}
-	if b := tip.Posts[keep.ID()].TextBucket; b != 0 {
+	if b := postOf(tip, keep.ID()).TextBucket; b != 0 {
 		t.Fatalf("permanent text in bucket %d", b)
 	}
 
@@ -81,8 +81,8 @@ func TestTextSealExtendExpire(t *testing.T) {
 	r.send(t, k, ext)
 	r.mineToSeal(t)
 	tip = r.c.Tip()
-	pl := tip.Posts[later.ID()]
-	if pl.TextTier != 12 || pl.TextBucket <= tip.Posts[short.ID()].TextBucket {
+	pl := postOf(tip, later.ID())
+	if pl.TextTier != 12 || pl.TextBucket <= postOf(tip, short.ID()).TextBucket {
 		t.Fatalf("extend not recorded: %+v", pl)
 	}
 	if got := bodyAt(t, r.st, pl); got != string(later.Text) {
@@ -147,14 +147,14 @@ func TestTextSealExtendExpire(t *testing.T) {
 	}
 
 	// The one-month body expires; the post stays.
-	for tip := r.c.Tip(); !tip.TextExpired(tip.Posts[short.ID()]); tip = r.c.Tip() {
+	for tip := r.c.Tip(); !tip.TextExpired(postOf(tip, short.ID())); tip = r.c.Tip() {
 		r.mineN(t, 2)
 	}
 	tip = r.c.Tip()
-	if tip.TextExpired(tip.Posts[keep.ID()]) || tip.TextExpired(tip.Posts[later.ID()]) {
+	if tip.TextExpired(postOf(tip, keep.ID())) || tip.TextExpired(postOf(tip, later.ID())) {
 		t.Fatal("longer retention expired early")
 	}
-	if _, ok := tip.Posts[short.ID()]; !ok {
+	if _, ok := tip.Posts.Get(short.ID()); !ok {
 		t.Fatal("expired post vanished from the chain")
 	}
 	r.check(t)

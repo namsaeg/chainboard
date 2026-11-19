@@ -96,7 +96,7 @@ func (n *Node) checkForeign(st *state.State) {
 	if !ok {
 		return
 	}
-	m, found := st.Members[idc]
+	m, found := st.Members.Get(idc)
 	if !found || m.Status == state.MemberGone {
 		return
 	}
@@ -107,13 +107,13 @@ func (n *Node) checkForeign(st *state.State) {
 		if e > cur { // cur was 0
 			continue
 		}
-		nulls := st.RLNNulls[e]
-		if len(nulls) == 0 {
+		nulls, ok := st.RLNNulls[e]
+		if !ok || nulls.Len() == 0 {
 			continue
 		}
 		for id := uint64(0); id < uint64(m.Limit); id++ {
 			null := rln.ToBytes(rln.Nullifier(rln.A1(*n.secret, e, scope, id)))
-			share, used := nulls[null]
+			share, used := nulls.Get(null)
 			if !used {
 				continue
 			}

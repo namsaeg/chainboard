@@ -20,19 +20,6 @@ func mulDiv(a, b, c uint64) uint64 {
 	return x.Uint64()
 }
 
-func mulDivUp(a, b, c uint64) uint64 {
-	if c == 0 {
-		return 0
-	}
-	x := new(big.Int).Mul(new(big.Int).SetUint64(a), new(big.Int).SetUint64(b))
-	x.Add(x, new(big.Int).SetUint64(c-1))
-	x.Div(x, new(big.Int).SetUint64(c))
-	if !x.IsUint64() {
-		return ^uint64(0)
-	}
-	return x.Uint64()
-}
-
 // StorageFee is the up-front fee for keeping bytes for months (permanent when
 // perm) at the current price: bytes × replicas × years × price / GB, rounded up.
 func StorageFee(p *params.Params, price, bytes, replicas, months uint64, perm bool) uint64 {

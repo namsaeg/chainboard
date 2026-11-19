@@ -172,11 +172,7 @@ func (n *Node) RLNStatus() RLNInfo {
 	e := tip.RLNEpoch(h)
 	cap, _ := tip.CapFor(e)
 	info := RLNInfo{Status: "none", Epoch: e, Cap: cap, EpochLeft: (e+1)*tip.P.RLNEpochBlocks - h}
-	for _, m := range tip.Members {
-		if m.Status != state.MemberGone {
-			info.Members++
-		}
-	}
+	info.Members = int(tip.MemberCount)
 	joining := n.joining()
 	n.rlnMu.Lock()
 	defer n.rlnMu.Unlock()
@@ -190,7 +186,7 @@ func (n *Node) RLNStatus() RLNInfo {
 		return info
 	}
 	info.Commitment = idc.String()
-	m, found := tip.Members[idc]
+	m, found := tip.Members.Get(idc)
 	switch {
 	case !found:
 		if joining {
@@ -224,7 +220,7 @@ func (n *Node) JoinRLN(bond uint64) error {
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
 	if ok {
-		if m, found := st.Members[idc]; found {
+		if m, found := st.Members.Get(idc); found {
 			if m.Status != state.MemberGone {
 				n.rlnMu.Unlock()
 				return errors.New("already a member; leave first to change the bond")
@@ -243,61 +239,44 @@ func (n *Node) JoinRLN(bond uint64) error {
 	return n.Send(&types.Tx{Kind: types.TxRLNJoin, Amount: limit * st.P.RLNBondPerMsg, Commitment: idc, Limit: uint16(limit)})
 }
 
-// joining reports whether our membership join is on its way: queued here,
-// travelling the stem, or pooled, but not mined.
-func (n *Node) joining() bool {
+// pendingJoin finds our membership join while it is on its way: queued
+// here, travelling the stem, or pooled, but not mined.
+func (n *Node) pendingJoin() (*types.Tx, bool) {
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
 	n.rlnMu.Unlock()
 	if !ok {
-		return false
+		return nil, false
 	}
-	if _, mined := n.Chain.Tip().Members[idc]; mined {
-		return false
+	if _, mined := n.Chain.Tip().Members.Get(idc); mined {
+		return nil, false
 	}
 	isJoin := func(t *types.Tx) bool { return t != nil && t.Kind == types.TxRLNJoin && t.Commitment == idc }
 	n.mu.Lock()
 	for _, q := range n.queue {
 		if isJoin(q.tx) {
 			n.mu.Unlock()
-			return true
+			return q.tx, true
 		}
 	}
 	for _, s := range n.sent {
 		if isJoin(s.tx) {
 			n.mu.Unlock()
-			return true
-		}
-	}
-	n.mu.Unlock()
-	n.syncPool()
-	_, pooled := n.Pool.PendingState().Members[idc]
-	return pooled
-}
-
-// joinLimit is the message limit our travelling or pooled join asks for.
-func (n *Node) joinLimit(idc cryptox.Hash) (uint64, bool) {
-	isJoin := func(t *types.Tx) bool { return t != nil && t.Kind == types.TxRLNJoin && t.Commitment == idc }
-	n.mu.Lock()
-	for _, q := range n.queue {
-		if isJoin(q.tx) {
-			n.mu.Unlock()
-			return uint64(q.tx.Limit), true
-		}
-	}
-	for _, s := range n.sent {
-		if isJoin(s.tx) {
-			n.mu.Unlock()
-			return uint64(s.tx.Limit), true
+			return s.tx, true
 		}
 	}
 	n.mu.Unlock()
 	for _, t := range n.Pool.Pending() {
 		if isJoin(t) {
-			return uint64(t.Limit), true
+			return t, true
 		}
 	}
-	return 0, false
+	return nil, false
+}
+
+func (n *Node) joining() bool {
+	_, ok := n.pendingJoin()
+	return ok
 }
 
 // LeaveRLN starts the exit of the membership; the bond returns after the
@@ -333,7 +312,7 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		return errors.New("join the anonymous lane first (bond some mature stake)")
 	}
 	tip := n.Chain.Tip()
-	m, found := tip.Members[idc]
+	m, found := tip.Members.Get(idc)
 	switch {
 	case found && m.Status == state.MemberGone:
 		return errors.New("membership ended; join again")
@@ -387,12 +366,12 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		if err != nil {
 			return err
 		}
-	} else if limit, ok := n.joinLimit(idc); ok {
+	} else if join, ok := n.pendingJoin(); ok {
 		// Joining: posts wait for the join. Count them against the limit
 		// the join asks for, so the warning still comes first.
 		_, cap := tip.AnonEpochCap()
-		limit = min(limit, cap)
-		waiting := uint64(len(n.unsentAnon()))
+		limit := min(uint64(join.Limit), cap)
+		waiting := uint64(len(n.ownAnon(false)))
 		if waiting >= limit {
 			return fmt.Errorf("%w (%d): this many posts already wait for the membership", errLimit, limit)
 		}
@@ -479,7 +458,7 @@ func (n *Node) buildAnon(req AnonRequest, st *state.State) (*types.Tx, error) {
 		n.rlnMu.Unlock()
 		return nil, errors.New("no membership")
 	}
-	m, found := st.Members[idc]
+	m, found := st.Members.Get(idc)
 	if !found || m.Status == state.MemberGone {
 		n.rlnMu.Unlock()
 		return nil, state.ErrNotMember
@@ -581,7 +560,7 @@ func (n *Node) tendOutbox(st *state.State) {
 		switch {
 		case it.waitJoin:
 			idc, _ := n.commitment()
-			if m, ok := st.Members[idc]; ok && m.Status != state.MemberGone {
+			if m, ok := st.Members.Get(idc); ok && m.Status != state.MemberGone {
 				it.waitJoin = false
 				again = append(again, it)
 			} else if time.Since(it.since) > joinWait {
@@ -589,7 +568,7 @@ func (n *Node) tendOutbox(st *state.State) {
 			} else {
 				keep = append(keep, it)
 			}
-		case st.Posts[it.id] != nil:
+		case st.Posts.Has(it.id):
 		case n.Pool.Has(it.id) || st.Height < it.sentAt+resendAfter || time.Since(it.since) < n.resendOwnAfter():
 			keep = append(keep, it) // pooled, or may still be in the stem
 		default:
@@ -615,9 +594,10 @@ func (n *Node) tendOutbox(st *state.State) {
 	}
 }
 
-// unsentAnon lists anonymous posts with no transaction in the pool: queued,
-// waiting for the join, or sent but dropped on the way.
-func (n *Node) unsentAnon() []AnonRequest {
+// ownAnon lists our anonymous posts not mined yet: queued, waiting for the
+// join, or sent. With pooled false, ones already in the pool are left out
+// (they show from there).
+func (n *Node) ownAnon(pooled bool) []AnonRequest {
 	var out []AnonRequest
 	n.mu.Lock()
 	for _, q := range n.queue {
@@ -630,28 +610,10 @@ func (n *Node) unsentAnon() []AnonRequest {
 	items := append([]*outboxItem(nil), n.outbox...)
 	n.rlnMu.Unlock()
 	for _, it := range items {
-		if it.waitJoin || !n.Pool.Has(it.id) {
+		if pooled || it.waitJoin || !n.Pool.Has(it.id) {
 			out = append(out, it.req)
 		}
 	}
-	return out
-}
-
-// QueuedAnon lists anonymous posts not yet mined (queued or sent).
-func (n *Node) QueuedAnon() []AnonRequest {
-	var out []AnonRequest
-	n.mu.Lock()
-	for _, q := range n.queue {
-		if q.anon != nil {
-			out = append(out, *q.anon)
-		}
-	}
-	n.mu.Unlock()
-	n.rlnMu.Lock()
-	for _, it := range n.outbox {
-		out = append(out, it.req)
-	}
-	n.rlnMu.Unlock()
 	return out
 }
 

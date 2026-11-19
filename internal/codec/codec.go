@@ -153,6 +153,9 @@ func (r *Reader) Count(max int) int {
 }
 
 // Done returns the sticky error, or ErrTrailing if bytes are left.
+// AtEnd reports whether all input was read.
+func (r *Reader) AtEnd() bool { return r.Err == nil && len(r.B) == 0 }
+
 func (r *Reader) Done() error {
 	if r.Err != nil {
 		return r.Err

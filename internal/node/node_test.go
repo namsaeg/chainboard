@@ -86,7 +86,7 @@ func TestThreeNodes(t *testing.T) {
 	}
 	root := up.Root
 	waitFor(t, "upload mined", 60*time.Second, func() bool {
-		_, ok := c.Chain.Tip().Data[root]
+		_, ok := c.Chain.Tip().Data.Get(root)
 		return ok
 	})
 	// The same file again: reused for a shorter tier, extended for a longer one.
@@ -97,7 +97,7 @@ func TestThreeNodes(t *testing.T) {
 		t.Fatalf("longer re-upload: %+v %v", longer, err)
 	}
 	waitFor(t, "auto-extend mined", 60*time.Second, func() bool {
-		d, ok := c.Chain.Tip().Data[root]
+		d, ok := c.Chain.Tip().Data.Get(root)
 		return ok && d.Tier == 24
 	})
 	post := &types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: "테스트", Text: []byte("세 노드 시험 글"), Tier: 12, Attach: []types.Hash{root}}
@@ -106,7 +106,7 @@ func TestThreeNodes(t *testing.T) {
 	}
 	waitFor(t, "post visible on every node", 60*time.Second, func() bool {
 		for _, n := range []*Node{a, b, c} {
-			if len(n.Index.Board("테스트", 0, 10)) == 0 {
+			if len(n.Board("테스트", 0, 10)) == 0 {
 				return false
 			}
 		}
@@ -215,7 +215,7 @@ func TestAnonymousPosts(t *testing.T) {
 	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "한도 초과", Confirm: true}); !errors.Is(err, errLimit) {
 		t.Fatalf("post beyond the limit: %v", err)
 	}
-	waitFor(t, "anonymous posts on another node", 90*time.Second, func() bool { return len(c.Index.Board("익명", 0, 10)) == 3 })
+	waitFor(t, "anonymous posts on another node", 90*time.Second, func() bool { return len(c.Board("익명", 0, 10)) == 3 })
 
 	// A second device with the same anonymous key notices the first one's
 	// posts and stops before it double-signals.
@@ -266,8 +266,8 @@ func TestAnonymousPosts(t *testing.T) {
 	if s := b.RLNStatus(); s.Used != 2 && s.Epoch == b.Chain.Tip().RLNEpoch(b.Chain.Height()+1) {
 		t.Logf("used %d (epoch may have rolled over)", s.Used)
 	}
-	if len(b.QueuedAnon()) != 0 {
-		waitFor(t, "outbox drained", 30*time.Second, func() bool { return len(b.QueuedAnon()) == 0 })
+	if len(b.ownAnon(true)) != 0 {
+		waitFor(t, "outbox drained", 30*time.Second, func() bool { return len(b.ownAnon(true)) == 0 })
 	}
 }
 

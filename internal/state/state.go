@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
+	"github.com/namsaeg/chainboard/internal/pmap"
 	"math/big"
 	"sort"
 
@@ -80,15 +81,9 @@ type Bucket struct {
 	// EpochLen is Len when the current proof epoch began; epoch challenges
 	// only point below it, so they stay the same for the whole epoch.
 	EpochLen uint64
-	Records  []Record
-	Escrow   uint64 // prepaid fees still to be paid out to storage
-	Bytes    uint64 // live (not moved) bytes
-}
-
-func (b *Bucket) clone() *Bucket {
-	c := *b
-	c.Records = append([]Record(nil), b.Records...)
-	return &c
+	Records  pmap.Vec[Record] // persistent: copying a bucket is O(1)
+	Escrow   uint64           // prepaid fees still to be paid out to storage
+	Bytes    uint64           // live (not moved) bytes
 }
 
 // DataInfo is where a data root currently lives.
@@ -143,14 +138,25 @@ type State struct {
 	VDFStep   uint64
 	EpochSeed Hash // hash of the block that opened the current proof epoch
 
-	Accounts map[Address]*Account
-	Buckets  map[uint32]*Bucket
-	Data     map[Hash]*DataInfo
-	Posts    map[Hash]*PostInfo
-	Likes    map[[52]byte]bool
-	dups     map[Hash]dupEntry
+	// The large collections are persistent maps: Clone shares them and a
+	// write copies only its path, so a state per block costs what the block
+	// changed, not the size of the state. Entries are never changed in
+	// place: Account and bucket hand out fresh copies to write.
+	Accounts pmap.Map[Address, *Account]
+	Buckets  map[uint32]*Bucket // a few thousand at most; entries copy-on-write
+	Data     pmap.Map[Hash, *DataInfo]
+	Posts    pmap.Map[Hash, *PostInfo]
+	Likes    pmap.Map[[52]byte, bool]
+	// Repeat counts in two generations of DupWindowBlocks: an entry older
+	// than that can only read as zero, so older generations are dropped.
+	dupGen          uint64
+	dupCur, dupPrev pmap.Map[Hash, dupEntry]
 
 	TextQueue []TextEntry // bodies waiting for the next seal block
+
+	// Vesters holds accounts that earned vesting income (miners): the only
+	// ones the epoch forfeit rule needs to look at.
+	Vesters pmap.Map[Address, bool]
 
 	Supply     uint64 // minted minus burned
 	Burned     uint64
@@ -167,80 +173,71 @@ type State struct {
 	CumWork    *big.Int
 
 	// Anonymous lane (RLN).
-	Members     map[Hash]*Member // by identity commitment; copy-on-write entries
+	Members     pmap.Map[Hash, *Member] // by identity commitment
+	MemberCount uint64                  // memberships not gone
 	RLNTree     *rln.Tree
-	RLNRoots    []RootEntry               // accepted membership roots, newest (current) last
-	RLNNulls    map[uint64]map[Hash]Share // epoch -> nullifier -> share
-	RLNExits    []exit                    // releases in height order
-	RLNCap      uint64                    // per-member cap of RLNCapEpoch
-	RLNCapPrev  uint64                    // cap of the epoch before
+	RLNRoots    []RootEntry                      // accepted membership roots, newest (current) last
+	RLNNulls    map[uint64]pmap.Map[Hash, Share] // epoch -> nullifier -> share
+	RLNExits    []exit                           // releases in height order
+	RLNCap      uint64                           // per-member cap of RLNCapEpoch
+	RLNCapPrev  uint64                           // cap of the epoch before
 	RLNCapEpoch uint64
 }
 
-// Clone deep-copies the state.
+// Clone copies the state. The persistent maps are shared, so this is
+// O(number of buckets + small windows), not O(size of the state).
 func (s *State) Clone() *State {
 	c := *s
 	c.replay = false
 	c.textCheck = nil
 	c.TextQueue = append([]TextEntry(nil), s.TextQueue...)
-	c.Accounts = make(map[Address]*Account, len(s.Accounts))
-	for k, v := range s.Accounts {
-		c.Accounts[k] = v.clone()
-	}
 	c.Buckets = make(map[uint32]*Bucket, len(s.Buckets))
 	for k, v := range s.Buckets {
-		c.Buckets[k] = v.clone()
-	}
-	c.Data = make(map[Hash]*DataInfo, len(s.Data))
-	for k, v := range s.Data {
-		d := *v
-		c.Data[k] = &d
-	}
-	c.Posts = make(map[Hash]*PostInfo, len(s.Posts))
-	for k, v := range s.Posts {
-		c.Posts[k] = v // entries are replaced, never modified in place
-	}
-	c.Likes = make(map[[52]byte]bool, len(s.Likes))
-	for k, v := range s.Likes {
-		c.Likes[k] = v
-	}
-	c.dups = make(map[Hash]dupEntry, len(s.dups))
-	for k, v := range s.dups {
-		c.dups[k] = v
+		c.Buckets[k] = v
 	}
 	c.Recent = append([]HeaderMeta(nil), s.Recent...)
 	c.CumWork = new(big.Int).Set(s.CumWork)
-	c.Members = make(map[Hash]*Member, len(s.Members))
-	for k, v := range s.Members {
-		c.Members[k] = v // entries are replaced, never modified in place
-	}
 	c.RLNTree = s.RLNTree.Clone()
 	c.RLNRoots = append([]RootEntry(nil), s.RLNRoots...)
-	c.RLNNulls = make(map[uint64]map[Hash]Share, len(s.RLNNulls))
+	c.RLNNulls = make(map[uint64]pmap.Map[Hash, Share], len(s.RLNNulls))
 	for e, m := range s.RLNNulls {
-		cm := make(map[Hash]Share, len(m))
-		for k, v := range m {
-			cm[k] = v
-		}
-		c.RLNNulls[e] = cm
+		c.RLNNulls[e] = m
 	}
 	c.RLNExits = append([]exit(nil), s.RLNExits...)
 	return &c
 }
 
-// Account returns an account, creating it on write paths.
+// Account returns a copy of an account to write, already stored in this
+// state (created if new). Other versions keep the old entry.
 func (s *State) Account(a Address) *Account {
-	acc, ok := s.Accounts[a]
-	if !ok {
-		acc = &Account{}
-		s.Accounts[a] = acc
+	acc := &Account{}
+	if old, ok := s.Accounts.Get(a); ok {
+		acc = old.clone()
 	}
+	s.Accounts.Set(a, acc)
 	return acc
 }
 
+// bucket returns a copy of a bucket to write, stored in this state.
+func (s *State) bucket(id uint32) *Bucket {
+	b := &Bucket{ID: id}
+	if old, ok := s.Buckets[id]; ok {
+		c := *old
+		b = &c
+	}
+	s.Buckets[id] = b
+	return b
+}
+
+// Post looks a post up.
+func (s *State) Post(id Hash) (*PostInfo, bool) { return s.Posts.Get(id) }
+
+// Member looks a membership up.
+func (s *State) Member(idc Hash) (*Member, bool) { return s.Members.Get(idc) }
+
 // Peek returns a copy of an account without creating it.
 func (s *State) Peek(a Address) Account {
-	if acc, ok := s.Accounts[a]; ok {
+	if acc, ok := s.Accounts.Get(a); ok {
 		return *acc.clone()
 	}
 	return Account{}
@@ -314,11 +311,11 @@ func (s *State) Locate(bucket uint32, pos uint64) (*Record, uint64, bool) {
 	if !ok || pos >= b.Len {
 		return nil, 0, false
 	}
-	i := sort.Search(len(b.Records), func(i int) bool { return b.Records[i].Start+b.Records[i].Chunks > pos })
-	if i >= len(b.Records) {
+	i := sort.Search(b.Records.Len(), func(i int) bool { r := b.Records.Ptr(i); return r.Start+r.Chunks > pos })
+	if i >= b.Records.Len() {
 		return nil, 0, false
 	}
-	r := &b.Records[i]
+	r := b.Records.Ptr(i) // read only
 	if pos < r.Start {
 		return nil, 0, false
 	}
@@ -383,20 +380,22 @@ func (s *State) Locked(a *Account, h uint64) uint64 {
 func Genesis(p *params.Params) (*State, []byte) {
 	s := &State{
 		P:          p,
-		Accounts:   map[Address]*Account{},
+		Accounts:   pmap.New[Address, *Account](pmap.Hash20[Address]),
+		Vesters:    pmap.New[Address, bool](pmap.Hash20[Address]),
 		Buckets:    map[uint32]*Bucket{},
-		Data:       map[Hash]*DataInfo{},
-		Posts:      map[Hash]*PostInfo{},
-		Likes:      map[[52]byte]bool{},
-		dups:       map[Hash]dupEntry{},
+		Data:       pmap.New[Hash, *DataInfo](pmap.Hash32[Hash]),
+		Posts:      pmap.New[Hash, *PostInfo](pmap.Hash32[Hash]),
+		Likes:      pmap.New[[52]byte, bool](pmap.Hash52[[52]byte]),
+		dupCur:     pmap.New[Hash, dupEntry](pmap.Hash32[Hash]),
+		dupPrev:    pmap.New[Hash, dupEntry](pmap.Hash32[Hash]),
 		Price:      p.InitialPrice,
 		PriceEMA:   p.InitialPrice,
 		BaseFee:    p.BaseFeeInit,
 		Congestion: 1000,
 		CumWork:    new(big.Int),
-		Members:    map[Hash]*Member{},
+		Members:    pmap.New[Hash, *Member](pmap.Hash32[Hash]),
 		RLNTree:    rln.NewTree(),
-		RLNNulls:   map[uint64]map[Hash]Share{},
+		RLNNulls:   map[uint64]pmap.Map[Hash, Share]{},
 		RLNCap:     p.RLNMaxLimit,
 		RLNCapPrev: p.RLNMaxLimit,
 	}
@@ -405,8 +404,10 @@ func Genesis(p *params.Params) (*State, []byte) {
 	data := GenesisData(p)
 	root, _ := chunk.Root(data)
 	n := chunk.Count(uint64(len(data)))
-	s.Buckets[0] = &Bucket{ID: 0, Len: n, EpochLen: n, Records: []Record{{DataRoot: root, Size: uint64(len(data)), Start: 0, Chunks: n}}, Bytes: uint64(len(data))}
-	s.Data[root] = &DataInfo{Bucket: 0, Size: uint64(len(data)), Media: types.MediaOther, Tier: params.TierPermanent, Record: 0}
+	g := &Bucket{ID: 0, Len: n, EpochLen: n, Bytes: uint64(len(data))}
+	g.Records.Append(Record{DataRoot: root, Size: uint64(len(data)), Start: 0, Chunks: n})
+	s.Buckets[0] = g
+	s.Data.Set(root, &DataInfo{Bucket: 0, Size: uint64(len(data)), Media: types.MediaOther, Tier: params.TierPermanent, Record: 0})
 	s.VDFOut = cryptox.Tagged("cb/genesis/vdf", []byte(p.Name))
 	s.Tip = GenesisHash(p)
 	s.Recent = []HeaderMeta{{Time: GenesisTime, Target: types.HashToTarget(p.GenesisTarget)}}
@@ -434,7 +435,7 @@ func GenesisData(p *params.Params) []byte {
 // CheckSupply verifies that every unit of supply is accounted for.
 func (s *State) CheckSupply() error {
 	var total uint64
-	for _, a := range s.Accounts {
+	s.Accounts.Range(func(_ Address, a *Account) bool {
 		total += a.Balance + a.StakeMature + a.StakePending
 		for _, u := range a.Unbonding {
 			total += u.Amount
@@ -442,13 +443,15 @@ func (s *State) CheckSupply() error {
 		for _, t := range a.Vesting {
 			total += t.Amount - t.Claimed
 		}
-	}
+		return true
+	})
 	for _, b := range s.Buckets {
 		total += b.Escrow
 	}
-	for _, m := range s.Members {
+	s.Members.Range(func(_ Hash, m *Member) bool {
 		total += m.Bond
-	}
+		return true
+	})
 	total += s.Endowment + s.RepairPool
 	if total != s.Supply {
 		return fmt.Errorf("supply mismatch: accounted %d, supply %d", total, s.Supply)

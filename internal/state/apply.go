@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"github.com/namsaeg/chainboard/internal/pmap"
 	"math/big"
 	"sort"
 
@@ -73,24 +74,47 @@ func (s *State) dupMultiplier(t *types.Tx, h uint64) (Hash, uint64) {
 		return Hash{}, 1
 	}
 	k := cryptox.Tagged("cb/dup", t.TextHash[:])
-	e := s.dups[k]
+	return k, DupMultiplier(s.dupAt(k, h).Count)
+}
+
+// dupAt is a text's repeat entry as seen at height h. Entries live in the
+// generation of their last height (h / DupWindowBlocks); anything older
+// than the previous generation has expired by construction.
+func (s *State) dupAt(k Hash, h uint64) dupEntry {
+	g := h / s.P.DupWindowBlocks
+	var e dupEntry
+	switch g {
+	case s.dupGen:
+		var ok bool
+		if e, ok = s.dupCur.Get(k); !ok {
+			e, _ = s.dupPrev.Get(k)
+		}
+	case s.dupGen + 1:
+		e, _ = s.dupCur.Get(k)
+	}
 	if h > e.Last+s.P.DupWindowBlocks {
 		e.Count = 0
 	}
-	return k, DupMultiplier(e.Count)
+	return e
 }
 
 func (s *State) noteDup(k Hash, h uint64) {
 	if k.IsZero() {
 		return
 	}
-	e := s.dups[k]
-	if h > e.Last+s.P.DupWindowBlocks {
-		e.Count = 0
-	}
+	e := s.dupAt(k, h)
 	e.Count++
 	e.Last = h
-	s.dups[k] = e
+	if g := h / s.P.DupWindowBlocks; g > s.dupGen {
+		empty := pmap.New[Hash, dupEntry](pmap.Hash32[Hash])
+		if g == s.dupGen+1 {
+			s.dupPrev, s.dupCur = s.dupCur, empty
+		} else {
+			s.dupPrev, s.dupCur = empty, empty
+		}
+		s.dupGen = g
+	}
+	s.dupCur.Set(k, e)
 }
 
 func likeKey(post Hash, a Address) [52]byte {
@@ -113,7 +137,7 @@ func (s *State) checkParent(t *types.Tx) error {
 	if t.Parent.IsZero() {
 		return nil
 	}
-	parent, ok := s.Posts[t.Parent]
+	parent, ok := s.Posts.Get(t.Parent)
 	if !ok {
 		return errors.New("comment on unknown post")
 	}
@@ -126,12 +150,13 @@ func (s *State) checkParent(t *types.Tx) error {
 // notePost records a post (signed or anonymous).
 func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash) {
 	s.noteDup(dupKey, h)
-	s.Posts[t.ID()] = &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h,
-		TextHash: t.TextHash, TextLen: t.TextLen, TextTier: t.Tier}
+	s.Posts.Set(t.ID(), &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h,
+		TextHash: t.TextHash, TextLen: t.TextLen, TextTier: t.Tier})
 	if !t.Parent.IsZero() {
-		pi := *s.Posts[t.Parent]
+		p, _ := s.Posts.Get(t.Parent)
+		pi := *p
 		pi.Comments++
-		s.Posts[t.Parent] = &pi
+		s.Posts.Set(t.Parent, &pi)
 	}
 }
 
@@ -150,7 +175,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	h := ctx.H
 	from := t.Sender()
 	var acc *Account
-	if a, ok := s.Accounts[from]; ok {
+	if a, ok := s.Accounts.Get(from); ok {
 		acc = a.clone()
 	} else {
 		acc = &Account{}
@@ -209,15 +234,15 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 			return err
 		}
 		for _, a := range t.Attach {
-			if _, ok := s.Data[a]; !ok {
+			if !s.Data.Has(a) {
 				return errors.New("attachment not stored")
 			}
 		}
 	case types.TxLike:
-		if _, ok := s.Posts[t.Target]; !ok {
+		if !s.Posts.Has(t.Target) {
 			return errors.New("like of unknown post")
 		}
-		if s.Likes[likeKey(t.Target, from)] {
+		if s.Likes.Has(likeKey(t.Target, from)) {
 			return errors.New("already liked")
 		}
 	case types.TxExtend:
@@ -313,16 +338,18 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		s.notePost(t, h, dupKey)
 		if t.TextLen > 0 {
 			id := t.ID()
-			pi := *s.Posts[id]
+			p, _ := s.Posts.Get(id)
+			pi := *p
 			pi.TextBucket = cost.Dest
-			s.Posts[id] = &pi
+			s.Posts.Set(id, &pi)
 			s.queueText(id, t.TextHash, t.TextLen, cost.Dest)
 		}
 	case types.TxLike:
-		s.Likes[likeKey(t.Target, from)] = true
-		pi := *s.Posts[t.Target]
+		s.Likes.Set(likeKey(t.Target, from), true)
+		p, _ := s.Posts.Get(t.Target)
+		pi := *p
 		pi.Likes++
-		s.Posts[t.Target] = &pi
+		s.Posts.Set(t.Target, &pi)
 	case types.TxUpload:
 		s.placeData(t, h)
 	case types.TxExtend:
@@ -345,7 +372,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	case types.TxRLNLeave:
 		s.applyLeave(t, h)
 	}
-	s.Accounts[from] = acc
+	s.Accounts.Set(from, acc)
 	*ctx = next
 	return nil
 }
@@ -362,7 +389,7 @@ func (s *State) remainingMonths(info *DataInfo, h uint64) uint64 {
 func (s *State) dataFee(t *types.Tx, h uint64, ctx *BlockCtx) (uint64, uint32, error) {
 	months, perm, _ := params.TierMonths(t.Tier)
 	dest := s.BucketFor(h, months, perm)
-	info, exists := s.Data[t.DataRoot]
+	info, exists := s.Data.Get(t.DataRoot)
 	size := t.Size
 	if t.Kind == types.TxUpload {
 		if size > s.FileCap() {
@@ -402,13 +429,15 @@ func (s *State) dataFee(t *types.Tx, h uint64, ctx *BlockCtx) (uint64, uint32, e
 func (s *State) placeData(t *types.Tx, h uint64) {
 	months, perm, _ := params.TierMonths(t.Tier)
 	destID := s.BucketFor(h, months, perm)
-	info, exists := s.Data[t.DataRoot]
+	info, exists := s.Data.Get(t.DataRoot)
 	size := t.Size
 	media := t.Media
 	if exists {
 		size, media = info.Size, info.Media
-		old := s.Buckets[info.Bucket]
-		old.Records[info.Record].Moved = true
+		old := s.bucket(info.Bucket)
+		r := old.Records.At(info.Record)
+		r.Moved = true
+		old.Records.Set(info.Record, r)
 		old.Bytes -= size
 		if info.Bucket == 0 {
 			s.PermBytes -= size
@@ -416,13 +445,9 @@ func (s *State) placeData(t *types.Tx, h uint64) {
 			s.TermBytes -= size
 		}
 	}
-	b, ok := s.Buckets[destID]
-	if !ok {
-		b = &Bucket{ID: destID}
-		s.Buckets[destID] = b
-	}
+	b := s.bucket(destID)
 	n := chunk.Count(size)
-	b.Records = append(b.Records, Record{DataRoot: t.DataRoot, Size: size, Start: b.Len, Chunks: n})
+	b.Records.Append(Record{DataRoot: t.DataRoot, Size: size, Start: b.Len, Chunks: n})
 	b.Len += n
 	b.Bytes += size
 	if destID == 0 {
@@ -430,7 +455,7 @@ func (s *State) placeData(t *types.Tx, h uint64) {
 	} else {
 		s.TermBytes += size
 	}
-	s.Data[t.DataRoot] = &DataInfo{Bucket: destID, Size: size, Media: media, Tier: t.Tier, Record: len(b.Records) - 1}
+	s.Data.Set(t.DataRoot, &DataInfo{Bucket: destID, Size: size, Media: media, Tier: t.Tier, Record: b.Records.Len() - 1})
 }
 
 // Challenge derives the chunk a challenge points at. ok is false when the
@@ -532,7 +557,7 @@ func (s *State) epochChallenge(a Address, acc *Account) (Challenge, uint64, bool
 
 // EpochChallenge tells a storage node what to prove this epoch.
 func (s *State) EpochChallenge(a Address) (Challenge, uint64, bool) {
-	acc, ok := s.Accounts[a]
+	acc, ok := s.Accounts.Get(a)
 	if !ok {
 		return Challenge{}, 0, false
 	}
@@ -715,18 +740,20 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 		exp := s.BucketExpiry(id)
 		if exp <= h {
 			s.RepairPool += bk.Escrow
-			for _, r := range bk.Records {
-				if info, ok := s.Data[r.DataRoot]; ok && info.Bucket == id && !r.Moved {
-					delete(s.Data, r.DataRoot)
+			for i := 0; i < bk.Records.Len(); i++ {
+				r := bk.Records.Ptr(i)
+				if info, ok := s.Data.Get(r.DataRoot); ok && info.Bucket == id && !r.Moved {
+					s.Data.Delete(r.DataRoot)
 				}
 			}
 			s.TermBytes -= bk.Bytes
 			delete(s.Buckets, id)
 			continue
 		}
-		rel := bk.Escrow / (exp - h)
-		bk.Escrow -= rel
-		payouts += rel
+		if rel := bk.Escrow / (exp - h); rel > 0 {
+			s.bucket(id).Escrow -= rel
+			payouts += rel
+		}
 	}
 	// Permanent data is paid from the endowment at the current price.
 	due := mulDiv(s.PermBytes*s.P.MediaReplicas, s.Price, params.GB) / s.P.BlocksPerYear
@@ -761,26 +788,41 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 		} else {
 			miner.Vesting = append(miner.Vesting, Tranche{Amount: v, Start: h, End: h + s.P.VestingBlocks})
 		}
+		s.Vesters.Set(hd.MinerAddr(), true)
 	}
 
 	// Forfeit unvested income of storage nodes that stopped proving.
 	if h%s.P.ProofEpoch == 0 {
+		// Only accounts that ever earned vesting income can forfeit, so this
+		// walks those (miners), not every account.
 		ep := s.Epoch(h)
-		for _, a := range s.Accounts {
-			if len(a.Vesting) == 0 || ep <= a.LastProof+s.P.ForfeitEpochs {
-				continue
+		var drop []Address
+		s.Vesters.Range(func(addr Address, _ bool) bool {
+			a, ok := s.Accounts.Get(addr)
+			switch {
+			case !ok || len(a.Vesting) == 0:
+				drop = append(drop, addr)
+			case ep > a.LastProof+s.P.ForfeitEpochs:
+				w := s.Account(addr)
+				for _, t := range w.Vesting {
+					s.RepairPool += t.Amount - t.Claimed
+				}
+				w.Vesting = nil
+				drop = append(drop, addr)
 			}
-			for _, t := range a.Vesting {
-				s.RepairPool += t.Amount - t.Claimed
-			}
-			a.Vesting = nil
+			return true
+		})
+		for _, addr := range drop {
+			s.Vesters.Delete(addr)
 		}
 	}
 	// The last block of an epoch fixes the next epoch's challenge inputs.
 	if (h+1)%s.P.ProofEpoch == 0 {
 		s.EpochSeed = hd.Hash()
-		for _, b := range s.Buckets {
-			b.EpochLen = b.Len
+		for id, b := range s.Buckets {
+			if b.EpochLen != b.Len {
+				s.bucket(id).EpochLen = b.Len
+			}
 		}
 	}
 

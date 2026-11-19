@@ -56,9 +56,3 @@ func UnpackSub(seed cryptox.Hash, s int, packedSub []byte, length int) []byte {
 	}
 	return raw
 }
-
-// Unpack recovers a whole chunk of the given length.
-func Unpack(seed cryptox.Hash, packed []byte, length int) []byte {
-	raw := xorAt(seed, 0, packed)
-	return raw[:length]
-}

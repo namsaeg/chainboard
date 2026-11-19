@@ -206,7 +206,7 @@ func (h *Host) FetchData(root Hash, prefer *peer) {
 func (h *Host) FetchChunks(want map[Hash][]uint64) {
 	for root := range want {
 		if _, ok := h.cfg.Store.Size(root); !ok {
-			info, ok := h.cfg.Chain.Tip().Data[root]
+			info, ok := h.cfg.Chain.Tip().Data.Get(root)
 			if !ok {
 				continue
 			}

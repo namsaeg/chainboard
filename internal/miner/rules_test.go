@@ -45,7 +45,7 @@ func TestUploadExtendExpire(t *testing.T) {
 	r.send(t, k, &types.Tx{Kind: types.TxUpload, DataRoot: root, Size: uint64(len(data)), Tier: 1, Media: types.MediaImage, MaxFee: 100 * params.Coin})
 	r.mineN(t, 1)
 	tip := r.c.Tip()
-	info, ok := tip.Data[root]
+	info, ok := tip.Data.Get(root)
 	if !ok || info.Bucket == 0 {
 		t.Fatalf("upload not placed in a term bucket: %+v", info)
 	}
@@ -62,7 +62,7 @@ func TestUploadExtendExpire(t *testing.T) {
 	r.send(t, other, &types.Tx{Kind: types.TxExtend, DataRoot: root, Tier: 12, MaxFee: 100 * params.Coin})
 	r.mineN(t, 1)
 	tip = r.c.Tip()
-	if tip.Data[root].Bucket <= firstBucket {
+	if dataOf(tip, root).Bucket <= firstBucket {
 		t.Fatal("extend did not move the data to a later bucket")
 	}
 	// Mine past the first bucket's expiry: the data survives in its new bucket.
@@ -73,7 +73,7 @@ func TestUploadExtendExpire(t *testing.T) {
 	if _, ok := tip.Buckets[firstBucket]; ok {
 		t.Fatal("expired bucket still present")
 	}
-	if _, ok := tip.Data[root]; !ok {
+	if _, ok := tip.Data.Get(root); !ok {
 		t.Fatal("extended data was dropped with the old bucket")
 	}
 	r.check(t)
@@ -85,11 +85,11 @@ func TestUploadExtendExpire(t *testing.T) {
 	r.pool.Reset(tip)
 	r.send(t, k, &types.Tx{Kind: types.TxUpload, DataRoot: root2, Size: uint64(len(data2)), Tier: 1, Media: types.MediaImage, MaxFee: 100 * params.Coin})
 	r.mineN(t, 1)
-	b2 := r.c.Tip().Data[root2].Bucket
+	b2 := dataOf(r.c.Tip(), root2).Bucket
 	for r.c.Height() < r.c.Tip().BucketExpiry(b2)+1 {
 		r.mineN(t, 1)
 	}
-	if _, ok := r.c.Tip().Data[root2]; ok {
+	if _, ok := r.c.Tip().Data.Get(root2); ok {
 		t.Fatal("unextended data did not expire")
 	}
 	r.check(t)
@@ -158,7 +158,7 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	r.send(t, staker, &types.Tx{Kind: types.TxTransfer, To: k.Address(), Amount: 1, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	after := r.c.Tip().Peek(staker.Address()).Balance
-	if m := r.c.Tip().Members[types.Hash{31: 1}]; m == nil || m.Bond != 2*params.Coin {
+	if m := memberOf(r.c.Tip(), types.Hash{31: 1}); m == nil || m.Bond != 2*params.Coin {
 		t.Fatal("membership bond not recorded")
 	}
 	if after < before+7*params.Coin {
@@ -184,7 +184,7 @@ func TestForfeitAndEpochProofs(t *testing.T) {
 	a.send(t, a.m.Key, &types.Tx{Kind: types.TxTransfer, To: b.Key.Address(), Amount: params.Coin, MaxFee: params.Coin})
 	a.mineN(t, 1)
 	tip = a.c.Tip()
-	a.m, b = b, a.m // b now mines; the old miner quits
+	a.m = b // b now mines; the old miner quits
 	// b registers its partitions so it can prove even in epochs it does not win.
 	a.pool.Reset(tip)
 	a.m.Prepare(tip)
@@ -268,11 +268,19 @@ func TestChainPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.MemoryDepth = 3 // older bodies are read back from the database
 	r.c = c
 	r.m.Chain = c
 	r.pool = newPool(c)
 	r.m.Pool = r.pool
-	r.mineTo(t, 8)
+	r.mineTo(t, 20)
+	first := c.BlockAt(1)
+	if first == nil || first.Height != 1 || c.Block(first.Hash()) == nil {
+		t.Fatal("evicted block not read back")
+	}
+	if got := c.After(c.Locator()[len(c.Locator())-1:], 50); len(got) != 20 || got[0].Hash() != first.Hash() {
+		t.Fatalf("serving blocks to a syncing peer: %d", len(got))
+	}
 	want := c.BestHash()
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
@@ -281,8 +289,9 @@ func TestChainPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c2.Close()
-	if c2.BestHash() != want || c2.Height() != 8 {
-		t.Fatalf("reopened chain at %d, want 8", c2.Height())
+	c2.MemoryDepth = 3
+	r.c = c2 // the version check replays from this one
+	if c2.BestHash() != want || c2.Height() != 20 {
+		t.Fatalf("reopened chain at %d, want 20", c2.Height())
 	}
 }

@@ -3,11 +3,8 @@ package store
 import (
 	"bytes"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 )
@@ -82,7 +79,7 @@ func TestPacked(t *testing.T) {
 	if err != nil || !bytes.Equal(sub, pk[2*params.SubChunkSize:3*params.SubChunkSize]) {
 		t.Fatal("packed sub mismatch")
 	}
-	if _, err := s.PackedSub(m, 4, 7, params.SubPerChunk); err == nil {
+	if _, err := s.PackedSub(m, 4, 7, (params.ChunkSize / params.SubChunkSize)); err == nil {
 		t.Fatal("out of range sub read")
 	}
 	if err := s.DropBucket(m, 4); err != nil {
@@ -93,35 +90,31 @@ func TestPacked(t *testing.T) {
 	}
 }
 
-func TestImportV010(t *testing.T) {
-	old := t.TempDir()
-	good := sample(params.ChunkSize+10, 5)
-	bad := sample(params.ChunkSize+10, 6)
-	write := func(data []byte, drop int) {
-		root, _ := chunk.Root(data)
-		d := filepath.Join(old, "data", root.String())
-		os.MkdirAll(d, 0o755)
-		os.WriteFile(filepath.Join(d, "meta.json"), []byte(fmt.Sprintf(`{"size":%d}`, len(data))), 0o644)
-		for i, c := range chunk.Split(data) {
-			if i != drop {
-				os.WriteFile(filepath.Join(d, fmt.Sprintf("%d.chunk", i)), c, 0o644)
-			}
-		}
-	}
-	write(good, -1)
-	write(bad, 1) // incomplete: skipped
+func TestUseGenesis(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	n, err := s.ImportV010(old)
-	if err != nil || n != 1 {
-		t.Fatalf("imported %d, %v", n, err)
+	data := sample(params.ChunkSize+10, 5)
+	root, _ := s.PutData(data)
+	miner := cryptox.Address{1}
+	if err := s.PutPacked(miner, Packed{Bucket: 3, Data: make([]byte, params.ChunkSize)}); err != nil {
+		t.Fatal(err)
 	}
-	gr, _ := chunk.Root(good)
-	br, _ := chunk.Root(bad)
-	if !s.Complete(gr) || s.Complete(br) {
-		t.Fatal("import picked the wrong files")
+	if _, err := s.PutText([]byte("글")); err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := s.UseGenesis(Hash{1}); dropped || err != nil {
+		t.Fatalf("first genesis: dropped=%v %v", dropped, err)
+	}
+	if dropped, _ := s.UseGenesis(Hash{1}); dropped {
+		t.Fatal("same genesis dropped data")
+	}
+	if dropped, _ := s.UseGenesis(Hash{2}); !dropped {
+		t.Fatal("another genesis kept replicas")
+	}
+	if s.HasPacked(miner, 3, 0) || len(s.TextHashes()) != 0 || !s.Complete(root) {
+		t.Fatal("wrong things dropped")
 	}
 }

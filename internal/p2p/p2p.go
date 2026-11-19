@@ -67,7 +67,8 @@ type Host struct {
 	mu       sync.Mutex
 	peers    map[*peer]bool
 	known    map[string]bool // addresses learned from peers
-	seen     map[Hash]time.Time
+	seen     map[Hash]bool   // this generation of seen tx and block ids
+	seenOld  map[Hash]bool   // the previous generation
 	stem     *peer
 	stemAt   time.Time
 	embargo  map[Hash]*time.Timer
@@ -110,7 +111,7 @@ func New(cfg Config) (*Host, error) {
 		cfg.Logf = log.Printf
 	}
 	return &Host{cfg: cfg, tls: tc, nonce: binary.BigEndian.Uint64(nb[:]),
-		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]time.Time{},
+		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]bool{}, seenOld: map[Hash]bool{},
 		embargo: map[Hash]*time.Timer{}, fetching: map[string]time.Time{}, waiting: map[Hash]*types.Tx{},
 		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{},
 		quit: make(chan struct{})}, nil
@@ -364,18 +365,16 @@ func (p *peer) readLoop() {
 func (h *Host) markSeen(id Hash) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, ok := h.seen[id]; ok {
+	if h.seen[id] || h.seenOld[id] {
 		return false
 	}
-	if len(h.seen) > seenLimit {
-		cut := time.Now().Add(-30 * time.Minute)
-		for k, t := range h.seen {
-			if t.Before(cut) {
-				delete(h.seen, k)
-			}
-		}
+	// Two generations: when this one is full it becomes the old one and the
+	// oldest is dropped whole. O(1) per id; at least seenLimit ids are
+	// always remembered.
+	if len(h.seen) >= seenLimit {
+		h.seenOld, h.seen = h.seen, make(map[Hash]bool, seenLimit)
 	}
-	h.seen[id] = time.Now()
+	h.seen[id] = true
 	return true
 }
 
@@ -631,7 +630,7 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 // wanted reports whether chunk data for root is something we need: an upload
 // in the pool or on chain with that size.
 func (h *Host) wanted(root Hash, size uint64) bool {
-	if info, ok := h.cfg.Chain.Tip().Data[root]; ok {
+	if info, ok := h.cfg.Chain.Tip().Data.Get(root); ok {
 		return info.Size == size
 	}
 	h.mu.Lock()

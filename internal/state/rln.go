@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"github.com/namsaeg/chainboard/internal/pmap"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
@@ -147,7 +148,7 @@ func (s *State) pushRoot(h uint64) {
 
 // MemberPath returns what a member needs to prove against the current root.
 func (s *State) MemberPath(idc Hash) (m Member, path [rln.Depth]fr.Element, bits [rln.Depth]uint8, ok bool) {
-	mp, found := s.Members[idc]
+	mp, found := s.Members.Get(idc)
 	if !found || mp.Status == MemberGone {
 		return Member{}, path, bits, false
 	}
@@ -177,7 +178,7 @@ func (s *State) checkJoin(t *types.Tx, acc *Account) error {
 	if _, err := field(t.Commitment); err != nil {
 		return err
 	}
-	if _, used := s.Members[t.Commitment]; used {
+	if s.Members.Has(t.Commitment) {
 		return errors.New("identity commitment already used")
 	}
 	if uint64(t.Limit) > s.P.RLNMaxLimit {
@@ -203,12 +204,13 @@ func (s *State) applyJoin(t *types.Tx, owner Address, acc *Account, h uint64) {
 	acc.StakeMature -= t.Amount
 	idc, _ := field(t.Commitment)
 	i := s.RLNTree.Append(rln.Leaf(idc, uint64(t.Limit)))
-	s.Members[t.Commitment] = &Member{Owner: owner, Index: i, Limit: t.Limit, Bond: t.Amount, Status: MemberActive}
+	s.Members.Set(t.Commitment, &Member{Owner: owner, Index: i, Limit: t.Limit, Bond: t.Amount, Status: MemberActive})
+	s.MemberCount++
 	s.pushRoot(h)
 }
 
 func (s *State) checkLeave(t *types.Tx, owner Address) error {
-	m, ok := s.Members[t.Commitment]
+	m, ok := s.Members.Get(t.Commitment)
 	if !ok || m.Owner != owner {
 		return errors.New("not your membership")
 	}
@@ -228,8 +230,9 @@ func (s *State) applyLeave(t *types.Tx, h uint64) {
 // cloneMember replaces a member with a private copy before it is modified,
 // so states that share nothing stay independent.
 func (s *State) cloneMember(idc Hash) *Member {
-	c := *s.Members[idc]
-	s.Members[idc] = &c
+	m, _ := s.Members.Get(idc)
+	c := *m
+	s.Members.Set(idc, &c)
 	return &c
 }
 
@@ -238,7 +241,7 @@ func (s *State) releaseExits(h uint64) {
 	for len(s.RLNExits) > 0 && s.RLNExits[0].At <= h {
 		e := s.RLNExits[0]
 		s.RLNExits = s.RLNExits[1:]
-		m, ok := s.Members[e.IDC]
+		m, ok := s.Members.Get(e.IDC)
 		if !ok || m.Status != MemberLeaving {
 			continue // slashed meanwhile
 		}
@@ -248,6 +251,7 @@ func (s *State) releaseExits(h uint64) {
 		s.Account(m.Owner).Balance += m.Bond
 		m.Bond = 0
 		m.Status = MemberGone
+		s.MemberCount--
 	}
 }
 
@@ -310,7 +314,7 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 	pub := rln.Public{Root: root, X: x, Y: y, Nullifier: null, Epoch: p.Epoch, Scope: s.P.RLNScope(), Cap: cap}
 	// The nullifier comes first, so a double signal is caught whatever else
 	// is wrong with the second post.
-	if prev, used := s.RLNNulls[p.Epoch][p.Nullifier]; used {
+	if prev, used := s.NullShare(p.Epoch, p.Nullifier); used {
 		if prev.X == share.X {
 			return ErrDuplicateAnon
 		}
@@ -341,15 +345,18 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 	ctx.FreeUsed += size
 	ctx.FreeStorage += fee
 	s.fund(dest, fee)
-	if s.RLNNulls[p.Epoch] == nil {
-		s.RLNNulls[p.Epoch] = map[Hash]Share{}
+	nulls, ok := s.RLNNulls[p.Epoch]
+	if !ok {
+		nulls = pmap.New[Hash, Share](pmap.Hash32[Hash])
 	}
-	s.RLNNulls[p.Epoch][p.Nullifier] = share
+	nulls.Set(p.Nullifier, share)
+	s.RLNNulls[p.Epoch] = nulls
 	s.notePost(t, h, dupKey)
 	id := t.ID()
-	pi := *s.Posts[id]
+	pp, _ := s.Posts.Get(id)
+	pi := *pp
 	pi.TextBucket = dest
-	s.Posts[id] = &pi
+	s.Posts.Set(id, &pi)
 	s.queueText(id, t.TextHash, t.TextLen, dest)
 	return nil
 }
@@ -361,7 +368,7 @@ func (s *State) applySlash(t *types.Tx, ctx *BlockCtx) error {
 		return err
 	}
 	idc := rln.ToBytes(rln.IdentityCommitment(sec))
-	m, ok := s.Members[idc]
+	m, ok := s.Members.Get(idc)
 	if !ok || m.Status == MemberGone {
 		return errors.New("no slashable membership for that secret")
 	}
@@ -378,6 +385,7 @@ func (s *State) applySlash(t *types.Tx, ctx *BlockCtx) error {
 	ctx.Burn += m.Bond - reward
 	m.Bond = 0
 	m.Status = MemberGone
+	s.MemberCount--
 	return nil
 }
 
@@ -387,12 +395,21 @@ func (s *State) AnonMined(t *types.Tx) bool {
 	if t.RLN == nil {
 		return false
 	}
-	prev, ok := s.RLNNulls[t.RLN.Epoch][t.RLN.Nullifier]
+	prev, ok := s.NullShare(t.RLN.Epoch, t.RLN.Nullifier)
 	if !ok {
 		return false
 	}
 	sig := t.Signal()
 	return prev.X == rln.ToBytes(rln.SignalX(sig[:]))
+}
+
+// NullShare is the share recorded under a nullifier of an epoch.
+func (s *State) NullShare(epoch uint64, null Hash) (Share, bool) {
+	m, ok := s.RLNNulls[epoch]
+	if !ok {
+		return Share{}, false
+	}
+	return m.Get(null)
 }
 
 // AnonEpochCap is the epoch the next block belongs to and its message cap.

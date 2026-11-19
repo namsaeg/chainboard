@@ -44,7 +44,7 @@ func TestRLNLane(t *testing.T) {
 	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: 1 * params.Coin, Commitment: idc2, Limit: 1, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	st := r.c.Tip()
-	if st.Members[idc] == nil || st.Members[idc].Status != state.MemberActive {
+	if memberOf(st, idc) == nil || memberOf(st, idc).Status != state.MemberActive {
 		t.Fatal("membership not active")
 	}
 
@@ -82,7 +82,7 @@ func TestRLNLane(t *testing.T) {
 	}
 	r.mineN(t, 1)
 	st = r.c.Tip()
-	if pi := st.Posts[a0.ID()]; pi == nil || pi.Author != (types.Address{}) {
+	if pi := postOf(st, a0.ID()); pi == nil || pi.Author != (types.Address{}) {
 		t.Fatal("anonymous post not mined or not anonymous")
 	}
 
@@ -94,7 +94,7 @@ func TestRLNLane(t *testing.T) {
 	}
 	r.mineN(t, 1)
 	st = r.c.Tip()
-	if m := st.Members[idc]; m.Status != state.MemberGone || m.Bond != 0 {
+	if m := memberOf(st, idc); m.Status != state.MemberGone || m.Bond != 0 {
 		t.Fatal("member not slashed")
 	}
 	if st.Burned < burned+3*params.Coin/2 || len(st.RLNRoots) != 1 {
@@ -123,13 +123,13 @@ func TestRLNLane(t *testing.T) {
 	r.send(t, k, &types.Tx{Kind: types.TxRLNLeave, Commitment: idc2, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	st = r.c.Tip()
-	m2 := st.Members[idc2]
+	m2 := memberOf(st, idc2)
 	if m2.Status != state.MemberLeaving || m2.Bond != params.Coin {
 		t.Fatal("leave not recorded")
 	}
 	r.mineTo(t, m2.Release)
 	st = r.c.Tip()
-	m := st.Members[idc2]
+	m := memberOf(st, idc2)
 	if leaf := st.RLNTree.Leaf(m.Index); m.Status != state.MemberGone || m.Bond != 0 || !leaf.IsZero() {
 		t.Fatal("membership not released")
 	}

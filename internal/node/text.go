@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
@@ -45,8 +46,8 @@ func (n *Node) textBody(x cryptox.Hash) ([]byte, bool) {
 	}
 	tip := n.Chain.Tip()
 	for _, id := range n.Index.postsWithText(x) {
-		pi := tip.Posts[id]
-		if pi == nil || pi.TextRoot.IsZero() || tip.TextExpired(pi) {
+		pi, ok := tip.Posts.Get(id)
+		if !ok || pi.TextRoot.IsZero() || tip.TextExpired(pi) {
 			continue
 		}
 		if b, ok := n.cutBody(pi); ok {
@@ -84,7 +85,7 @@ func (n *Node) fillText(v *PostView, tip *state.State) {
 		v.TextState = "ok"
 		return
 	}
-	if pi := tip.Posts[v.id]; pi != nil {
+	if pi, ok := tip.Posts.Get(v.id); ok {
 		v.Tier, v.Until = pi.TextTier, tip.TextUntil(pi)
 		if tip.TextExpired(pi) {
 			v.Text, v.TextState = "", "expired"
@@ -106,7 +107,7 @@ func (n *Node) fillText(v *PostView, tip *state.State) {
 // Board returns a board's newest posts with their bodies.
 func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 	tip := n.Chain.Tip()
-	vs := n.Index.Board(name, minLikes, limit)
+	vs := n.Index.Board(tip, name, minLikes, limit)
 	for i := range vs {
 		n.fillText(&vs[i], tip)
 	}
@@ -116,7 +117,7 @@ func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 // Thread returns a post and its comments with their bodies.
 func (n *Node) Thread(id cryptox.Hash) (*PostView, []PostView) {
 	tip := n.Chain.Tip()
-	p, cs := n.Index.Thread(id)
+	p, cs := n.Index.Thread(tip, id)
 	if p == nil {
 		return nil, nil
 	}
@@ -147,8 +148,8 @@ func (n *Node) textLoop(ctx context.Context) {
 		var again []cryptox.Hash
 		for _, id := range ids {
 			v, ok := n.Index.post(id)
-			pi := tip.Posts[id]
-			if !ok || pi == nil || tip.TextExpired(pi) || v.Height+n.cacheBlocks() < tip.Height {
+			pi, onChain := tip.Posts.Get(id)
+			if !ok || !onChain || tip.TextExpired(pi) || v.Height+n.cacheBlocks() < tip.Height {
 				delete(tries, id)
 				continue // gone, expired, or old enough to fetch only when opened
 			}
@@ -185,8 +186,8 @@ func (n *Node) sweep(tip *state.State) {
 	// Raw data: uploads and text bundles.
 	live := map[cryptox.Hash]bool{}
 	for _, b := range tip.Buckets {
-		for _, r := range b.Records {
-			live[r.DataRoot] = true
+		for i := 0; i < b.Records.Len(); i++ {
+			live[b.Records.Ptr(i).DataRoot] = true
 		}
 	}
 	kept := map[cryptox.Hash]bool{}
@@ -196,10 +197,12 @@ func (n *Node) sweep(tip *state.State) {
 			if !ok {
 				continue
 			}
-			for _, r := range tip.Buckets[bucket].Records {
-				if r.Start < start+length && r.Start+r.Chunks > start {
-					kept[r.DataRoot] = true
-				}
+			// Records are in position order: find the first that reaches
+			// the partition, then walk while they start inside it.
+			recs := tip.Buckets[bucket].Records
+			i := sort.Search(recs.Len(), func(i int) bool { r := recs.Ptr(i); return r.Start+r.Chunks > start })
+			for ; i < recs.Len() && recs.Ptr(i).Start < start+length; i++ {
+				kept[recs.Ptr(i).DataRoot] = true
 			}
 		}
 	}
@@ -252,9 +255,9 @@ func (n *Node) sweep(tip *state.State) {
 		}
 		keep := false
 		for _, id := range ids {
-			pi := tip.Posts[id]
+			pi, onChain := tip.Posts.Get(id)
 			v, ok := n.Index.post(id)
-			if pi != nil && ok && !tip.TextExpired(pi) && !old(v.Height) {
+			if onChain && ok && !tip.TextExpired(pi) && !old(v.Height) {
 				keep = true
 			}
 		}
@@ -275,7 +278,7 @@ func (n *Node) sweep(tip *state.State) {
 // needs the body, which travels with the transaction to the next seal.
 func (n *Node) ExtendPost(id cryptox.Hash, tier uint16, confirm bool) error {
 	tip := n.Chain.Tip()
-	pi, ok := tip.Posts[id]
+	pi, ok := tip.Posts.Get(id)
 	if !ok {
 		return errors.New("post not found")
 	}

@@ -20,7 +20,7 @@ import (
 // gigabytes of memory.
 const MaxPixels = 40_000_000
 
-var ErrUnsupported = errors.New("media: only PNG, JPEG and GIF images are accepted in 0.1.0")
+var ErrUnsupported = errors.New("media: only PNG, JPEG and GIF images are accepted")
 
 // Sniff returns the media class of data, or an error if it is not accepted.
 func Sniff(b []byte) (uint8, string, error) {

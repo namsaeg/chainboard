@@ -54,12 +54,7 @@ func (s *State) fund(dest uint32, fee uint64) {
 		s.Endowment += fee
 		return
 	}
-	b, ok := s.Buckets[dest]
-	if !ok {
-		b = &Bucket{ID: dest}
-		s.Buckets[dest] = b
-	}
-	b.Escrow += fee
+	s.bucket(dest).Escrow += fee
 }
 
 func (s *State) queueText(post, hash Hash, n uint16, bucket uint32) {
@@ -119,13 +114,9 @@ func (s *State) seal(hd *types.Header, h uint64) error {
 	}
 	for i, w := range want {
 		root := hd.TextBundles[i].Root
-		b, ok := s.Buckets[w.Bucket]
-		if !ok {
-			b = &Bucket{ID: w.Bucket}
-			s.Buckets[w.Bucket] = b
-		}
+		b := s.bucket(w.Bucket)
 		n := chunk.Count(w.Size)
-		b.Records = append(b.Records, Record{DataRoot: root, Size: w.Size, Start: b.Len, Chunks: n})
+		b.Records.Append(Record{DataRoot: root, Size: w.Size, Start: b.Len, Chunks: n})
 		b.Len += n
 		b.Bytes += w.Size
 		if w.Bucket == 0 {
@@ -135,10 +126,10 @@ func (s *State) seal(hd *types.Header, h uint64) error {
 		}
 		off := uint32(0)
 		for _, e := range w.Entries {
-			if pi, ok := s.Posts[e.Post]; ok {
+			if pi, ok := s.Posts.Get(e.Post); ok {
 				c := *pi
 				c.TextRoot, c.TextOff = root, off
-				s.Posts[e.Post] = &c
+				s.Posts.Set(e.Post, &c)
 			}
 			off += uint32(e.Len)
 		}
@@ -181,7 +172,7 @@ func (s *State) TextUntil(pi *PostInfo) uint64 {
 
 // postExtendFee prices lengthening a post's text retention.
 func (s *State) postExtendFee(t *types.Tx, h uint64) (uint64, uint32, error) {
-	pi, ok := s.Posts[t.Target]
+	pi, ok := s.Posts.Get(t.Target)
 	if !ok {
 		return 0, 0, errors.New("extend of unknown post")
 	}
@@ -211,9 +202,10 @@ func (s *State) postExtendFee(t *types.Tx, h uint64) (uint64, uint32, error) {
 }
 
 func (s *State) applyPostExtend(t *types.Tx, dest uint32) {
-	c := *s.Posts[t.Target]
+	p, _ := s.Posts.Get(t.Target)
+	c := *p
 	c.TextTier, c.TextBucket = t.Tier, dest
-	s.Posts[t.Target] = &c
+	s.Posts.Set(t.Target, &c)
 	s.queueText(t.Target, t.TextHash, t.TextLen, dest)
 }
 

@@ -138,19 +138,20 @@ func New(cfg Config) (*Node, error) {
 			ch.Close()
 		}
 	}()
-	// 0.1.0 kept data as files under store/; import what is complete.
-	if old := filepath.Join(dir, "store"); dirExists(filepath.Join(old, "data")) {
-		if n, err := st.ImportV010(old); err == nil {
-			_ = os.Rename(old, filepath.Join(dir, "store.v010"))
-			cfg.Logf("node: imported %d files from the 0.1.0 store", n)
-		}
+	if ch.SetAside != "" {
+		cfg.Logf("node: the chain database belonged to another network; moved it to %s", ch.SetAside)
+	}
+	if dropped, err := st.UseGenesis(ch.Genesis()); err != nil {
+		return nil, err
+	} else if dropped {
+		cfg.Logf("node: dropped packed replicas and post bodies of another network")
 	}
 	if groot, _ := chunk.Root(ch.GenesisData); !st.Complete(groot) {
 		if _, err := st.PutData(ch.GenesisData); err != nil {
 			return nil, err
 		}
 	}
-	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, Index: NewIndex(), dir: dir,
+	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, dir: dir,
 		sent: map[uint64]*sentTx{}}
 	if err := n.loadRLN(); err != nil {
 		return nil, err
@@ -175,15 +176,19 @@ func New(cfg Config) (*Node, error) {
 	n.Host = host
 	n.Miner = &miner.Miner{Chain: ch, Pool: n.Pool, Store: st, Key: wallet, PledgeBytes: cfg.PledgeBytes,
 		OnBlock: host.BroadcastBlock, Logf: cfg.Logf}
-	n.Index.Sync(ch)
+	ix, err := OpenIndex(filepath.Join(dir, "index.db"))
+	if err != nil {
+		return nil, err
+	}
+	ix.RecentBlocks = n.cacheBlocks()
+	n.Index = ix
+	if err := ix.Sync(ch); err != nil {
+		ix.Close()
+		return nil, err
+	}
 	n.loadOutbox()
 	ok = true
 	return n, nil
-}
-
-func dirExists(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && fi.IsDir()
 }
 
 // checkUpload is the pool's data policy: all chunks present and an accepted
@@ -229,6 +234,7 @@ func (n *Node) Stop() {
 	n.Host.Stop()
 	n.wg.Wait()
 	n.saveOutbox()
+	_ = n.Index.Close()
 	_ = n.Chain.Close()
 	_ = n.Store.Close()
 }
@@ -246,7 +252,9 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 			// notifications must not move the pool backwards.
 			st := n.Chain.Tip()
 			n.syncPool()
-			n.Index.Sync(n.Chain)
+			if err := n.Index.Sync(n.Chain); err != nil {
+				n.cfg.Logf("node: index: %v", err)
+			}
 			n.tendSent(st)
 			n.checkForeign(st)
 			n.tendOutbox(st)
@@ -465,7 +473,7 @@ func (n *Node) Quote(t *types.Tx) (uint64, error) {
 	if err := st.ApplyTx(&probe, st.NewCtx()); err != nil {
 		return 0, err
 	}
-	spent := start - st.Accounts[n.Wallet.Address()].Balance
+	spent := start - st.Peek(n.Wallet.Address()).Balance
 	switch t.Kind {
 	case types.TxTransfer, types.TxStake:
 		spent -= t.Amount
@@ -612,7 +620,7 @@ func (n *Node) Upload(raw []byte, tier uint16, confirm bool) (UploadResult, erro
 		return UploadResult{Root: root}, err
 	}
 	st := n.trialState()
-	info, exists := st.Data[root]
+	info, exists := st.Data.Get(root)
 	if exists {
 		until := st.BucketExpiry(info.Bucket)
 		if info.Tier == params.TierPermanent || (!perm && st.BucketFor(st.Height+1, months, perm) <= info.Bucket) {

@@ -610,9 +610,6 @@ func (t *Tx) CheckStateless() error {
 	return nil
 }
 
-// IsText reports whether the tx counts against text lane capacity.
-func (t *Tx) IsText() bool { return t.Kind == TxPost || t.Kind == TxLike || t.Kind == TxAnonPost }
-
 // IsPost reports whether the tx creates a post.
 func (t *Tx) IsPost() bool { return t.Kind == TxPost || t.Kind == TxAnonPost }
 

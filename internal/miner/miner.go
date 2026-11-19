@@ -170,63 +170,108 @@ func (m *Miner) Run(ctx context.Context) {
 }
 
 func (m *Miner) mineOn(ctx context.Context, tip *state.State, tips <-chan *state.State) {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	addr := m.Key.Address()
 	target := tip.ExpectedTarget()
 	h := tip.Height + 1
-	in := vdf.Reseed(tip.VDFOut, tip.Tip)
-	var outputs []cryptox.Hash
+	clock := m.startVDF(ctx, vdf.Reseed(tip.VDFOut, tip.Tip), tip.P.VDFIterations)
 	parts := m.Assigned()
+	done := 0 // steps whose challenges have been checked
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tips:
 			return
-		default:
+		case <-clock.ready:
 		}
-		out := vdf.Step(in, tip.P.VDFIterations)
-		in = out
-		outputs = append(outputs, out)
-		m.mu.Lock()
-		m.stats.Steps++
-		m.mu.Unlock()
-		for _, p := range parts {
-			for k := 0; k < tip.P.ChallengesPerStep; k++ {
-				c, ok := tip.ChallengeFor(out, p, addr, uint8(k), h)
-				if !ok || !m.Store.HasPacked(addr, c.Bucket, c.Position) {
-					continue
-				}
-				packed, err := m.Store.PackedSub(addr, c.Bucket, c.Position, c.Sub)
-				if err != nil {
-					continue
-				}
-				m.mu.Lock()
-				m.stats.Checks++
-				m.mu.Unlock()
-				if !state.MeetsTarget(state.SolutionHash(c.H0, packed), target, c.Weight) {
-					continue
-				}
-				b, err := m.build(tip, target, outputs, p, uint8(k), c, packed)
-				if err != nil {
-					m.logf("miner: build block: %v", err)
-					continue
-				}
-				if err := m.Chain.Add(b); err != nil {
-					m.setResult("rejected: " + err.Error())
-					m.logf("miner: own block rejected: %v", err)
+		outputs := clock.sofar()
+		for ; done < len(outputs); done++ {
+			out := outputs[done]
+			checks := uint64(0)
+			for _, p := range parts {
+				for k := 0; k < tip.P.ChallengesPerStep; k++ {
+					c, ok := tip.ChallengeFor(out, p, addr, uint8(k), h)
+					if !ok || !m.Store.HasPacked(addr, c.Bucket, c.Position) {
+						continue
+					}
+					packed, err := m.Store.PackedSub(addr, c.Bucket, c.Position, c.Sub)
+					if err != nil {
+						continue
+					}
+					checks++
+					if !state.MeetsTarget(state.SolutionHash(c.H0, packed), target, c.Weight) {
+						continue
+					}
+					m.addChecks(checks)
+					checks = 0
+					b, err := m.build(tip, target, outputs[:done+1], p, uint8(k), c, packed)
+					if err != nil {
+						m.logf("miner: build block: %v", err)
+						continue
+					}
+					if err := m.Chain.Add(b); err != nil {
+						m.setResult("rejected: " + err.Error())
+						m.logf("miner: own block rejected: %v", err)
+						return
+					}
+					m.mu.Lock()
+					m.stats.Blocks++
+					m.stats.LastResult = "found block " + b.Hash().String()[:12]
+					m.mu.Unlock()
+					if m.OnBlock != nil {
+						m.OnBlock(b)
+					}
 					return
 				}
-				m.mu.Lock()
-				m.stats.Blocks++
-				m.stats.LastResult = "found block " + b.Hash().String()[:12]
-				m.mu.Unlock()
-				if m.OnBlock != nil {
-					m.OnBlock(b)
-				}
-				return
 			}
+			m.addChecks(checks)
 		}
 	}
+}
+
+// vdfClock runs the VDF in its own goroutine, so storage reads for the
+// challenges never slow the clock: a miner's challenge rate is set by its
+// VDF speed alone, and checks only need to keep up on average.
+type vdfClock struct {
+	mu    sync.Mutex
+	outs  []cryptox.Hash
+	ready chan struct{} // signalled after each step (coalesced)
+}
+
+func (m *Miner) startVDF(ctx context.Context, in cryptox.Hash, iterations uint64) *vdfClock {
+	c := &vdfClock{ready: make(chan struct{}, 1)}
+	go func() {
+		for ctx.Err() == nil {
+			in = vdf.Step(in, iterations)
+			c.mu.Lock()
+			c.outs = append(c.outs, in)
+			c.mu.Unlock()
+			m.mu.Lock()
+			m.stats.Steps++
+			m.mu.Unlock()
+			select {
+			case c.ready <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return c
+}
+
+// sofar returns the outputs computed so far. Later steps only append past
+// its end, so the caller may read it without the lock.
+func (c *vdfClock) sofar() []cryptox.Hash {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.outs[:len(c.outs):len(c.outs)]
+}
+
+func (m *Miner) addChecks(n uint64) {
+	m.mu.Lock()
+	m.stats.Checks += n
+	m.mu.Unlock()
 }
 
 func (m *Miner) setResult(s string) {

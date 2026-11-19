@@ -13,13 +13,12 @@ import (
 )
 
 const (
-	Version = "0.3.0"
+	Version = "0.3.1"
 
 	Coin = 100_000_000 // units per coin
 
 	ChunkSize    = 256 * 1024 // bytes per chunk
 	SubChunkSize = 8 * 1024   // bytes per sub-chunk (proofs carry one sub-chunk)
-	SubPerChunk  = ChunkSize / SubChunkSize
 
 	GB = 1_000_000_000
 
@@ -40,7 +39,7 @@ type Params struct {
 	BlockTime time.Duration
 
 	// VDF and mining.
-	VDFIterations     uint64 // SHA-256 iterations per VDF step (target ~1 step/s)
+	VDFIterations     uint64 // SHA-256 iterations per VDF step (testnet: ~43 ms with SHA-NI)
 	ChallengesPerStep int    // challenges unlocked per stored partition per VDF step
 	PartitionChunks   uint64 // chunks per partition
 	PackMemoryKiB     uint32 // Argon2id memory per packing seed (packing cost)

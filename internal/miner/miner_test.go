@@ -29,12 +29,13 @@ func FastParams() *params.Params {
 }
 
 type rig struct {
-	p     *params.Params
-	c     *chain.Chain
-	pool  *mempool.Pool
-	st    *store.Store
-	m     *Miner
-	clock int64
+	p       *params.Params
+	c       *chain.Chain
+	pool    *mempool.Pool
+	st      *store.Store
+	m       *Miner
+	clock   int64
+	history []version
 }
 
 func newRig(t *testing.T, p *params.Params, seed byte) *rig {
@@ -50,6 +51,11 @@ func newRig(t *testing.T, p *params.Params, seed byte) *rig {
 		t.Fatal(err)
 	}
 	r := &rig{p: p, c: c, st: st, clock: state.GenesisTime}
+	t.Cleanup(func() {
+		if !t.Failed() {
+			r.checkVersions(t)
+		}
+	})
 	r.pool = mempool.New(c.Tip(), nil)
 	r.pool.Bodies = st
 	c.Texts = st
@@ -78,6 +84,38 @@ func (r *rig) mineTo(t *testing.T, h uint64) {
 		r.pool.Reset(tip)
 		r.m.Prepare(tip)
 		r.m.mineOn(ctx, tip, make(chan *state.State))
+		if cur := r.c.Tip(); cur != tip {
+			r.history = append(r.history, version{cur, cur.Digest()})
+		}
+	}
+}
+
+// version is a state the chain handed out, with its digest at the time.
+type version struct {
+	st *state.State
+	d  state.Hash
+}
+
+// checkVersions runs after every rig test: no later block changed a state
+// version handed out earlier (copy-on-write held), and replaying the chain
+// from genesis reaches the same state (application is deterministic).
+func (r *rig) checkVersions(t *testing.T) {
+	for _, v := range r.history {
+		if v.st.Digest() != v.d {
+			t.Fatalf("state at height %d changed after it was handed out", v.st.Height)
+		}
+	}
+	fresh, err := chain.Open(r.p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h <= r.c.Height(); h++ {
+		if err := fresh.Add(r.c.BlockAt(h)); err != nil {
+			t.Fatalf("replay at %d: %v", h, err)
+		}
+	}
+	if fresh.Tip().Digest() != r.c.Tip().Digest() {
+		t.Fatal("replaying the chain reached a different state")
 	}
 }
 
@@ -104,7 +142,7 @@ func TestMineAndPost(t *testing.T) {
 	}
 	r.mineTo(t, tip.Height+1)
 	tip = r.c.Tip()
-	if _, ok := tip.Posts[post.ID()]; !ok {
+	if _, ok := tip.Posts.Get(post.ID()); !ok {
 		t.Fatal("post not mined")
 	}
 	// A comment, and a reply to that comment (not allowed).
@@ -124,7 +162,7 @@ func TestMineAndPost(t *testing.T) {
 	}
 	r.mineTo(t, tip.Height+1)
 	tip = r.c.Tip()
-	if tip.Posts[post.ID()].Comments != 1 {
+	if postOf(tip, post.ID()).Comments != 1 {
 		t.Fatal("comment not counted")
 	}
 	if err := tip.CheckSupply(); err != nil {

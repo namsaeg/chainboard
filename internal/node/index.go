@@ -1,10 +1,21 @@
 package node
 
 import (
-	"sort"
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
 	"sync"
+	"time"
 
-	"github.com/namsaeg/chainboard/internal/chain"
+	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
+
+	"github.com/namsaeg/chainboard/internal/codec"
+	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/state"
+
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/types"
 )
@@ -36,129 +47,408 @@ type PostView struct {
 	textLen  uint16
 }
 
-// Index keeps the posts of the best chain, rebuilt when the chain reorganises.
+// Index keeps the posts of the best chain on disk (index.db), so memory
+// does not grow with every post ever written. Each new block costs work in
+// proportion to that block; a reorganisation undoes only the blocks it
+// replaces. Likes and comment counts are read from the chain state when a
+// post is shown, not copied into the index.
 type Index struct {
-	mu       sync.RWMutex
-	path     []cryptox.Hash // block hash by height that was indexed
-	posts    map[cryptox.Hash]*PostView
-	byBoard  map[string][]cryptox.Hash
-	comments map[cryptox.Hash][]cryptox.Hash
-	byText   map[cryptox.Hash][]cryptox.Hash // text hash -> posts
-	dataAt   map[cryptox.Hash]uint64         // upload and bundle roots -> height first placed
-	needText []cryptox.Hash                  // posts whose bodies may still be missing
+	db       *bolt.DB
+	sync     sync.Mutex // one Sync at a time
+	mu       sync.Mutex // needText
+	needText []cryptox.Hash
+	// RecentBlocks: posts newer than this many blocks behind the tip are
+	// queued for the background body fetcher when indexed.
+	RecentBlocks uint64
 }
 
-// NewIndex returns an empty index.
-func NewIndex() *Index {
-	ix := &Index{}
-	ix.reset()
-	return ix
-}
+var (
+	ixPath     = []byte("path")     // height -> block hash
+	ixPosts    = []byte("posts")    // post id -> record
+	ixBoard    = []byte("board")    // len(board) board height id -> nil
+	ixCount    = []byte("count")    // board -> number of posts
+	ixComments = []byte("comments") // parent height id -> nil
+	ixText     = []byte("text")     // text hash, post id -> nil
+	ixData     = []byte("data")     // data root -> height first placed
+	ixUndo     = []byte("undo")     // height -> what that block added
+)
 
-func (ix *Index) reset() {
-	ix.path = nil
-	ix.posts = map[cryptox.Hash]*PostView{}
-	ix.byBoard = map[string][]cryptox.Hash{}
-	ix.comments = map[cryptox.Hash][]cryptox.Hash{}
-	ix.byText = map[cryptox.Hash][]cryptox.Hash{}
-	ix.dataAt = map[cryptox.Hash]uint64{}
-	ix.needText = nil
-}
-
-// View converts a post transaction.
-func View(t *types.Tx, height uint64, tm int64) *PostView {
-	v := &PostView{ID: t.ID().String(), Board: t.Board, Text: string(t.Text), Author: t.Author().String(),
-		Height: height, Time: tm, Lane: "fee", Tier: t.Tier, TextState: "ok", id: t.ID(), textHash: t.TextHash, textLen: t.TextLen}
-	if t.TextLen > 0 && len(t.Text) == 0 {
-		v.TextState = "loading"
+// OpenIndex opens (or creates) the index database. The index is derived
+// from the chain, so it skips fsync, and a file that does not open (after a
+// crash, say) is deleted and rebuilt by the next Sync.
+func OpenIndex(path string) (*Index, error) {
+	opts := &bolt.Options{Timeout: 5 * time.Second, NoSync: true, NoFreelistSync: true}
+	db, err := bolt.Open(path, 0o600, opts)
+	if err != nil && !errors.Is(err, bolterrors.ErrTimeout) {
+		_ = os.Remove(path)
+		db, err = bolt.Open(path, 0o600, opts)
 	}
-	if t.Kind == types.TxAnonPost {
-		v.Lane = "anon"
-		v.Author = ""
-		if len(t.PseudoPub) > 0 {
-			v.Author, v.Pseudo = t.Author().String(), true
+	if err != nil {
+		return nil, fmt.Errorf("index: %w", err)
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		for _, b := range [][]byte{ixPath, ixPosts, ixBoard, ixCount, ixComments, ixText, ixData, ixUndo} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Index{db: db}, nil
+}
+
+// Close closes the database.
+func (ix *Index) Close() error { return ix.db.Close() }
+
+func u64(x uint64) []byte { return binary.BigEndian.AppendUint64(nil, x) }
+
+func boardKey(board string, height uint64, id cryptox.Hash) []byte {
+	k := append([]byte{byte(len(board))}, board...)
+	k = binary.BigEndian.AppendUint64(k, height)
+	return append(k, id[:]...)
+}
+
+func commentKey(parent cryptox.Hash, height uint64, id cryptox.Hash) []byte {
+	k := append(parent[:0:0], parent[:]...)
+	k = binary.BigEndian.AppendUint64(k, height)
+	return append(k, id[:]...)
+}
+
+// postRec is what the index stores per post.
+type postRec struct {
+	ID       cryptox.Hash
+	Board    string
+	Author   cryptox.Address
+	Parent   cryptox.Hash
+	Height   uint64
+	Time     int64
+	Anon     bool
+	Pseudo   bool
+	Attach   []cryptox.Hash
+	TextHash cryptox.Hash
+	TextLen  uint16
+	Tier     uint16
+}
+
+func (r *postRec) encode() []byte {
+	var w codec.Writer
+	w.Bytes([]byte(r.Board))
+	w.Fixed(r.Author[:])
+	w.Fixed(r.Parent[:])
+	w.Var(r.Height)
+	w.Var(uint64(r.Time))
+	w.Bool(r.Anon)
+	w.Bool(r.Pseudo)
+	w.Var(uint64(len(r.Attach)))
+	for _, a := range r.Attach {
+		w.Fixed(a[:])
+	}
+	w.Fixed(r.TextHash[:])
+	w.U16(r.TextLen)
+	w.U16(r.Tier)
+	return w.B
+}
+
+func decodeRec(id cryptox.Hash, b []byte) (*postRec, error) {
+	r := &postRec{ID: id}
+	rd := codec.NewReader(b)
+	r.Board = string(rd.Bytes(params.MaxBoardBytes))
+	rd.Fixed(r.Author[:])
+	rd.Fixed(r.Parent[:])
+	r.Height = rd.Var()
+	r.Time = int64(rd.Var())
+	r.Anon = rd.Bool()
+	r.Pseudo = rd.Bool()
+	n := rd.Count(params.MaxAttachments)
+	for i := 0; i < n && rd.Err == nil; i++ {
+		var a cryptox.Hash
+		rd.Fixed(a[:])
+		r.Attach = append(r.Attach, a)
+	}
+	rd.Fixed(r.TextHash[:])
+	r.TextLen = rd.U16()
+	r.Tier = rd.U16()
+	return r, rd.Done()
+}
+
+func recOf(t *types.Tx, height uint64, tm int64) *postRec {
+	r := &postRec{ID: t.ID(), Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: height, Time: tm,
+		Anon: t.Kind == types.TxAnonPost, Pseudo: len(t.PseudoPub) > 0, Attach: t.Attach,
+		TextHash: t.TextHash, TextLen: t.TextLen, Tier: t.Tier}
+	return r
+}
+
+func (r *postRec) view() PostView {
+	v := PostView{ID: r.ID.String(), Board: r.Board, Author: r.Author.String(), Height: r.Height, Time: r.Time,
+		Lane: "fee", Tier: r.Tier, TextState: "ok", id: r.ID, textHash: r.TextHash, textLen: r.TextLen}
+	if r.Anon {
+		v.Lane, v.Author = "anon", ""
+		if r.Pseudo {
+			v.Author, v.Pseudo = r.Author.String(), true
 		}
 	}
-	if !t.Parent.IsZero() {
-		v.Parent = t.Parent.String()
+	if !r.Parent.IsZero() {
+		v.Parent = r.Parent.String()
 	}
-	for _, a := range t.Attach {
+	for _, a := range r.Attach {
 		v.Attach = append(v.Attach, a.String())
 	}
 	return v
 }
 
-// Sync catches the index up with the best chain.
-func (ix *Index) Sync(c *chain.Chain) {
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
-	h := c.Height()
-	// Find the first height where our path disagrees with the chain.
-	for i := range ix.path {
-		b := c.BlockAt(uint64(i) + 1)
-		if b == nil || b.Hash() != ix.path[i] {
-			ix.reset()
-			break
-		}
+// View converts a post transaction (one not indexed yet: pending).
+func View(t *types.Tx, height uint64, tm int64) *PostView {
+	v := recOf(t, height, tm).view()
+	v.Text = string(t.Text)
+	if t.TextLen > 0 && len(t.Text) == 0 {
+		v.TextState = "loading"
 	}
-	for height := uint64(len(ix.path)) + 1; height <= h; height++ {
-		b := c.BlockAt(height)
-		if b == nil {
-			break
+	return &v
+}
+
+// Sync catches the index up with the best chain: it walks back from its
+// last indexed block to where it agrees with the chain (usually zero
+// steps), undoes the blocks after that, and indexes the new ones.
+func (ix *Index) Sync(c blockSource) error {
+	ix.sync.Lock()
+	defer ix.sync.Unlock()
+	tipH := c.Height()
+	var last uint64
+	var fork uint64
+	err := ix.db.View(func(tx *bolt.Tx) error {
+		if k, _ := tx.Bucket(ixPath).Cursor().Last(); k != nil {
+			last = binary.BigEndian.Uint64(k)
 		}
-		for _, tb := range b.TextBundles {
-			if _, ok := ix.dataAt[tb.Root]; !ok {
-				ix.dataAt[tb.Root] = height
-			}
-		}
-		for _, t := range b.Txs {
-			if t.Kind == types.TxUpload {
-				if _, ok := ix.dataAt[t.DataRoot]; !ok {
-					ix.dataAt[t.DataRoot] = height
+		path := tx.Bucket(ixPath)
+		for fork = min(last, tipH); fork > 0; fork-- {
+			b, v := c.BlockAt(fork), path.Get(u64(fork))
+			if b != nil && v != nil {
+				if bh := b.Hash(); bytes.Equal(v, bh[:]) {
+					break
 				}
 			}
-			if !t.IsPost() {
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if fork < last {
+		if err := ix.db.Update(func(tx *bolt.Tx) error {
+			for h := last; h > fork; h-- {
+				if err := undoHeight(tx, h); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	// Index in transactions of about a thousand posts: bbolt splits nodes
+	// only at commit, so one huge transaction slows down quadratically.
+	const batchPosts = 1000
+	for h := fork + 1; h <= tipH; {
+		var recent []cryptox.Hash
+		err := ix.db.Update(func(tx *bolt.Tx) error {
+			for posts := 0; h <= tipH && posts < batchPosts; h++ {
+				b := c.BlockAt(h)
+				if b == nil {
+					h = tipH + 1
+					return nil
+				}
+				ids, n, err := indexBlock(tx, b, h)
+				if err != nil {
+					return err
+				}
+				posts += n + 1
+				if h+ix.RecentBlocks >= tipH {
+					recent = append(recent, ids...)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		ix.mu.Lock()
+		ix.needText = append(ix.needText, recent...)
+		ix.mu.Unlock()
+	}
+	return nil
+}
+
+// blockSource is what Sync reads: the best chain's blocks by height.
+type blockSource interface {
+	Height() uint64
+	BlockAt(uint64) *types.Block
+}
+
+// indexBlock records one block and remembers how to undo it. It returns
+// the posts with text and how many posts it indexed.
+func indexBlock(tx *bolt.Tx, b *types.Block, h uint64) ([]cryptox.Hash, int, error) {
+	var undo codec.Writer
+	var withText []cryptox.Hash
+	added := map[string]int64{}
+	count := 0
+	data := tx.Bucket(ixData)
+	newData := func(root cryptox.Hash) {
+		if data.Get(root[:]) == nil {
+			_ = data.Put(root[:], u64(h))
+			undo.U8(1)
+			undo.Fixed(root[:])
+		}
+	}
+	for _, tb := range b.TextBundles {
+		newData(tb.Root)
+	}
+	for _, t := range b.Txs {
+		if t.Kind == types.TxUpload {
+			newData(t.DataRoot)
+		}
+		if !t.IsPost() {
+			continue
+		}
+		count++
+		r := recOf(t, h, b.Time)
+		if err := putPost(tx, r); err != nil {
+			return nil, 0, err
+		}
+		if r.Parent.IsZero() {
+			added[r.Board]++
+		}
+		undo.U8(2)
+		undo.Fixed(r.ID[:])
+		if r.TextLen > 0 {
+			withText = append(withText, r.ID)
+		}
+	}
+	for board, n := range added {
+		if err := addCount(tx, board, n); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := tx.Bucket(ixUndo).Put(u64(h), undo.B); err != nil {
+		return nil, 0, err
+	}
+	bh := b.Hash()
+	return withText, count, tx.Bucket(ixPath).Put(u64(h), bh[:])
+}
+
+func putPost(tx *bolt.Tx, r *postRec) error {
+	if err := tx.Bucket(ixPosts).Put(r.ID[:], r.encode()); err != nil {
+		return err
+	}
+	if r.TextLen > 0 {
+		if err := tx.Bucket(ixText).Put(append(r.TextHash[:], r.ID[:]...), nil); err != nil {
+			return err
+		}
+	}
+	if !r.Parent.IsZero() {
+		return tx.Bucket(ixComments).Put(commentKey(r.Parent, r.Height, r.ID), nil)
+	}
+	return tx.Bucket(ixBoard).Put(boardKey(r.Board, r.Height, r.ID), nil)
+}
+
+func addCount(tx *bolt.Tx, board string, d int64) error {
+	cb := tx.Bucket(ixCount)
+	var n uint64
+	if v := cb.Get([]byte(board)); v != nil {
+		n = binary.BigEndian.Uint64(v)
+	}
+	n = uint64(int64(n) + d)
+	if n == 0 {
+		return cb.Delete([]byte(board))
+	}
+	return cb.Put([]byte(board), u64(n))
+}
+
+// undoHeight removes what the block at height h added.
+func undoHeight(tx *bolt.Tx, h uint64) error {
+	raw := tx.Bucket(ixUndo).Get(u64(h))
+	rd := codec.NewReader(raw)
+	for rd.Err == nil && len(raw) > 0 && !rd.AtEnd() {
+		kind := rd.U8()
+		var x cryptox.Hash
+		rd.Fixed(x[:])
+		switch kind {
+		case 1:
+			if err := tx.Bucket(ixData).Delete(x[:]); err != nil {
+				return err
+			}
+		case 2:
+			v := tx.Bucket(ixPosts).Get(x[:])
+			if v == nil {
 				continue
 			}
-			id := t.ID()
-			ix.posts[id] = View(t, height, b.Time)
-			if t.TextLen > 0 {
-				ix.byText[t.TextHash] = append(ix.byText[t.TextHash], id)
-				ix.needText = append(ix.needText, id)
+			r, err := decodeRec(x, v)
+			if err != nil {
+				return err
 			}
-			if t.Parent.IsZero() {
-				ix.byBoard[t.Board] = append(ix.byBoard[t.Board], id)
+			if err := tx.Bucket(ixPosts).Delete(x[:]); err != nil {
+				return err
+			}
+			if r.TextLen > 0 {
+				_ = tx.Bucket(ixText).Delete(append(r.TextHash[:], x[:]...))
+			}
+			if !r.Parent.IsZero() {
+				_ = tx.Bucket(ixComments).Delete(commentKey(r.Parent, r.Height, x))
 			} else {
-				ix.comments[t.Parent] = append(ix.comments[t.Parent], id)
+				_ = tx.Bucket(ixBoard).Delete(boardKey(r.Board, r.Height, x))
+				if err := addCount(tx, r.Board, -1); err != nil {
+					return err
+				}
 			}
 		}
-		ix.path = append(ix.path, b.Hash())
 	}
-	tip := c.Tip()
-	for id, v := range ix.posts {
-		if info, ok := tip.Posts[id]; ok {
-			v.Likes, v.Comments = info.Likes, info.Comments
-		}
+	if err := tx.Bucket(ixUndo).Delete(u64(h)); err != nil {
+		return err
 	}
+	return tx.Bucket(ixPath).Delete(u64(h))
+}
+
+func (ix *Index) get(tx *bolt.Tx, id cryptox.Hash) (*postRec, bool) {
+	v := tx.Bucket(ixPosts).Get(id[:])
+	if v == nil {
+		return nil, false
+	}
+	r, err := decodeRec(id, v)
+	return r, err == nil
 }
 
 // postsWithText lists the posts committing to a body.
 func (ix *Index) postsWithText(x cryptox.Hash) []cryptox.Hash {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	return append([]cryptox.Hash(nil), ix.byText[x]...)
+	var out []cryptox.Hash
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(ixText).Cursor()
+		for k, _ := c.Seek(x[:]); k != nil && bytes.HasPrefix(k, x[:]); k, _ = c.Next() {
+			var id cryptox.Hash
+			copy(id[:], k[32:])
+			out = append(out, id)
+		}
+		return nil
+	})
+	return out
 }
 
 // dataHeight is when a data root was first placed (upload or seal).
 func (ix *Index) dataHeight(root cryptox.Hash) (uint64, bool) {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	h, ok := ix.dataAt[root]
+	var h uint64
+	var ok bool
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(ixData).Get(root[:]); v != nil {
+			h, ok = binary.BigEndian.Uint64(v), true
+		}
+		return nil
+	})
 	return h, ok
 }
 
-// takeNeedText returns up to n posts whose bodies may be missing, oldest
-// queued first; keep says whether to look at a post again later.
+// takeNeedText returns up to n posts whose bodies may be missing.
 func (ix *Index) takeNeedText(n int) []cryptox.Hash {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -174,58 +464,99 @@ func (ix *Index) requeueNeedText(ids []cryptox.Hash) {
 	ix.mu.Unlock()
 }
 
-// post returns a copy of an indexed post.
+// post returns an indexed post.
 func (ix *Index) post(id cryptox.Hash) (PostView, bool) {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	v, ok := ix.posts[id]
-	if !ok {
-		return PostView{}, false
-	}
-	return *v, true
+	var v PostView
+	var ok bool
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		var r *postRec
+		if r, ok = ix.get(tx, id); ok {
+			v = r.view()
+		}
+		return nil
+	})
+	return v, ok
 }
 
 // Boards lists boards with their post counts.
 func (ix *Index) Boards() map[string]int {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
 	out := map[string]int{}
-	for b, ids := range ix.byBoard {
-		out[b] = len(ids)
-	}
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(ixCount).ForEach(func(k, v []byte) error {
+			out[string(k)] = int(binary.BigEndian.Uint64(v))
+			return nil
+		})
+	})
 	return out
 }
 
-// Board returns the newest posts of a board; minLikes filters "개념글".
-func (ix *Index) Board(board string, minLikes uint64, limit int) []PostView {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	ids := ix.byBoard[board]
+// Board returns the newest posts of a board, newest first, with likes and
+// comment counts from st; minLikes filters "개념글". It reads O(limit)
+// entries (more when minLikes skips some).
+func (ix *Index) Board(st *state.State, board string, minLikes uint64, limit int) []PostView {
 	var out []PostView
-	for i := len(ids) - 1; i >= 0 && len(out) < limit; i-- {
-		v := ix.posts[ids[i]]
-		if v.Likes >= minLikes {
-			out = append(out, *v)
+	prefix := append([]byte{byte(len(board))}, board...)
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(ixBoard).Cursor()
+		k, _ := c.Seek(append(append([]byte(nil), prefix...), bytes.Repeat([]byte{0xff}, 41)...))
+		if k == nil {
+			k, _ = c.Last()
+		} else {
+			k, _ = c.Prev()
 		}
-	}
+		for ; k != nil && bytes.HasPrefix(k, prefix) && len(out) < limit; k, _ = c.Prev() {
+			var id cryptox.Hash
+			copy(id[:], k[len(prefix)+8:])
+			r, ok := ix.get(tx, id)
+			if !ok {
+				continue
+			}
+			v := r.view()
+			counts(st, &v)
+			if v.Likes >= minLikes {
+				out = append(out, v)
+			}
+		}
+		return nil
+	})
 	return out
 }
 
 // Thread returns a post and its comments, oldest first.
-func (ix *Index) Thread(id cryptox.Hash) (*PostView, []PostView) {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	p, ok := ix.posts[id]
-	if !ok {
-		return nil, nil
-	}
+func (ix *Index) Thread(st *state.State, id cryptox.Hash) (*PostView, []PostView) {
+	var p *PostView
 	var cs []PostView
-	for _, c := range ix.comments[id] {
-		cs = append(cs, *ix.posts[c])
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		r, ok := ix.get(tx, id)
+		if !ok {
+			return nil
+		}
+		v := r.view()
+		counts(st, &v)
+		p = &v
+		c := tx.Bucket(ixComments).Cursor()
+		for k, _ := c.Seek(id[:]); k != nil && bytes.HasPrefix(k, id[:]); k, _ = c.Next() {
+			var cid cryptox.Hash
+			copy(cid[:], k[40:])
+			if cr, ok := ix.get(tx, cid); ok {
+				cv := cr.view()
+				counts(st, &cv)
+				cs = append(cs, cv)
+			}
+		}
+		return nil
+	})
+	return p, cs
+}
+
+// counts fills likes and comment counts from the chain state.
+func counts(st *state.State, v *PostView) {
+	if st == nil {
+		return
 	}
-	sort.SliceStable(cs, func(i, j int) bool { return cs[i].Height < cs[j].Height })
-	cp := *p
-	return &cp, cs
+	if pi, ok := st.Posts.Get(v.id); ok {
+		v.Likes, v.Comments = pi.Likes, pi.Comments
+	}
 }
 
 // PendingPosts lists posts not mined yet: ours still queued, travelling the
@@ -259,7 +590,7 @@ func (n *Node) PendingPosts() []PostView {
 	for _, t := range own {
 		add(t)
 	}
-	for _, a := range n.unsentAnon() {
+	for _, a := range n.ownAnon(false) {
 		v := PostView{Board: a.Board, Text: a.Text, Lane: "anon", Pseudo: a.Pseudo, Pending: true}
 		if !a.Parent.IsZero() {
 			v.Parent = a.Parent.String()
