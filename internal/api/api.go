@@ -42,6 +42,10 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/upload", s.upload)
 	mux.HandleFunc("/api/extend", s.extend)
 	mux.HandleFunc("/api/like", s.like)
+	mux.HandleFunc("/api/likes", s.likes)
+	mux.HandleFunc("/api/fund/new", s.fundNew)
+	mux.HandleFunc("/api/fund/check", s.fundCheck)
+	mux.HandleFunc("/api/fund/pledge", s.fundPledge)
 	mux.HandleFunc("/api/stake", s.stake)
 	mux.HandleFunc("/api/unstake", s.stake)
 	mux.HandleFunc("/api/transfer", s.transfer)
@@ -137,6 +141,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		"p2p_listen":         n.Host.Addr(),
 		"storage_price":      coins(st.Price) + " / raw GB-year",
 		"base_fee_per_byte":  st.BaseFee,
+		"block_byte_fee":     max(st.BaseFee, st.PermByteFee()),
 		"anon_lane_pressure": float64(st.Congestion) / 1000,
 		"media_cap_block":    st.MediaCapPerBlock(),
 		"file_cap":           st.FileCap(),
@@ -393,8 +398,8 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) like(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID      string `json:"id"`
-		Confirm bool   `json:"confirm"`
+		ID   string `json:"id"`
+		Undo bool   `json:"undo"` // take back a like that has not left yet
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -405,11 +410,37 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.SendChecked(&types.Tx{Kind: types.TxLike, Target: id}, req.Confirm); err != nil {
+	if req.Undo {
+		writeJSON(w, map[string]bool{"removed": s.n.UnqueueLike(id)})
+		return
+	}
+	waiting, err := s.n.QueueLike(id)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	writeJSON(w, map[string]any{"queued": true, "waiting": waiting})
+}
+
+// likes shows the waiting likes (GET) or sends them now (POST).
+func (s *server) likes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, s.n.QueuedLikes())
+		return
+	}
+	var req struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	n, err := s.n.FlushLikes(req.Confirm)
+	if err != nil {
 		sendFail(w, err)
 		return
 	}
-	writeJSON(w, map[string]bool{"queued": true})
+	writeJSON(w, map[string]int{"sent": n})
 }
 
 func (s *server) stake(w http.ResponseWriter, r *http.Request) {
@@ -471,7 +502,7 @@ func (s *server) rlnStatus(w http.ResponseWriter, r *http.Request) {
 		"limit": info.Limit, "bond": coins(info.Bond), "release": info.Release,
 		"epoch": info.Epoch, "cap": info.Cap, "used": info.Used, "epoch_blocks_left": info.EpochLeft,
 		"members": info.Members, "pseudonym": info.Pseudonym,
-		"bond_per_message": coins(s.n.P.RLNBondPerMsg), "max_limit": s.n.P.RLNMaxLimit,
+		"bond_per_message": coins(info.BondPerMsg), "bond_full": coins(info.BondFull), "max_limit": s.n.P.RLNMaxLimit,
 		"remaining": info.Remaining, "foreign_use": info.ForeignUse,
 		"epoch_minutes_left": (time.Duration(info.EpochLeft)*s.n.P.BlockTime + time.Minute - 1) / time.Minute,
 	})
@@ -517,6 +548,103 @@ func (s *server) rlnLeave(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.n.LeaveRLN(); err != nil {
 		fail(w, 400, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"queued": true})
+}
+
+// fundNew keeps a file here and signs a funding request for it (multipart:
+// file, board, note, tier = the minimum retention, days to the deadline).
+func (s *server) fundNew(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, 405, errors.New("POST only"))
+		return
+	}
+	st := s.n.Chain.Tip()
+	r.Body = http.MaxBytesReader(w, r.Body, int64(st.FileCap())*2+1<<20)
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	tier, err := tierFrom(r.FormValue("tier"))
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	days, err := strconv.ParseUint(r.FormValue("days"), 10, 64)
+	if err != nil {
+		fail(w, 400, errors.New("days: a whole number"))
+		return
+	}
+	q, code, err := s.n.CreateFund(raw, r.FormValue("board"), r.FormValue("note"), tier, days)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	writeJSON(w, map[string]any{"id": q.ID().String(), "code": code, "deadline": q.Deadline})
+}
+
+// fundCheck reads a request code and spot-checks its data (POST {code}),
+// or reports how far the check got (GET ?id=).
+func (s *server) fundCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var req struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+			fail(w, 400, err)
+			return
+		}
+		fc, err := s.n.CheckFund(strings.TrimSpace(req.Code))
+		if err != nil {
+			fail(w, 400, err)
+			return
+		}
+		writeJSON(w, fc)
+		return
+	}
+	id, err := cryptox.ParseHash(r.URL.Query().Get("id"))
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	fc, err := s.n.FundStatus(id)
+	if err != nil {
+		fail(w, 404, err)
+		return
+	}
+	writeJSON(w, fc)
+}
+
+func (s *server) fundPledge(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID      string `json:"id"`
+		Amount  string `json:"amount"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	id, err := cryptox.ParseHash(req.ID)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	amt, err := parseCoins(req.Amount)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if err := s.n.Pledge(id, amt, req.Confirm); err != nil {
+		sendFail(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"queued": true})

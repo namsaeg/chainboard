@@ -38,7 +38,7 @@ func TestIndexSyncCost(t *testing.T) {
 	}
 	t.Logf("one more block of %d posts with %d indexed: %v", perBlock, blocks*perBlock, time.Since(start))
 	start = time.Now()
-	vs := ix.Board(nil, "b3", 0, 50)
+	vs := ix.Board("b3", 0, 50)
 	t.Logf("newest 50 of a %d-post board: %v (%d)", blocks*perBlock/20, time.Since(start), len(vs))
 	var h types.Header
 	h.VDFOutputs = make([]cryptox.Hash, 200)

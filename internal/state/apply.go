@@ -1,10 +1,12 @@
 package state
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/namsaeg/chainboard/internal/pmap"
 	"math/big"
+	mrand "math/rand/v2"
+	"runtime"
 	"sort"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
@@ -106,7 +108,7 @@ func (s *State) noteDup(k Hash, h uint64) {
 	e.Count++
 	e.Last = h
 	if g := h / s.P.DupWindowBlocks; g > s.dupGen {
-		empty := pmap.New[Hash, dupEntry](pmap.Hash32[Hash])
+		empty := newDupMap()
 		if g == s.dupGen+1 {
 			s.dupPrev, s.dupCur = s.dupCur, empty
 		} else {
@@ -115,13 +117,6 @@ func (s *State) noteDup(k Hash, h uint64) {
 		s.dupGen = g
 	}
 	s.dupCur.Set(k, e)
-}
-
-func likeKey(post Hash, a Address) [52]byte {
-	var k [52]byte
-	copy(k[:32], post[:])
-	copy(k[32:], a[:])
-	return k
 }
 
 // TxCost is what a fee-lane transaction pays (base fee, storage, tip).
@@ -147,16 +142,14 @@ func (s *State) checkParent(t *types.Tx) error {
 	return nil
 }
 
-// notePost records a post (signed or anonymous).
-func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash) {
+// notePost records a post (signed or anonymous) whose life ends with
+// bucket: where its body is kept, or the one-month bucket without a body.
+func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash, bucket uint32) {
 	s.noteDup(dupKey, h)
-	s.Posts.Set(t.ID(), &PostInfo{Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: h,
-		TextHash: t.TextHash, TextLen: t.TextLen, TextTier: t.Tier})
-	if !t.Parent.IsZero() {
-		p, _ := s.Posts.Get(t.Parent)
-		pi := *p
-		pi.Comments++
-		s.Posts.Set(t.Parent, &pi)
+	id := t.ID()
+	s.Posts.Set(id, &PostInfo{Parent: t.Parent, TextHash: t.TextHash, TextLen: t.TextLen, TextTier: t.Tier, TextBucket: bucket})
+	if bucket != 0 {
+		s.bucket(bucket).Posts.Append(id)
 	}
 }
 
@@ -199,6 +192,10 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		burstMul = s.BurstMultiplier(burstScore)
 	}
 	cost := TxCost{Tip: t.Tip}
+	var pledged uint64 // moved into funding escrows
+	var fund *Campaign // funded upload or proof: its fees come from the escrow
+	var fundBase, fundHeld uint64
+	var fundTier uint16
 	if t.Kind == types.TxProof {
 		if next.Proofs >= MaxProofTxs {
 			return errors.New("too many proofs in block")
@@ -210,7 +207,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		}
 		next.FeeUsed += size
 	}
-	cost.Base = satMul(satMul(s.BaseFee*size, dupMul), burstMul)
+	cost.Base = satMul(satMul(s.BytesFee(t), dupMul), burstMul)
 	if t.Kind == types.TxPost && t.TextLen > 0 {
 		cost.Storage, cost.Dest = s.textFee(uint64(t.TextLen), t.Tier, h)
 	}
@@ -238,13 +235,31 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 				return errors.New("attachment not stored")
 			}
 		}
-	case types.TxLike:
-		if !s.Posts.Has(t.Target) {
-			return errors.New("like of unknown post")
+	case types.TxLikes:
+		var err error
+		if pledged, err = s.checkPledges(t, h); err != nil {
+			return err
 		}
-		if s.Likes.Has(likeKey(t.Target, from)) {
-			return errors.New("already liked")
+	case types.TxFundUpload, types.TxFundProof:
+		c, ok := s.campaign(t.Target)
+		if !ok {
+			return errors.New("unknown funding request")
 		}
+		if t.Kind == types.TxFundProof && s.Data.Has(c.DataRoot) {
+			return errors.New("that data is already stored")
+		}
+		// Only the creator chooses when to upload (and so the tier), so no
+		// one can force an early, short-tier upload; anyone holding the
+		// data may send the proof.
+		if t.Kind == types.TxFundUpload && from != c.Creator {
+			return errors.New("only the request's creator sends its upload")
+		}
+		base, held, tier, err := s.fundCost(t, c, h, &next)
+		if err != nil {
+			return err
+		}
+		fund, fundBase, fundHeld, fundTier = c, base, held, tier
+		cost.Base = 0 // paid from the escrow, below
 	case types.TxExtend:
 		var fee uint64
 		var dest uint32
@@ -292,7 +307,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	if total > t.MaxFee {
 		return fmt.Errorf("fee %d exceeds max fee %d", total, t.MaxFee)
 	}
-	need := total
+	need := total + pledged
 	if t.Kind == types.TxTransfer || t.Kind == types.TxStake {
 		need += t.Amount
 	}
@@ -303,6 +318,9 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	// Everything checked: commit.
 	acc.Balance -= total
 	next.Burn += cost.Base
+	if fund != nil {
+		next.Burn += fundBase
+	}
 	next.Tips += cost.Tip
 	s.fund(cost.Dest, cost.Storage)
 	acc.Nonce++
@@ -335,21 +353,14 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		}
 		acc.Unbonding = append(acc.Unbonding, Unbond{Amount: t.Amount, Release: h + s.P.UnbondBlocks})
 	case types.TxPost:
-		s.notePost(t, h, dupKey)
+		life := s.BucketFor(h, 1, false)
 		if t.TextLen > 0 {
-			id := t.ID()
-			p, _ := s.Posts.Get(id)
-			pi := *p
-			pi.TextBucket = cost.Dest
-			s.Posts.Set(id, &pi)
-			s.queueText(id, t.TextHash, t.TextLen, cost.Dest)
+			life = cost.Dest
 		}
-	case types.TxLike:
-		s.Likes.Set(likeKey(t.Target, from), true)
-		p, _ := s.Posts.Get(t.Target)
-		pi := *p
-		pi.Likes++
-		s.Posts.Set(t.Target, &pi)
+		s.notePost(t, h, dupKey, life)
+		if t.TextLen > 0 {
+			s.queueText(t.ID(), t.TextHash, t.TextLen, cost.Dest)
+		}
 	case types.TxUpload:
 		s.placeData(t, h)
 	case types.TxExtend:
@@ -358,6 +369,13 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		} else {
 			s.applyPostExtend(t, cost.Dest)
 		}
+	case types.TxLikes:
+		acc.Balance -= pledged
+		s.applyPledges(t, from, h)
+	case types.TxFundUpload:
+		s.applyFundUpload(t.Target, fund, fundBase, fundHeld, fundTier, h)
+	case types.TxFundProof:
+		s.applyFundProof(t.Target, fund, fundBase, &next)
 	case types.TxRegister:
 		if e := s.Epoch(h); acc.PartsEpoch != e+1 {
 			acc.ProveParts = acc.Partitions
@@ -428,10 +446,12 @@ func (s *State) dataFee(t *types.Tx, h uint64, ctx *BlockCtx) (uint64, uint32, e
 // placeData writes an upload or an extend into the weave.
 func (s *State) placeData(t *types.Tx, h uint64) {
 	months, perm, _ := params.TierMonths(t.Tier)
-	destID := s.BucketFor(h, months, perm)
-	info, exists := s.Data.Get(t.DataRoot)
-	size := t.Size
-	media := t.Media
+	s.place(t.DataRoot, t.Size, t.Media, t.Tier, s.BucketFor(h, months, perm))
+}
+
+// place puts data into a bucket, moving it out of the bucket it was in.
+func (s *State) place(root Hash, size uint64, media uint8, tier uint16, destID uint32) {
+	info, exists := s.Data.Get(root)
 	if exists {
 		size, media = info.Size, info.Media
 		old := s.bucket(info.Bucket)
@@ -447,7 +467,7 @@ func (s *State) placeData(t *types.Tx, h uint64) {
 	}
 	b := s.bucket(destID)
 	n := chunk.Count(size)
-	b.Records.Append(Record{DataRoot: t.DataRoot, Size: size, Start: b.Len, Chunks: n})
+	b.Records.Append(Record{DataRoot: root, Size: size, Start: b.Len, Chunks: n})
 	b.Len += n
 	b.Bytes += size
 	if destID == 0 {
@@ -455,7 +475,7 @@ func (s *State) placeData(t *types.Tx, h uint64) {
 	} else {
 		s.TermBytes += size
 	}
-	s.Data.Set(t.DataRoot, &DataInfo{Bucket: destID, Size: size, Media: media, Tier: t.Tier, Record: b.Records.Len() - 1})
+	s.Data.Set(root, &DataInfo{Bucket: destID, Size: size, Media: media, Tier: tier, Record: b.Records.Len() - 1})
 }
 
 // Challenge derives the chunk a challenge points at. ok is false when the
@@ -470,14 +490,66 @@ type Challenge struct {
 	Weight   uint64 // permille
 }
 
-// ChallengeFor computes challenge k of a VDF output for a miner and partition.
-func (s *State) ChallengeFor(out Hash, partition uint64, miner Address, k uint8, h uint64) (Challenge, bool) {
+// RecallRange is the run of chunks one partition unlocks for one miner at
+// one VDF step. Every sub-chunk in it is a ticket.
+type RecallRange struct {
+	H0         Hash
+	Bucket     uint32
+	Start, End uint64 // positions [Start, End)
+	Weight     uint64 // permille
+}
+
+// WeaveChunks is the number of chunk positions in all buckets.
+func (s *State) WeaveChunks() uint64 {
+	var n uint64
+	for _, b := range s.Buckets {
+		n += b.Len
+	}
+	return n
+}
+
+// Span is the space a partition's range offset is drawn from: its own
+// length, raised to 1/SpanDivisor of the weave and capped at the nominal
+// partition size. A partition shorter than its span is hit only in
+// proportion to its length, so many small buckets do not multiply the reads
+// a miner must do per step; while the weave is small, every partition is hit
+// every step and mining can start from the genesis data alone.
+func (s *State) Span(length, weave uint64) uint64 {
+	floor := (weave + s.P.SpanDivisor - 1) / s.P.SpanDivisor
+	return min(s.P.PartitionChunks, max(length, floor))
+}
+
+// RangeFor computes the recall range a VDF output unlocks in a partition
+// for a miner. weave is WeaveChunks() of this state. ok is false when the
+// draw falls past the partition's data or the bucket carries no weight.
+func (s *State) RangeFor(out Hash, partition uint64, miner Address, h, weave uint64) (RecallRange, bool) {
 	bucket, start, length, ok := s.PartitionRange(partition)
 	if !ok {
+		return RecallRange{}, false
+	}
+	w := TermWeight(s.P, bucket == 0, s.BucketExpiry(bucket), h)
+	if w == 0 {
+		return RecallRange{}, false
+	}
+	h0 := cryptox.Tagged("cb/chal", out[:], cryptox.U64(partition), miner[:])
+	off := binary.BigEndian.Uint64(h0[:8]) % s.Span(length, weave)
+	if off >= length {
+		return RecallRange{}, false
+	}
+	end := min(off+s.P.RecallChunks, length)
+	return RecallRange{H0: h0, Bucket: bucket, Start: start + off, End: start + end, Weight: w}, true
+}
+
+// Ticket checks that sub-chunk sub of position pos is a ticket of r.
+func (s *State) Ticket(r RecallRange, pos uint64, sub int) (Challenge, bool) {
+	if pos < r.Start || pos >= r.End {
 		return Challenge{}, false
 	}
-	h0 := cryptox.Tagged("cb/chal", out[:], cryptox.U64(partition), miner[:], []byte{k})
-	return s.pointAt(h0, bucket, start, length, h)
+	rec, ci, ok := s.Locate(r.Bucket, pos)
+	if !ok || rec.Moved || sub < 0 || sub >= chunk.SubCount(rec.Size, ci) {
+		return Challenge{}, false
+	}
+	return Challenge{H0: r.H0, Bucket: r.Bucket, Position: pos, Sub: sub, Rec: rec, ChunkIdx: ci, Weight: r.Weight}, true
 }
 
 func (s *State) pointAt(h0 Hash, bucket uint32, start, length, h uint64) (Challenge, bool) {
@@ -508,8 +580,10 @@ func (s *State) VerifyPacked(c Challenge, miner Address, packed []byte, path chu
 	return chunk.VerifySub(c.Rec.DataRoot, c.Rec.Size, c.ChunkIdx, c.Sub, raw, path)
 }
 
-// SolutionHash is compared against the weighted target.
-func SolutionHash(h0 Hash, packed []byte) Hash { return cryptox.Tagged("cb/sol", h0[:], packed) }
+// SolutionHash is a ticket's draw, compared against the weighted target.
+func SolutionHash(c Challenge, packed []byte) Hash {
+	return cryptox.Tagged("cb/sol", c.H0[:], cryptox.U64(c.Position), []byte{byte(c.Sub)}, packed)
+}
 
 // MeetsTarget reports whether sol < target × weight / 1000.
 func MeetsTarget(sol Hash, target *big.Int, weight uint64) bool {
@@ -672,8 +746,18 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 	if len(hd.VDFOutputs) == 0 || hd.VDFStep != s.VDFStep+uint64(len(hd.VDFOutputs)) {
 		return errors.New("bad VDF step count")
 	}
-	if !s.replay && !vdf.VerifyChain(vdf.Reseed(s.VDFOut, s.Tip), hd.VDFOutputs, s.P.VDFIterations) {
-		return errors.New("bad VDF outputs")
+	if !s.replay && s.vdfCheck >= 0 {
+		start := vdf.Reseed(s.VDFOut, s.Tip)
+		ok := false
+		if n := len(hd.VDFOutputs); s.vdfCheck > 0 && n > s.vdfCheck {
+			idx := mrand.Perm(n)[:s.vdfCheck]
+			ok = vdf.VerifySteps(start, hd.VDFOutputs, s.P.VDFIterations, idx, runtime.NumCPU())
+		} else {
+			ok = vdf.VerifyChain(start, hd.VDFOutputs, s.P.VDFIterations)
+		}
+		if !ok {
+			return errors.New("bad VDF outputs")
+		}
 	}
 	if len(hd.Miner) != 32 || len(hd.Sig) != 64 {
 		return errors.New("bad miner key")
@@ -683,17 +767,18 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 		return errors.New("bad block signature")
 	}
 	miner := hd.MinerAddr()
-	if int(hd.Sol.K) >= s.P.ChallengesPerStep {
-		return errors.New("bad challenge index")
+	rr, ok := s.RangeFor(hd.VDFOutputs[len(hd.VDFOutputs)-1], hd.Sol.Partition, miner, h, s.WeaveChunks())
+	if !ok {
+		return errors.New("solution partition has no recall range at this step")
 	}
-	c, ok := s.ChallengeFor(hd.VDFOutputs[len(hd.VDFOutputs)-1], hd.Sol.Partition, miner, hd.Sol.K, h)
-	if !ok || c.Position != hd.Sol.Position || c.Sub != int(hd.Sol.Sub) {
-		return errors.New("solution does not answer its challenge")
+	c, ok := s.Ticket(rr, hd.Sol.Position, int(hd.Sol.Sub))
+	if !ok {
+		return errors.New("solution is not a ticket of its recall range")
 	}
 	if !s.replay && !s.VerifyPacked(c, miner, hd.Sol.PackedSub, hd.Sol.Path) {
 		return errors.New("solution chunk does not verify")
 	}
-	if !MeetsTarget(SolutionHash(c.H0, hd.Sol.PackedSub), target, c.Weight) {
+	if !MeetsTarget(SolutionHash(c, hd.Sol.PackedSub), target, c.Weight) {
 		return errors.New("solution misses the target")
 	}
 	if hd.TxRoot != types.TxRoot(b.Txs) || hd.BoardRoot != types.BoardRoot(b.Txs) {
@@ -714,7 +799,34 @@ func (s *State) ApplyBlock(b *types.Block, now int64) error {
 	if err := s.seal(hd, h); err != nil {
 		return err
 	}
-	return s.finish(b, ctx, target)
+	if err := s.finish(b, ctx, target); err != nil {
+		return err
+	}
+	// Checked on replay too: it is cheap (only what the block changed is
+	// hashed) and keeps the cached commitments warm.
+	if !s.noRoot && s.Root() != hd.StateRoot {
+		return errors.New("state root does not match the block")
+	}
+	return nil
+}
+
+// SetVDFCheck sets how the next ApplyBlock checks the VDF (see vdfCheck).
+func (s *State) SetVDFCheck(n int) { s.vdfCheck = n }
+
+// NextRoot is the state root a block built on this state must carry. The
+// header's other fields must be final; its signature and root are not read.
+// The proofs the miner has just made are not checked again.
+func (s *State) NextRoot(b *types.Block) (Hash, error) {
+	c := s.Clone()
+	c.replay, c.noRoot = true, true
+	probe := *b
+	if len(probe.Sig) != 64 { // not signed yet: the signature is not checked here
+		probe.Sig = make([]byte, 64)
+	}
+	if err := c.ApplyBlock(&probe, 0); err != nil {
+		return Hash{}, err
+	}
+	return c.Root(), nil
 }
 
 // finish runs the end-of-block rules: expiry, payouts, issuance, vesting,
@@ -724,6 +836,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	hd := &b.Header
 
 	s.releaseExits(h)
+	s.fundDue(h, hd.Prev)
 
 	// Expire term buckets.
 	var ids []uint32
@@ -744,6 +857,12 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 				r := bk.Records.Ptr(i)
 				if info, ok := s.Data.Get(r.DataRoot); ok && info.Bucket == id && !r.Moved {
 					s.Data.Delete(r.DataRoot)
+				}
+			}
+			for i := 0; i < bk.Posts.Len(); i++ {
+				p := bk.Posts.At(i)
+				if pi, ok := s.Posts.Get(p); ok && pi.TextBucket == id {
+					s.Posts.Delete(p)
 				}
 			}
 			s.TermBytes -= bk.Bytes
@@ -828,7 +947,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 
 	// Price, base fee, congestion, proven storage.
 	steps := uint64(len(hd.VDFOutputs))
-	obs := ProvenBytes(s.P, types.Work(target), steps)
+	obs := s.ProvenBytes(types.Work(target), steps)
 	w := uint64(s.P.RetargetWindow)
 	if obs > s.Proven {
 		s.Proven += (obs - s.Proven) / w

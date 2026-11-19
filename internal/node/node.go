@@ -46,8 +46,10 @@ type Config struct {
 	// TextWindowSec overrides how recent a block must be to need its
 	// bodies before it is accepted (tests).
 	TextWindowSec int64
-	Params        *params.Params
-	Logf          func(string, ...any)
+	// LikeFlushAfter overrides how long likes wait for their batch (tests).
+	LikeFlushAfter time.Duration
+	Params         *params.Params
+	Logf           func(string, ...any)
 }
 
 // Node is a running chainboard node.
@@ -76,6 +78,14 @@ type Node struct {
 	regFor     []uint64 // partitions we last registered
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+
+	fundMu sync.Mutex // guards funds
+	funds  map[cryptox.Hash]*fundTend
+
+	likesMu        sync.Mutex // guards likes
+	likes          []QueuedLike
+	likesFlush     sync.Mutex // one batch at a time
+	likeWarnLogged time.Time
 
 	rlnMu  sync.Mutex // guards the fields below
 	secret *fr.Element
@@ -152,7 +162,7 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, dir: dir,
-		sent: map[uint64]*sentTx{}}
+		sent: map[uint64]*sentTx{}, funds: map[cryptox.Hash]*fundTend{}}
 	if err := n.loadRLN(); err != nil {
 		return nil, err
 	}
@@ -167,6 +177,7 @@ func New(cfg Config) (*Node, error) {
 	ch.Texts = st
 	ch.TextWindowSec = cfg.TextWindowSec
 	ch.KeepBundle = func(data []byte) { _, _ = st.PutData(data) }
+	ch.Logf = cfg.Logf
 	host, err := p2p.New(p2p.Config{P: p, Chain: ch, Pool: n.Pool, Store: st,
 		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo,
 		Text: n.textBody})
@@ -176,17 +187,20 @@ func New(cfg Config) (*Node, error) {
 	n.Host = host
 	n.Miner = &miner.Miner{Chain: ch, Pool: n.Pool, Store: st, Key: wallet, PledgeBytes: cfg.PledgeBytes,
 		OnBlock: host.BroadcastBlock, Logf: cfg.Logf}
-	ix, err := OpenIndex(filepath.Join(dir, "index.db"))
+	ix, err := OpenIndex(filepath.Join(dir, "index.db"), ch.Genesis())
 	if err != nil {
 		return nil, err
 	}
 	ix.RecentBlocks = n.cacheBlocks()
+	ix.LikeWindow = LikeWindowDays * n.P.BlocksPerDay
 	n.Index = ix
 	if err := ix.Sync(ch); err != nil {
 		ix.Close()
 		return nil, err
 	}
 	n.loadOutbox()
+	n.loadLikes()
+	n.loadFunds()
 	ok = true
 	return n, nil
 }
@@ -215,10 +229,11 @@ func (n *Node) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
 	tips := n.Chain.Subscribe()
-	n.wg.Add(3)
+	n.wg.Add(4)
 	go n.tipLoop(ctx, tips)
 	go n.sendLoop(ctx)
 	go n.textLoop(ctx)
+	go func() { defer n.wg.Done(); n.Chain.VerifyLoop(ctx) }()
 	if n.cfg.Mine {
 		n.wg.Add(1)
 		go func() { defer n.wg.Done(); n.Miner.Run(ctx) }()
@@ -258,6 +273,7 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 			n.tendSent(st)
 			n.checkForeign(st)
 			n.tendOutbox(st)
+			n.tendFunds(st)
 			n.storageDuties(st)
 		case <-t.C:
 			n.storageDuties(n.Chain.Tip())
@@ -452,7 +468,7 @@ func (n *Node) finish(t *types.Tx) error {
 		if err != nil {
 			return err
 		}
-		t.MaxFee = est*2 + st.BaseFee*64
+		t.MaxFee = est*2 + max(st.BaseFee, st.PermByteFee())*64
 	}
 	t.Sign(n.Wallet)
 	return t.CheckStateless()
@@ -522,6 +538,7 @@ func (n *Node) sendLoop(ctx context.Context) {
 		}
 		if tick%5 == 0 {
 			n.saveOutbox()
+			n.tendLikes(time.Now())
 		}
 		now := time.Now()
 		var due []queued

@@ -4,6 +4,7 @@ import (
 	"math/big"
 
 	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/types"
 )
 
 // All economics is integer arithmetic so every node computes identical values.
@@ -80,6 +81,23 @@ func TailReward(p *params.Params, supply, provenBytes, needBytes uint64) uint64 
 	return mulDiv(perBlock, FeedbackPermille(p, provenBytes, needBytes), 1000)
 }
 
+// PermByteFee is the floor price of one byte that stays in a block: the
+// permanent storage price of a post body (TextReplicas copies for PermYears),
+// since every full node keeps block bytes forever. It follows the storage
+// price, so it stays the same in real terms when the coin's value moves.
+func (s *State) PermByteFee() uint64 {
+	return StorageFee(s.P, s.Price, 1, s.P.TextReplicas, 0, true)
+}
+
+// BytesFee is the base fee of a fee-lane transaction before surcharges: its
+// block bytes at the congestion base fee but never below PermByteFee, and
+// its off-chain body at the congestion base fee (the body's storage is paid
+// separately, by its retention tier).
+func (s *State) BytesFee(t *types.Tx) uint64 {
+	onChain := uint64(t.EncodedSize())
+	return satMul(max(s.BaseFee, s.PermByteFee()), onChain) + satMul(s.BaseFee, uint64(t.TextLen))
+}
+
 // NextBaseFee follows EIP-1559 on the fee lane: ±12.5% at most per block,
 // targeting half of the lane's capacity.
 func NextBaseFee(p *params.Params, base, used uint64) uint64 {
@@ -119,20 +137,33 @@ func NextCongestion(p *params.Params, cur, used uint64) uint64 {
 	return cur
 }
 
-// ProvenBytes estimates the storage behind the current difficulty: one
-// partition yields ChallengesPerStep checks per VDF step, so
-// partitions ≈ work / (K × steps).
-func ProvenBytes(p *params.Params, work *big.Int, steps uint64) uint64 {
+// ProvenBytes estimates the raw storage behind a block's work. If every
+// chunk of the weave were stored once, a step would unlock Σ length/span
+// recall ranges of RecallChunks × sub-chunks tickets; the work per step over
+// that is the number of replicas, times the weave size.
+func (s *State) ProvenBytes(work *big.Int, steps uint64) uint64 {
 	if steps == 0 {
 		steps = 1
 	}
-	d := new(big.Int).SetUint64(uint64(p.ChallengesPerStep) * steps)
-	parts := new(big.Int).Div(work, d)
-	parts.Mul(parts, new(big.Int).SetUint64(p.PartitionChunks*params.ChunkSize))
-	if !parts.IsUint64() {
+	weave := s.WeaveChunks()
+	const ppm = 1_000_000
+	var ranges uint64 // per step, in ppm
+	for _, p := range s.Partitions() {
+		_, _, length, _ := s.PartitionRange(p)
+		ranges += mulDiv(length, ppm, s.Span(length, weave))
+	}
+	tickets := new(big.Int).SetUint64(ranges)
+	tickets.Mul(tickets, new(big.Int).SetUint64(s.P.RecallChunks*params.ChunkSize/params.SubChunkSize*steps))
+	if tickets.Sign() == 0 {
+		return 0
+	}
+	x := new(big.Int).Mul(work, new(big.Int).SetUint64(weave*params.ChunkSize))
+	x.Mul(x, big.NewInt(ppm))
+	x.Div(x, tickets)
+	if !x.IsUint64() {
 		return ^uint64(0)
 	}
-	return parts.Uint64()
+	return x.Uint64()
 }
 
 // ObservedPrice is what miners currently earn per raw GB-year.

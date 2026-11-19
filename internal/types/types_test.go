@@ -112,3 +112,29 @@ func TestUnsignedKinds(t *testing.T) {
 		t.Fatal("signed tx on the anonymous lane accepted")
 	}
 }
+
+// A batch costs about an eighth of its likes sent one by one: one header
+// and signature, and short references.
+func TestLikeBatchSize(t *testing.T) {
+	one := &Tx{Kind: TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), Nonce: 1000, MaxFee: 1 << 24,
+		Likes: []LikeRef{{Height: 1_500_000}}}
+	batch := *one
+	batch.Likes = nil
+	for i := 0; i < 100; i++ {
+		batch.Likes = append(batch.Likes, LikeRef{Height: 1_500_000 - uint64(i)*997, Prefix: [4]byte{byte(i)}})
+	}
+	if b, o := batch.EncodedSize(), one.EncodedSize(); b*10 > o*100 {
+		t.Fatalf("100 likes in a batch: %d bytes, one by one: %d", b, 100*o)
+	}
+	if err := checkLikes(&batch); err != nil {
+		t.Fatal(err)
+	}
+	batch.Likes = append(batch.Likes, batch.Likes[0])
+	if checkLikes(&batch) == nil {
+		t.Fatal("duplicate like accepted")
+	}
+	got, err := DecodeTx(batch.Encode())
+	if err != nil || len(got.Likes) != 101 || got.Likes[7] != batch.Likes[7] {
+		t.Fatalf("round trip: %v", err)
+	}
+}

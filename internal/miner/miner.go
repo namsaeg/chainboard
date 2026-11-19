@@ -85,15 +85,16 @@ func Assign(st *state.State, pledge uint64) []uint64 {
 		}
 		return bi > bj
 	})
-	per := st.P.PartitionChunks * params.ChunkSize
 	var out []uint64
 	var used uint64
 	for _, p := range parts {
-		if used+per > pledge && len(out) > 0 {
+		_, _, length, _ := st.PartitionRange(p)
+		size := length * params.ChunkSize
+		if used+size > pledge && len(out) > 0 {
 			break
 		}
 		out = append(out, p)
-		used += per
+		used += size
 	}
 	return out
 }
@@ -172,12 +173,11 @@ func (m *Miner) Run(ctx context.Context) {
 func (m *Miner) mineOn(ctx context.Context, tip *state.State, tips <-chan *state.State) {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
-	addr := m.Key.Address()
 	target := tip.ExpectedTarget()
-	h := tip.Height + 1
 	clock := m.startVDF(ctx, vdf.Reseed(tip.VDFOut, tip.Tip), tip.P.VDFIterations)
 	parts := m.Assigned()
-	done := 0 // steps whose challenges have been checked
+	weave := tip.WeaveChunks()
+	done := 0 // steps whose recall ranges have been checked
 	for {
 		select {
 		case <-ctx.Done():
@@ -188,47 +188,66 @@ func (m *Miner) mineOn(ctx context.Context, tip *state.State, tips <-chan *state
 		}
 		outputs := clock.sofar()
 		for ; done < len(outputs); done++ {
-			out := outputs[done]
-			checks := uint64(0)
 			for _, p := range parts {
-				for k := 0; k < tip.P.ChallengesPerStep; k++ {
-					c, ok := tip.ChallengeFor(out, p, addr, uint8(k), h)
-					if !ok || !m.Store.HasPacked(addr, c.Bucket, c.Position) {
-						continue
-					}
-					packed, err := m.Store.PackedSub(addr, c.Bucket, c.Position, c.Sub)
-					if err != nil {
-						continue
-					}
-					checks++
-					if !state.MeetsTarget(state.SolutionHash(c.H0, packed), target, c.Weight) {
-						continue
-					}
-					m.addChecks(checks)
-					checks = 0
-					b, err := m.build(tip, target, outputs[:done+1], p, uint8(k), c, packed)
-					if err != nil {
-						m.logf("miner: build block: %v", err)
-						continue
-					}
-					if err := m.Chain.Add(b); err != nil {
-						m.setResult("rejected: " + err.Error())
-						m.logf("miner: own block rejected: %v", err)
-						return
-					}
-					m.mu.Lock()
-					m.stats.Blocks++
-					m.stats.LastResult = "found block " + b.Hash().String()[:12]
-					m.mu.Unlock()
-					if m.OnBlock != nil {
-						m.OnBlock(b)
-					}
+				c, packed, ok := m.search(tip, outputs[done], p, weave, target)
+				if !ok {
+					continue
+				}
+				b, err := m.build(tip, target, outputs[:done+1], p, c, packed)
+				if err != nil {
+					m.logf("miner: build block: %v", err)
+					continue
+				}
+				if err := m.Chain.AddOwn(b); err != nil {
+					m.setResult("rejected: " + err.Error())
+					m.logf("miner: own block rejected: %v", err)
 					return
 				}
+				m.mu.Lock()
+				m.stats.Blocks++
+				m.stats.LastResult = "found block " + b.Hash().String()[:12]
+				m.mu.Unlock()
+				if m.OnBlock != nil {
+					m.OnBlock(b)
+				}
+				return
 			}
-			m.addChecks(checks)
 		}
 	}
+}
+
+// search reads the recall range one VDF output unlocks in a partition (one
+// sequential read) and checks every sub-chunk of it against the target.
+func (m *Miner) search(tip *state.State, out cryptox.Hash, part, weave uint64, target *big.Int) (state.Challenge, []byte, bool) {
+	addr := m.Key.Address()
+	rr, ok := tip.RangeFor(out, part, addr, tip.Height+1, weave)
+	if !ok {
+		return state.Challenge{}, nil, false
+	}
+	replicas, err := m.Store.ReadPacked(addr, rr.Bucket, rr.Start, rr.End-rr.Start)
+	if err != nil {
+		return state.Challenge{}, nil, false
+	}
+	checks := uint64(0)
+	defer func() { m.addChecks(checks) }()
+	for i, rep := range replicas {
+		if rep == nil {
+			continue
+		}
+		pos := rr.Start + uint64(i)
+		for sub := 0; sub < params.ChunkSize/params.SubChunkSize; sub++ {
+			c, ok := tip.Ticket(rr, pos, sub)
+			if !ok {
+				break // past the end of the record's data
+			}
+			packed := rep[sub*params.SubChunkSize : (sub+1)*params.SubChunkSize]
+			checks++
+			if state.MeetsTarget(state.SolutionHash(c, packed), target, c.Weight) {
+				return c, append([]byte(nil), packed...), true
+			}
+		}
+	}
+	return state.Challenge{}, nil, false
 }
 
 // vdfClock runs the VDF in its own goroutine, so storage reads for the
@@ -281,7 +300,7 @@ func (m *Miner) setResult(s string) {
 }
 
 func (m *Miner) build(tip *state.State, target *big.Int, outputs []cryptox.Hash,
-	partition uint64, k uint8, c state.Challenge, packed []byte) (*types.Block, error) {
+	partition uint64, c state.Challenge, packed []byte) (*types.Block, error) {
 	path, err := m.Store.SubProof(c.Rec.DataRoot, c.ChunkIdx, c.Sub)
 	if err != nil {
 		return nil, err
@@ -310,9 +329,12 @@ func (m *Miner) build(tip *state.State, target *big.Int, outputs []cryptox.Hash,
 	hd.BoardRoot = types.BoardRoot(txs)
 	hd.VDFStep = tip.VDFStep + uint64(len(outputs))
 	hd.VDFOutputs = append([]cryptox.Hash(nil), outputs...)
-	hd.Sol = types.Solution{Partition: partition, K: k, Position: c.Position, Sub: uint8(c.Sub),
+	hd.Sol = types.Solution{Partition: partition, Position: c.Position, Sub: uint8(c.Sub),
 		PackedSub: packed, Path: chunk.Proof{SubPath: path.SubPath, ChunkPath: path.ChunkPath}}
 	hd.Miner = append([]byte(nil), m.Key.Pub...)
+	if hd.StateRoot, err = tip.NextRoot(b); err != nil {
+		return nil, err
+	}
 	sh := hd.SigHash()
 	hd.Sig = m.Key.Sign(sh[:])
 	return b, nil
@@ -369,7 +391,28 @@ func (m *Miner) EpochProof(st *state.State, nonce uint64) (*types.Tx, bool) {
 	}
 	t := &types.Tx{Kind: types.TxProof, Nonce: nonce, Lane: types.LaneFee,
 		Proof: &types.StorageProof{Epoch: epoch, Partition: part, Position: c.Position, Sub: uint8(c.Sub), PackedSub: packed, Path: path}}
-	t.MaxFee = st.BaseFee * 2 * uint64(t.EncodedSize()+200)
+	t.MaxFee = max(st.BaseFee, st.PermByteFee()) * 2 * uint64(t.EncodedSize()+200)
 	t.Sign(m.Key)
 	return t, true
+}
+
+// FundSamples builds the samples a funding proof must show, from data this
+// node holds.
+func FundSamples(st *store.Store, c *state.Campaign, id cryptox.Hash) ([]types.FundSample, error) {
+	out := make([]types.FundSample, 0, types.FundSamples)
+	for j := 0; j < types.FundSamples; j++ {
+		ci, sub := state.FundSampleAt(c.Seed, id, c.Size, j)
+		raw, err := st.Chunk(c.DataRoot, ci)
+		if err != nil {
+			return nil, err
+		}
+		path, err := st.SubProof(c.DataRoot, ci, sub)
+		if err != nil {
+			return nil, err
+		}
+		lo := sub * params.SubChunkSize
+		hi := min(lo+params.SubChunkSize, len(raw))
+		out = append(out, types.FundSample{Sub: append([]byte(nil), raw[lo:hi]...), Path: path})
+	}
+	return out, nil
 }

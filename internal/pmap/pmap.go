@@ -9,9 +9,15 @@
 package pmap
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"math/bits"
+	"sort"
+	"sync/atomic"
 )
+
+// Sum is a 32-byte commitment.
+type Sum = [32]byte
 
 const (
 	fanBits = 5
@@ -20,17 +26,20 @@ const (
 )
 
 type leaf[K comparable, V any] struct {
-	h uint64
-	k K
-	v V
+	h   uint64
+	k   K
+	v   V
+	sum atomic.Pointer[Sum] // cached leaf commitment
 }
 
 // node is a bitmap-compressed trie node. Below the last hash level it
-// holds colliding leaves in a plain list (bitmap unused).
+// holds colliding leaves in a plain list (bitmap unused). Nodes are never
+// changed once built, so their commitment is computed once and cached.
 type node[K comparable, V any] struct {
 	bitmap uint32
 	kids   []*node[K, V] // for set bits: child node, or nil when leafs[i] is used
 	leafs  []*leaf[K, V]
+	sum    atomic.Pointer[Sum]
 }
 
 // Map is a persistent hash map. The zero value is not usable; call New.
@@ -38,12 +47,68 @@ type Map[K comparable, V any] struct {
 	root *node[K, V]
 	n    int
 	hash func(K) uint64
+	leaf func(K, V) Sum // commitment of one entry (see Root)
 }
 
 // New makes an empty map with the given hash. It must be deterministic:
 // iteration order follows it.
 func New[K comparable, V any](hash func(K) uint64) Map[K, V] {
 	return Map[K, V]{root: &node[K, V]{}, hash: hash}
+}
+
+// Committed makes an empty map whose Root commits to its entries, each by
+// leaf(key, value).
+func Committed[K comparable, V any](hash func(K) uint64, leaf func(K, V) Sum) Map[K, V] {
+	return Map[K, V]{root: &node[K, V]{}, hash: hash, leaf: leaf}
+}
+
+// Root commits to the map's entries. The trie's shape depends only on the
+// set of keys (a slot holds a leaf until a second key needs it, and a lone
+// leaf moves back up on delete), so equal contents give equal roots. Only
+// nodes built since the last Root are hashed: O(changes × depth).
+func (m Map[K, V]) Root() Sum {
+	if m.leaf == nil {
+		panic("pmap: Root of a map made without a leaf commitment")
+	}
+	return m.root.commit(m.leaf, 0)
+}
+
+func (n *node[K, V]) commit(leafSum func(K, V) Sum, shift uint) Sum {
+	if s := n.sum.Load(); s != nil {
+		return *s
+	}
+	sums := make([]Sum, len(n.leafs))
+	for i, l := range n.leafs {
+		if c := n.kids[i]; c != nil {
+			sums[i] = c.commit(leafSum, shift+fanBits)
+			continue
+		}
+		if s := l.sum.Load(); s != nil {
+			sums[i] = *s
+			continue
+		}
+		s := leafSum(l.k, l.v)
+		l.sum.Store(&s)
+		sums[i] = s
+	}
+	if shift >= 64 { // collision list: insertion order is not canonical
+		sort.Slice(sums, func(i, j int) bool { return string(sums[i][:]) < string(sums[j][:]) })
+	}
+	h := sha256.New()
+	h.Write([]byte("pmap/node"))
+	h.Write(binary.BigEndian.AppendUint32(nil, n.bitmap))
+	for i := range sums {
+		kind := byte('L')
+		if n.kids[i] != nil {
+			kind = 'N'
+		}
+		h.Write([]byte{kind})
+		h.Write(sums[i][:])
+	}
+	var s Sum
+	h.Sum(s[:0])
+	n.sum.Store(&s)
+	return s
 }
 
 // Len is the number of entries.
@@ -239,10 +304,6 @@ func Hash32[K ~[32]byte](k K) uint64 { return binary.LittleEndian.Uint64(k[:8]) 
 // Hash20 hashes an address key.
 func Hash20[K ~[20]byte](k K) uint64 { return binary.LittleEndian.Uint64(k[:8]) }
 
-// Hash52 hashes an address||hash key by its hash part, so one address's
-// keys spread out.
-func Hash52[K ~[52]byte](k K) uint64 { return binary.LittleEndian.Uint64(k[20:28]) }
-
 // Uint64 hashes an integer key (splitmix64 finaliser).
 func Uint64(x uint64) uint64 {
 	x ^= x >> 30
@@ -255,8 +316,15 @@ func Uint64(x uint64) uint64 {
 // Vec is a persistent append-mostly vector: copying is O(1), Append and Set
 // copy one chunk of chunkLen elements plus the chunk index.
 type Vec[T any] struct {
-	chunks [][]T
+	chunks []*vchunk[T]
 	n      int
+}
+
+// vchunk is never changed once another version can see it, so its
+// commitment is cached.
+type vchunk[T any] struct {
+	items []T
+	sum   atomic.Pointer[Sum]
 }
 
 const chunkLen = 256
@@ -265,38 +333,63 @@ const chunkLen = 256
 func (v Vec[T]) Len() int { return v.n }
 
 // At returns element i.
-func (v Vec[T]) At(i int) T { return v.chunks[i/chunkLen][i%chunkLen] }
+func (v Vec[T]) At(i int) T { return v.chunks[i/chunkLen].items[i%chunkLen] }
 
 // Ptr returns a pointer to element i for reading. Writing through it would
 // change every version that shares the chunk; use Set.
-func (v Vec[T]) Ptr(i int) *T { return &v.chunks[i/chunkLen][i%chunkLen] }
+func (v Vec[T]) Ptr(i int) *T { return &v.chunks[i/chunkLen].items[i%chunkLen] }
+
+func (v *Vec[T]) own(ci int) *vchunk[T] {
+	c := &vchunk[T]{items: make([]T, len(v.chunks[ci].items), chunkLen)}
+	copy(c.items, v.chunks[ci].items)
+	chunks := make([]*vchunk[T], len(v.chunks))
+	copy(chunks, v.chunks)
+	chunks[ci] = c
+	v.chunks = chunks
+	return c
+}
 
 // Append adds an element.
 func (v *Vec[T]) Append(x T) {
+	var c *vchunk[T]
 	if v.n%chunkLen == 0 {
-		v.chunks = append(v.chunks[:len(v.chunks):len(v.chunks)], make([]T, 0, chunkLen))
+		c = &vchunk[T]{items: make([]T, 0, chunkLen)}
+		v.chunks = append(v.chunks[:len(v.chunks):len(v.chunks)], c)
 	} else {
-		last := len(v.chunks) - 1
-		c := make([]T, len(v.chunks[last]), chunkLen)
-		copy(c, v.chunks[last])
-		chunks := make([][]T, len(v.chunks))
-		copy(chunks, v.chunks)
-		chunks[last] = c
-		v.chunks = chunks
+		c = v.own(len(v.chunks) - 1)
 	}
-	last := len(v.chunks) - 1
-	v.chunks[last] = append(v.chunks[last], x)
+	c.items = append(c.items, x)
 	v.n++
 }
 
 // Set replaces element i.
 func (v *Vec[T]) Set(i int, x T) {
-	ci := i / chunkLen
-	c := make([]T, len(v.chunks[ci]), chunkLen)
-	copy(c, v.chunks[ci])
-	c[i%chunkLen] = x
-	chunks := make([][]T, len(v.chunks))
-	copy(chunks, v.chunks)
-	chunks[ci] = c
-	v.chunks = chunks
+	v.own(i / chunkLen).items[i%chunkLen] = x
+}
+
+// Root commits to the elements in order, each by item(x). Chunks hashed
+// before are not hashed again.
+func (v Vec[T]) Root(item func(T) Sum) Sum {
+	h := sha256.New()
+	h.Write([]byte("pmap/vec"))
+	h.Write(binary.BigEndian.AppendUint64(nil, uint64(v.n)))
+	for _, c := range v.chunks {
+		s := c.sum.Load()
+		if s == nil {
+			ch := sha256.New()
+			ch.Write([]byte("pmap/chunk"))
+			for _, x := range c.items {
+				is := item(x)
+				ch.Write(is[:])
+			}
+			var cs Sum
+			ch.Sum(cs[:0])
+			c.sum.Store(&cs)
+			s = &cs
+		}
+		h.Write(s[:])
+	}
+	var out Sum
+	h.Sum(out[:0])
+	return out
 }

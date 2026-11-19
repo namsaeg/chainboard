@@ -88,6 +88,47 @@ func TestPacked(t *testing.T) {
 	if s.HasPacked(m, 4, 7) || !s.HasPacked(m, 5, 1) {
 		t.Fatal("drop removed the wrong bucket")
 	}
+	if got := s.PackedBuckets(m); len(got) != 1 || got[0] != 5 {
+		t.Fatalf("packed buckets %v", got)
+	}
+}
+
+// A recall range is read with one read per run of stored positions, across
+// segment boundaries and gaps.
+func TestReadPacked(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m cryptox.Address
+	m[1] = 3
+	stored := map[uint64]bool{SegChunks - 2: true, SegChunks - 1: true, SegChunks: true, SegChunks + 2: true}
+	for pos := range stored {
+		if err := s.PutPacked(m, Packed{Bucket: 2, Position: pos, Data: sample(params.ChunkSize, byte(pos))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(s *Store) {
+		got, err := s.ReadPacked(m, 2, SegChunks-3, 6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, b := range got {
+			pos := uint64(SegChunks - 3 + i)
+			if stored[pos] != (b != nil) || (b != nil && !bytes.Equal(b, sample(params.ChunkSize, byte(pos)))) {
+				t.Fatalf("position %d: stored %v, read %d bytes", pos, stored[pos], len(b))
+			}
+		}
+	}
+	check(s)
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	check(s2)
 }
 
 func TestUseGenesis(t *testing.T) {

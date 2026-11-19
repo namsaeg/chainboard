@@ -2,6 +2,7 @@
 const $ = (s) => document.querySelector(s);
 let board = '';
 let openThread = '';
+let queuedLikes = new Set();
 
 async function api(path, opts = {}) {
   opts.headers = Object.assign({ 'X-Chainboard': '1' }, opts.headers || {});
@@ -29,6 +30,7 @@ async function send(path, body) {
 const tierNames = { 1: '1개월', 65535: '영구' };
 function tierName(t) { return tierNames[t] || (t % 12 === 0 ? (t / 12) + '년' : t + '개월'); }
 
+function coin(units) { return (Number(units) / 1e8).toFixed(4).replace(/\.?0+$/, ''); }
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
 function short(s) { return s ? s.slice(0, 10) + '…' : ''; }
 function when(t) { return t ? new Date(t * 1000).toLocaleString() : '미확정'; }
@@ -48,10 +50,16 @@ async function refreshStatus() {
     for (const [k, v] of [['주소', w.address], ['잔액', w.balance], ['잠긴 보상', w.vesting], ['예치', w.stake], ['숙성 중 예치', w.stake_matures_at ? `${w.stake_pending} (높이 ${w.stake_matures_at}에 숙성)` : w.stake_pending], ['보내는 중', w.queued], ['연속 전송', burst]]) {
       const d = el('div'); d.append(el('span', 'muted', k + ' '), el('span', '', String(v))); box.append(d);
     }
+    const lq = await api('/api/likes');
+    if (lq.length) {
+      const d = el('div'); const go = el('a', '', ' 지금 보내기');
+      go.onclick = () => send('/api/likes', {}).then((r) => { toast(`좋아요 ${r.sent}개를 한 번에 보냈어요`); refreshPosts(); }).catch((e) => toast(e.message, true));
+      d.append(el('span', 'muted', '좋아요 대기 '), el('span', '', `${lq.length}개`), go); box.append(d);
+    }
     const r = await api('/api/rln');
     const names = { none: '등록 안 됨', pending: '등록 대기', active: '활성', leaving: '해제 중', gone: '종료됨' };
     const rb = $('#rln'); rb.replaceChildren();
-    const rows = [['상태', names[r.status] || r.status], ['회원 수', r.members]];
+    const rows = [['상태', names[r.status] || r.status], ['회원 수', r.members], ['지금 보증금', `글 1개당 ${coin(r.bond_per_message)} · 30개 ${coin(r.bond_full)} 코인`]];
     if (r.member) rows.push(['보증금', r.bond], ['이번 에포크 남은 글', `${r.remaining} / ${Math.min(r.limit, r.cap)}개 · 약 ${r.epoch_minutes_left}분 뒤 충전`]);
     if (r.status === 'leaving') rows.push(['보증금 반환 높이', r.release]);
     if (r.pseudonym) rows.push(['가명', short(r.pseudonym)]);
@@ -83,9 +91,19 @@ function renderPost(p, isComment) {
   const who = p.lane === 'anon' ? (p.pseudonym ? '가명 ' + short(p.author) : '익명') : short(p.author);
   m.append(el('span', '', who), el('span', '', when(p.time)), el('span', '', p.lane === 'anon' ? '익명 차선' : '수수료 차선'));
   if (p.tier) m.append(el('span', '', '보관 ' + tierName(p.tier) + (p.until ? ` (높이 ${p.until}까지)` : '')));
+  if (p.fund) d.append(renderFund(p.id, p.fund));
   if (p.pending) m.append(el('span', '', '전송 대기/미확정'));
   else {
-    const like = el('a', '', `좋아요 ${p.likes}`); like.onclick = () => send('/api/like', { id: p.id }).then(() => toast('좋아요를 보냈어요')).catch((e) => toast(e.message, true)); m.append(like);
+    if (queuedLikes.has(p.id)) {
+      const undo = el('a', '', `좋아요 ${p.likes}+1 대기 · 취소`);
+      undo.onclick = () => post('/api/like', { id: p.id, undo: true }).then(() => { toast('좋아요를 취소했어요'); refreshPosts(); }).catch((e) => toast(e.message, true));
+      m.append(undo);
+    } else {
+      const like = el('a', '', `좋아요 ${p.likes}`);
+      like.onclick = () => post('/api/like', { id: p.id })
+        .then((r) => { toast(`좋아요를 담았어요 · ${r.waiting}개 대기 (10분 안에 한 번에 보내요)`); refreshPosts(); }).catch((e) => toast(e.message, true));
+      m.append(like);
+    }
     if (p.tier && p.tier !== 65535 && p.text_state === 'ok') { const x = el('a', '', '글 연장'); x.onclick = () => {
       const tier = prompt('글을 보관할 기간 (1y, 5y, 20y, perm) — 누구나 연장할 수 있어요', '1y');
       if (tier) send('/api/extend', { post: p.id, tier }).then(() => toast('연장을 보냈어요')).catch((e) => toast(e.message, true)); }; m.append(x); }
@@ -97,10 +115,40 @@ function renderPost(p, isComment) {
   return d;
 }
 
+const fundStates = { new: '새 요청 (첫 후원과 함께 체인에 올라가요)', open: '모금 중', uploaded: '업로드됨 · 증명 대기', stored: '저장 완료', closed: '마감 (환불됨)' };
+function renderFund(id, f) {
+  const box = el('div', 'fund small');
+  const line = [fundStates[f.status] || f.status];
+  if (f.status === 'open' || f.status === 'uploaded') line.push(`모인 코인 ${f.raised} (후원 ${f.backers}명)`, `마감 높이 ${f.deadline}`);
+  if (f.status === 'open' || f.status === 'new') line.push(`최소 ${tierName(f.min_tier)} 비용 지금 ${f.need_for_min} 코인`);
+  if (f.tier) line.push((f.status === 'open' ? '지금 올리면 ' : '산 기간 ') + tierName(f.tier));
+  box.append(el('div', '', line.join(' · ')));
+  if (f.status === 'open' || f.status === 'new') {
+    const b = el('a', '', '후원하기');
+    b.onclick = () => { const a = prompt('후원할 코인 수량 — 저장되지 않으면 마감 뒤 돌아와요', '1');
+      if (a) send('/api/fund/pledge', { id, amount: a }).then(() => toast('후원을 보냈어요')).catch((e) => toast(e.message, true)); };
+    box.append(b);
+  }
+  return box;
+}
+
+async function showFundCheck(id) {
+  const box = $('#fundCheck');
+  const fc = await api('/api/fund/check?id=' + id);
+  box.replaceChildren();
+  box.append(el('div', '', fc.note || '(설명 없음)'), el('div', 'muted', `게시판 ${fc.board} · 만든 사람 ${short(fc.creator)} · 크기 ${fc.fund.size} 바이트`));
+  box.append(renderFund(fc.id, fc.fund));
+  const ok = fc.samples_verified === fc.samples_asked;
+  box.append(el('div', ok ? '' : 'warn', `데이터 표본 확인 ${fc.samples_verified}/${fc.samples_asked}` + (ok ? ' — 요청의 데이터 루트와 일치해요' : ' — 네트워크에서 받는 중이에요. 끝내 안 오면 데이터가 없을 수 있어요')));
+  if (fc.preview && fc.media !== 3) { const img = el('img'); img.src = 'data:image/*;base64,' + fc.preview; img.alt = '앞부분 미리보기'; box.append(img); }
+  if (!ok) setTimeout(() => { if ($('#fundCheck').dataset.id === id) showFundCheck(id).catch(() => {}); }, 2000);
+}
+
 async function refreshPosts() {
   if (!board) return;
   const min = $('#bestOnly').checked ? Number($('#minLikes').value || 1) : 0;
-  const [ps, pend] = await Promise.all([api(`/api/board?name=${encodeURIComponent(board)}&min_likes=${min}`), api('/api/pending')]);
+  const [ps, pend, lq] = await Promise.all([api(`/api/board?name=${encodeURIComponent(board)}&min_likes=${min}`), api('/api/pending'), api('/api/likes')]);
+  queuedLikes = new Set((lq || []).map((l) => l.id));
   const box = $('#posts'); box.replaceChildren();
   (pend || []).filter((p) => p.board === board && !p.parent).forEach((p) => box.append(renderPost(p)));
   (ps || []).forEach((p) => box.append(renderPost(p)));
@@ -158,6 +206,24 @@ $('#rlnLeave').onclick = () => { if (confirm('등록을 해제할까요? 보증�
 $('#sendForm').onsubmit = (e) => { e.preventDefault();
   send('/api/transfer', { to: e.target.to.value.trim(), amount: e.target.amount.value }).then(() => toast('송금을 보냈어요')).catch((err) => toast(err.message, true)); };
 
+$('#fundNewForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target; const fd = new FormData();
+  fd.append('file', f.file.files[0]); fd.append('board', f.board.value.trim()); fd.append('note', f.note.value);
+  fd.append('tier', f.tier.value); fd.append('days', f.days.value);
+  try {
+    const r = await api('/api/fund/new', { method: 'POST', body: fd });
+    const c = $('#fundCode'); c.hidden = false; c.value = r.code; c.select();
+    toast(`요청을 만들었어요. 코드를 나눠 주세요 (마감 높이 ${r.deadline}). 모이면 이 노드가 알아서 올리고 증명해요.`);
+  } catch (err) { toast(err.message, true); }
+};
+$('#fundCheckForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const fc = await post('/api/fund/check', { code: e.target.code.value });
+    $('#fundCheck').dataset.id = fc.id; await showFundCheck(fc.id);
+  } catch (err) { toast(err.message, true); }
+};
 $('#rlnAck').onclick = () => post('/api/rln/ack', {}).then(() => toast('이 기기에서 익명 글쓰기를 다시 시작해요')).catch((e) => toast(e.message, true));
 const syncTier = () => { const anon = $('#postForm').lane.value === 'anon'; $('#postForm').textTier.disabled = anon;
   if (anon) $('#postForm').textTier.value = '1m'; };

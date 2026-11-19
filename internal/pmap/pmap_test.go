@@ -1,6 +1,7 @@
 package pmap
 
 import (
+	"encoding/binary"
 	"math/rand"
 	"testing"
 )
@@ -139,5 +140,68 @@ func BenchmarkGoMapCopyAndSet(b *testing.B) {
 			c[k] = v
 		}
 		c[uint64(i)] = -i
+	}
+}
+
+func sumOf(k uint64, v int) Sum {
+	var s Sum
+	binary.BigEndian.PutUint64(s[:], k)
+	binary.BigEndian.PutUint64(s[8:], uint64(v))
+	return s
+}
+
+// Equal contents give equal roots, whatever the order of writes and
+// deletes, also through hash collisions; any change moves the root.
+func TestRootCanonical(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	keys := make([]uint64, 3000)
+	for i := range keys {
+		keys[i] = rng.Uint64()
+	}
+	weak := func(k uint64) uint64 { return k % 50 } // forces collisions and deep paths
+	for _, hash := range []func(uint64) uint64{Uint64, weak} {
+		a := Committed[uint64, int](hash, sumOf)
+		for i, k := range keys {
+			a.Set(k, i)
+		}
+		b := Committed[uint64, int](hash, sumOf)
+		for _, i := range rng.Perm(len(keys)) {
+			b.Set(keys[i], -1) // overwritten below
+			b.Set(rng.Uint64(), 0)
+		}
+		b = Committed[uint64, int](hash, sumOf)
+		extra := rng.Uint64()
+		b.Set(extra, 7)
+		for _, i := range rng.Perm(len(keys)) {
+			b.Set(keys[i], i)
+		}
+		b.Delete(extra)
+		if a.Root() != b.Root() {
+			t.Fatal("same contents, different roots")
+		}
+		before := a.Root()
+		c := a
+		c.Set(keys[5], 99)
+		if c.Root() == before || a.Root() != before {
+			t.Fatal("a write did not move only its own version's root")
+		}
+	}
+}
+
+func TestVecRoot(t *testing.T) {
+	item := func(x int) Sum { return sumOf(uint64(x), 0) }
+	var a, b Vec[int]
+	for i := 0; i < 700; i++ {
+		a.Append(i)
+		b.Append(i)
+	}
+	r := a.Root(item)
+	b.Set(300, -1)
+	if b.Root(item) == r || a.Root(item) != r {
+		t.Fatal("vector roots")
+	}
+	b.Set(300, 300)
+	if b.Root(item) != r {
+		t.Fatal("restored vector has another root")
 	}
 }

@@ -7,17 +7,14 @@ import (
 	"github.com/namsaeg/chainboard/internal/params"
 )
 
-// bigState fills a state with posts, likes and accounts, as a busy network
-// would have after a while.
+// bigState fills a state with posts and accounts, as a busy network would
+// have after a while.
 func bigState(posts, accounts int) *State {
 	s, _ := Genesis(params.Testnet())
 	var k Hash
 	for i := 0; i < posts; i++ {
 		binary.LittleEndian.PutUint64(k[:], uint64(i)*0x9e3779b97f4a7c15)
-		s.Posts.Set(k, &PostInfo{Board: "b", Height: uint64(i)})
-		var lk [52]byte
-		copy(lk[20:], k[:])
-		s.Likes.Set(lk, true)
+		s.Posts.Set(k, &PostInfo{TextLen: uint16(i)})
 	}
 	var a Address
 	for i := 0; i < accounts; i++ {

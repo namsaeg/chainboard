@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/types"
 )
 
 func TestEconomics(t *testing.T) {
@@ -43,5 +44,27 @@ func TestEconomics(t *testing.T) {
 	}
 	if w := TermWeight(p, false, 10*p.BlocksPerYear, 0); w != 500 {
 		t.Fatalf("10-year data should weigh 0.5, got %d", w)
+	}
+}
+
+// Block bytes cost at least the permanent price of a post body; the body
+// itself pays only the congestion base fee besides its storage tier.
+func TestBlockBytesFloor(t *testing.T) {
+	s, _ := Genesis(params.Testnet())
+	if got := s.PermByteFee(); got != 400 {
+		t.Fatalf("permanent byte fee %d, want 400 units at 1 coin per GB-year", got)
+	}
+	tx := &types.Tx{Kind: types.TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), MaxFee: 1 << 20, Likes: []types.LikeRef{{Height: 7}}}
+	if got, want := s.BytesFee(tx), 400*uint64(tx.EncodedSize()); got != want {
+		t.Fatalf("like pays %d, want %d", got, want)
+	}
+	post := &types.Tx{Kind: types.TxPost, From: make([]byte, 32), Sig: make([]byte, 64), Board: "b", Tier: 1}
+	post.SetText(make([]byte, 300))
+	if got, want := s.BytesFee(post), 400*uint64(post.EncodedSize())+s.BaseFee*300; got != want {
+		t.Fatalf("post pays %d, want %d", got, want)
+	}
+	s.Price *= 2 // the floor follows the storage price
+	if s.PermByteFee() != 800 {
+		t.Fatal("floor does not follow the price")
 	}
 }

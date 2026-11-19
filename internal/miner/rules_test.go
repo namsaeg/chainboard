@@ -2,8 +2,11 @@ package miner
 
 import (
 	"crypto/rand"
+	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/namsaeg/chainboard/internal/chain"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -108,8 +111,7 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	first.Sign(k)
 	var exact uint64
 	for i := 0; i < 3; i++ { // MaxFee is part of the size; iterate to a fixed point
-		size := uint64(first.LaneSize())
-		exact = tip.BaseFee*size + state.StorageFee(p, tip.Price, uint64(first.TextLen), p.TextReplicas, 1, false)
+		exact = tip.BytesFee(first) + state.StorageFee(p, tip.Price, uint64(first.TextLen), p.TextReplicas, 1, false)
 		first.MaxFee = exact
 		first.Sign(k)
 	}
@@ -148,8 +150,9 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	}
 	r.mineN(t, p.StakeAgingBlocks)
 	r.pool.Reset(r.c.Tip())
-	r.send(t, staker, &types.Tx{Kind: types.TxRLNJoin, Amount: 2 * params.Coin, Commitment: types.Hash{31: 1}, Limit: 2, MaxFee: params.Coin})
-	r.send(t, staker, &types.Tx{Kind: types.TxUnstake, Amount: 8 * params.Coin, MaxFee: params.Coin})
+	bond := r.c.Tip().BondFor(2) // follows the storage price
+	r.send(t, staker, &types.Tx{Kind: types.TxRLNJoin, Amount: bond, Commitment: types.Hash{31: 1}, Limit: 2, MaxFee: params.Coin})
+	r.send(t, staker, &types.Tx{Kind: types.TxUnstake, Amount: 10*params.Coin - bond, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	before := r.c.Tip().Peek(staker.Address()).Balance
 	r.mineN(t, p.UnbondBlocks+1)
@@ -158,10 +161,10 @@ func TestDuplicateSurchargeAndStake(t *testing.T) {
 	r.send(t, staker, &types.Tx{Kind: types.TxTransfer, To: k.Address(), Amount: 1, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	after := r.c.Tip().Peek(staker.Address()).Balance
-	if m := memberOf(r.c.Tip(), types.Hash{31: 1}); m == nil || m.Bond != 2*params.Coin {
+	if m := memberOf(r.c.Tip(), types.Hash{31: 1}); m == nil || m.Bond != bond {
 		t.Fatal("membership bond not recorded")
 	}
-	if after < before+7*params.Coin {
+	if after < before+10*params.Coin-bond-params.Coin {
 		t.Fatalf("unbonded stake not returned: before %d after %d", before, after)
 	}
 	r.check(t)
@@ -293,5 +296,93 @@ func TestChainPersistence(t *testing.T) {
 	r.c = c2 // the version check replays from this one
 	if c2.BestHash() != want || c2.Height() != 20 {
 		t.Fatalf("reopened chain at %d, want 20", c2.Height())
+	}
+}
+
+// A block must carry the root of the state it produces.
+func TestStateRootChecked(t *testing.T) {
+	p := FastParams()
+	r := newRig(t, p, 4)
+	r.mineTo(t, 3)
+	c, err := chain.Open(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h < 3; h++ {
+		if err := c.Add(r.c.BlockAt(h)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := *r.c.BlockAt(3)
+	b.StateRoot[0] ^= 1
+	sh := b.SigHash()
+	b.Sig = r.m.Key.Sign(sh[:])
+	if err := c.Add(&b); err == nil || !strings.Contains(err.Error(), "state root") {
+		t.Fatalf("wrong state root accepted: %v", err)
+	}
+	if err := c.Add(r.c.BlockAt(3)); err != nil {
+		t.Fatal(err)
+	}
+	if c.Tip().Root() != r.c.Tip().Root() {
+		t.Fatal("same blocks, different roots")
+	}
+}
+
+// History is accepted on a VDF sample and checked in full in the
+// background: a block with a forged step is then removed with its
+// descendants, and the tip moves back.
+func TestSampledVDFCaughtLater(t *testing.T) {
+	p := FastParams()
+	p.GenesisTarget = new(big.Int).Lsh(big.NewInt(1), 247) // a few steps per block
+	r := newRig(t, p, 6)
+	r.mineTo(t, 2)
+	at := uint64(0) // a block with at least two VDF steps
+	for at == 0 {
+		r.mineN(t, 1)
+		if h := r.c.Height(); len(r.c.BlockAt(h).VDFOutputs) >= 2 {
+			at = h
+		}
+		if r.c.Height() > 200 {
+			t.Fatal("no block with two VDF steps")
+		}
+	}
+	c, err := chain.Open(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SampleSteps = -1       // accept on no sample at all
+	c.FullCheckSec = 1 << 40 // and recheck every block in full
+	for h := uint64(1); h < at; h++ {
+		if err := c.Add(r.c.BlockAt(h)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forged := *r.c.BlockAt(at)
+	forged.VDFOutputs = append([]types.Hash(nil), forged.VDFOutputs...)
+	forged.VDFOutputs[0][0] ^= 1
+	sh := forged.SigHash()
+	forged.Sig = r.m.Key.Sign(sh[:])
+	if err := c.Add(&forged); err != nil {
+		t.Fatalf("history block not accepted on a sample: %v", err)
+	}
+	if c.Height() != at {
+		t.Fatal("forged block not at the tip")
+	}
+	if n := c.VerifyPending(); n == 0 {
+		t.Fatal("nothing checked in the background")
+	}
+	if c.Height() != at-1 || c.Block(forged.Hash()) != nil {
+		t.Fatalf("forged block kept: height %d", c.Height())
+	}
+	if err := c.Add(&forged); err == nil {
+		t.Fatal("removed block accepted again")
+	}
+	// The honest block is fine, and passes its full check.
+	if err := c.Add(r.c.BlockAt(at)); err != nil {
+		t.Fatal(err)
+	}
+	c.VerifyPending()
+	if c.Height() != at {
+		t.Fatal("honest block removed")
 	}
 }

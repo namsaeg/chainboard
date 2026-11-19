@@ -5,12 +5,14 @@ package chain
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
+	"github.com/namsaeg/chainboard/internal/vdf"
 )
 
 type Hash = cryptox.Hash
@@ -80,6 +83,13 @@ type Chain struct {
 	// KeepBundle, if set, receives each text bundle a seal check rebuilt,
 	// so the node can serve its chunks to miners right away.
 	KeepBundle func([]byte)
+	// Logf receives background verification results (optional).
+	Logf func(string, ...any)
+	// SampleSteps overrides how many VDF steps a sampled block gets
+	// checked on arrival (tests; -1 checks none).
+	SampleSteps int
+	// FullCheckSec overrides vdfFullAge (tests).
+	FullCheckSec int64
 
 	mu       sync.RWMutex
 	db       *bolt.DB // nil for an in-memory chain
@@ -92,12 +102,35 @@ type Chain struct {
 	evicted  uint64 // best-chain bodies at or below this height are not in memory
 	bestPath []Hash // hash by height on the best chain
 	subs     []chan *state.State
+
+	// Blocks whose VDF was only sampled, waiting for the full check, and
+	// whether this node verifies too slowly to fully check new blocks.
+	unverified []Hash
+	slow       bool
+	wake       chan struct{}
 }
+
+// VDF checking. A full check costs as much hashing as the block's VDF took
+// to compute (about a block time of one fast core), spread over this
+// node's cores. History (blocks older than vdfHistoryAge by their time) and,
+// on a node too slow to keep up, new blocks too are accepted after checking
+// vdfSampleSteps random steps. Blocks of the last vdfFullAge are then
+// checked in full in the background, and one that fails is removed with its
+// descendants. Older history stays sampled: checking it all would take as
+// long as the chain took to make. A forged step in each of many blocks is
+// still caught almost surely (each block's sample hits it with about
+// vdfSampleSteps/steps).
+const (
+	vdfHistoryAge  = 6 * 3600
+	vdfFullAge     = 7 * 24 * 3600
+	vdfSampleSteps = 4
+)
 
 var (
 	bBlocks  = []byte("blocks")  // block hash -> encoded block
 	bHeights = []byte("heights") // height || block hash -> nil, for loading in order
 	bInfo    = []byte("info")    // "genesis" -> genesis hash of the stored chain
+	bPending = []byte("vdf")     // block hash -> nil: VDF only sampled so far
 )
 
 // Open loads (or creates) a chain in dir/chain.db. An empty dir keeps the
@@ -111,6 +144,7 @@ func Open(p *params.Params, dir string) (*Chain, error) {
 		bad:     map[Hash]error{},
 		orphans: map[Hash][]*types.Block{},
 		best:    g.Tip, bestPath: []Hash{g.Tip},
+		wake: make(chan struct{}, 1),
 	}
 	if dir == "" {
 		return c, nil
@@ -144,9 +178,21 @@ func Open(p *params.Params, dir string) (*Chain, error) {
 		})
 		if blk, err := types.DecodeBlock(raw); err == nil {
 			// Invalid stored blocks are ignored; the network refills gaps.
-			_ = c.add(blk, 0, false)
+			_ = c.add(blk, 0, addReplay)
 		}
 	}
+	// Blocks whose VDF was only sampled before the last shutdown are
+	// checked again in the background.
+	_ = db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bPending).ForEach(func(k, _ []byte) error {
+			var h Hash
+			copy(h[:], k)
+			if _, ok := c.blocks[h]; ok {
+				c.unverified = append(c.unverified, h)
+			}
+			return nil
+		})
+	})
 	return c, nil
 }
 
@@ -160,6 +206,9 @@ func indexHeights(db *bolt.DB) error {
 		}
 		heights, err := tx.CreateBucketIfNotExists(bHeights)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(bPending); err != nil {
 			return err
 		}
 		if k, _ := heights.Cursor().First(); k != nil {
@@ -339,13 +388,27 @@ func (c *Chain) After(locator []Hash, max int) []*types.Block {
 // Add validates a block and attaches it. It returns ErrOrphan when the parent
 // is missing (the block is kept until the parent arrives).
 func (c *Chain) Add(b *types.Block) error {
-	return c.add(b, time.Now().Unix(), true)
+	return c.add(b, time.Now().Unix(), addNet)
 }
 
-func (c *Chain) add(b *types.Block, now int64, persist bool) error {
+// AddOwn adds a block this node mined: its VDF and storage proof were made
+// here, so they are not checked again; everything else is.
+func (c *Chain) AddOwn(b *types.Block) error {
+	return c.add(b, time.Now().Unix(), addOwn)
+}
+
+type addMode int
+
+const (
+	addNet    addMode = iota // from the network: checked in full (VDF maybe sampled)
+	addReplay                // read back from our own database
+	addOwn                   // mined here
+)
+
+func (c *Chain) add(b *types.Block, now int64, mode addMode) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	err := c.addLocked(b, now, persist)
+	err := c.addLocked(b, now, mode)
 	if err != nil {
 		return err
 	}
@@ -357,7 +420,7 @@ func (c *Chain) add(b *types.Block, now int64, persist bool) error {
 		kids := c.orphans[h]
 		delete(c.orphans, h)
 		for _, k := range kids {
-			if c.addLocked(k, now, persist) == nil {
+			if c.addLocked(k, now, mode) == nil {
 				queue = append(queue, k.Hash())
 			}
 		}
@@ -365,7 +428,8 @@ func (c *Chain) add(b *types.Block, now int64, persist bool) error {
 	return nil
 }
 
-func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
+func (c *Chain) addLocked(b *types.Block, now int64, mode addMode) error {
+	persist := mode != addReplay
 	h := b.Hash()
 	if _, ok := c.blocks[h]; ok {
 		return ErrKnown
@@ -390,6 +454,18 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 	}
 	st := parent.Clone()
 	apply := func() error { return st.ApplyBlock(b, now) }
+	recheck := false
+	switch {
+	case mode == addOwn:
+		st.SetVDFCheck(-1)
+	case mode == addNet && (c.slow || (now > 0 && b.Time < now-vdfHistoryAge)):
+		n := vdfSampleSteps
+		if c.SampleSteps != 0 {
+			n = c.SampleSteps
+		}
+		st.SetVDFCheck(n)
+		recheck = b.Time >= now-c.fullAge()
+	}
 	if !persist {
 		// Read back from our own database: validated before it was stored.
 		apply = func() error { return st.ReplayBlock(b) }
@@ -407,7 +483,9 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 		}
 		st.SetTextCheck(c.checkBundle)
 	}
+	began := time.Now()
 	err = apply()
+	took := time.Since(began)
 	st.SetTextCheck(nil)
 	var mt *MissingTextsError
 	if errors.As(err, &mt) {
@@ -425,8 +503,24 @@ func (c *Chain) addLocked(b *types.Block, now int64, persist bool) error {
 			if err := tx.Bucket(bBlocks).Put(h[:], b.Encode()); err != nil {
 				return err
 			}
+			if recheck {
+				if err := tx.Bucket(bPending).Put(h[:], nil); err != nil {
+					return err
+				}
+			}
 			return tx.Bucket(bHeights).Put(heightKey(b.Height, h[:]), nil)
 		})
+	}
+	if recheck {
+		c.unverified = append(c.unverified, h)
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+	} else if mode == addNet {
+		// A node that needs over half a block time to check a new block
+		// samples new blocks too, until the backlog is checked.
+		c.slow = took > c.P.BlockTime/2
 	}
 	if work.Cmp(c.blocks[c.best].work) > 0 {
 		c.setBest(h)
@@ -579,4 +673,132 @@ func (c *Chain) checkBundle(b state.BundleSpec, root Hash) error {
 		c.KeepBundle(data)
 	}
 	return nil
+}
+
+func (c *Chain) fullAge() int64 {
+	if c.FullCheckSec > 0 {
+		return c.FullCheckSec
+	}
+	return vdfFullAge
+}
+
+// VerifyLoop checks, in the background, the VDF of blocks that were
+// accepted on a sample, oldest first, leaving one core to the rest of the
+// node. A block that fails is removed with everything built on it.
+func (c *Chain) VerifyLoop(ctx context.Context) {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+	for {
+		for c.verifyOne() {
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.wake:
+		case <-tick.C:
+		}
+	}
+}
+
+// VerifyPending fully checks every sampled block now and reports how many
+// it checked.
+func (c *Chain) VerifyPending() int {
+	n := 0
+	for c.verifyOne() {
+		n++
+	}
+	return n
+}
+
+// verifyOne fully checks the oldest sampled block; false when none waits.
+func (c *Chain) verifyOne() bool {
+	c.mu.Lock()
+	var h Hash
+	var b *types.Block
+	var start Hash
+	for len(c.unverified) > 0 && b == nil {
+		h = c.unverified[0]
+		c.unverified = c.unverified[1:]
+		e, ok := c.blocks[h]
+		if !ok {
+			continue // already removed
+		}
+		b = c.blockOf(e, h)
+		if b == nil {
+			continue
+		}
+		last := c.states[c.genesis].VDFOut
+		if pe := c.blocks[b.Prev]; pe != nil && b.Prev != c.genesis {
+			if pb := c.blockOf(pe, b.Prev); pb != nil {
+				last = pb.VDFOutputs[len(pb.VDFOutputs)-1]
+			}
+		}
+		start = vdf.Reseed(last, b.Prev)
+	}
+	if len(c.unverified) == 0 {
+		c.slow = false
+	}
+	c.mu.Unlock()
+	if b == nil {
+		return false
+	}
+	idx := make([]int, len(b.VDFOutputs))
+	for i := range idx {
+		idx[i] = i
+	}
+	ok := vdf.VerifySteps(start, b.VDFOutputs, c.P.VDFIterations, idx, runtime.NumCPU()-1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ok {
+		if c.db != nil {
+			_ = c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bPending).Delete(h[:]) })
+		}
+		return true
+	}
+	c.invalidate(h, errors.New("VDF outputs fail the full check"))
+	return true
+}
+
+// invalidate removes a block and its descendants and moves the tip to the
+// heaviest block left. c.mu must be held.
+func (c *Chain) invalidate(bad Hash, why error) {
+	kids := map[Hash][]Hash{}
+	for h, e := range c.blocks {
+		kids[e.parent] = append(kids[e.parent], h)
+	}
+	queue := []Hash{bad}
+	for len(queue) > 0 {
+		h := queue[0]
+		queue = queue[1:]
+		queue = append(queue, kids[h]...)
+		e := c.blocks[h]
+		c.bad[h] = why
+		delete(c.blocks, h)
+		delete(c.states, h)
+		if c.db != nil && e != nil {
+			_ = c.db.Update(func(tx *bolt.Tx) error {
+				_ = tx.Bucket(bPending).Delete(h[:])
+				_ = tx.Bucket(bHeights).Delete(heightKey(e.height, h[:]))
+				return tx.Bucket(bBlocks).Delete(h[:])
+			})
+		}
+	}
+	if c.Logf != nil {
+		c.Logf("chain: block %x and its descendants removed: %v", bad[:6], why)
+	}
+	if _, ok := c.blocks[c.best]; ok {
+		return
+	}
+	best := c.genesis
+	for h, e := range c.blocks {
+		if e.work.Cmp(c.blocks[best].work) > 0 {
+			best = h
+		}
+	}
+	if _, err := c.stateAt(best); err == nil {
+		c.setBest(best)
+	}
 }

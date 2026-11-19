@@ -24,23 +24,25 @@ type (
 type TxKind uint8
 
 const (
-	TxTransfer TxKind = iota + 1
-	TxPost            // a post or a comment (Parent set)
-	TxUpload          // registers a data root (media) with a retention tier
-	TxExtend          // anyone extends a data root to a longer tier
-	TxStake           // locks coins for the free lane
-	TxUnstake         // starts unbonding
-	TxRegister        // declares the partitions a storage node keeps
-	TxProof           // epoch storage proof
-	TxLike
-	TxAnonPost // unsigned post of the anonymous lane, carrying an RLN proof
-	TxRLNJoin  // moves mature stake into an RLN membership bond
-	TxRLNLeave // starts the exit of a membership (bond returns after unbonding)
-	TxRLNSlash // unsigned: reveals a member's secret recovered from a double signal
+	TxTransfer   TxKind = iota + 1
+	TxPost              // a post or a comment (Parent set)
+	TxUpload            // registers a data root (media) with a retention tier
+	TxExtend            // anyone extends a data root to a longer tier
+	TxStake             // locks coins for the free lane
+	TxUnstake           // starts unbonding
+	TxRegister          // declares the partitions a storage node keeps
+	TxProof             // epoch storage proof
+	TxLikes             // a batch of likes (and pledges to funding requests)
+	TxAnonPost          // unsigned post of the anonymous lane, carrying an RLN proof
+	TxRLNJoin           // moves mature stake into an RLN membership bond
+	TxRLNLeave          // starts the exit of a membership (bond returns after unbonding)
+	TxRLNSlash          // unsigned: reveals a member's secret recovered from a double signal
+	TxFundUpload        // stores funded data, paid from its request's escrow (anyone may send)
+	TxFundProof         // proves the funded data's sampled sub-chunks, paid from the escrow
 )
 
-var kindNames = [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "like",
-	"anonpost", "rlnjoin", "rlnleave", "rlnslash"}
+var kindNames = [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "likes",
+	"anonpost", "rlnjoin", "rlnleave", "rlnslash", "fundupload", "fundproof"}
 
 func (k TxKind) String() string { return kindNames[min(int(k), len(kindNames)-1)] }
 
@@ -91,6 +93,35 @@ type RLNProof struct {
 	Proof     []byte
 }
 
+// LikeRef names a post by the height of its block and the first bytes of
+// its id: enough to find it there, short enough to batch many. Likes are not
+// part of the chain state: nodes resolve and count them in their index.
+type LikeRef struct {
+	Height uint64
+	Prefix [4]byte
+}
+
+// RefOf is the like reference of a post placed at a height.
+func RefOf(post Hash, height uint64) LikeRef {
+	r := LikeRef{Height: height}
+	copy(r.Prefix[:], post[:4])
+	return r
+}
+
+// Matches reports whether a post at a height is the one a reference names.
+func (r LikeRef) Matches(post Hash, height uint64) bool {
+	return r.Height == height && [4]byte(post[:4]) == r.Prefix
+}
+
+// Pledge backs a funding request with coins; it also counts as a like.
+type Pledge struct {
+	Request Hash
+	Amount  uint64
+}
+
+// MaxLikes bounds the entries (likes plus pledges) of one batch.
+const MaxLikes = 256
+
 // MaxRLNProof bounds the encoded Groth16 proof.
 const MaxRLNProof = 256
 
@@ -117,7 +148,12 @@ type Tx struct {
 	Tier     uint16 // upload, extend, post (retention of the body)
 	Media    uint8
 
-	Target Hash // like; extend of a post (the post id)
+	Target Hash // extend of a post (the post id)
+
+	Likes    []LikeRef      // likes
+	Pledges  []Pledge       // likes
+	Requests []*FundRequest // likes: funding requests carried on chain with their first pledge
+	Samples  []FundSample   // fundproof
 
 	// Text is the body of a post. It is not part of the encoding, ID or
 	// signature, which commit to TextHash: it travels next to the
@@ -177,8 +213,27 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 		w.Fixed(t.Target[:])
 		w.Fixed(t.TextHash[:])
 		w.U16(t.TextLen)
-	case TxLike:
+	case TxLikes:
+		w.Var(uint64(len(t.Likes)))
+		for _, l := range t.Likes {
+			w.Var(l.Height)
+			w.Fixed(l.Prefix[:])
+		}
+		w.Var(uint64(len(t.Pledges)))
+		for _, p := range t.Pledges {
+			w.Fixed(p.Request[:])
+			w.Var(p.Amount)
+		}
+		w.Var(uint64(len(t.Requests)))
+		for _, r := range t.Requests {
+			r.encodeBody(w)
+			w.Fixed(r.Sig)
+		}
+	case TxFundUpload:
 		w.Fixed(t.Target[:])
+	case TxFundProof:
+		w.Fixed(t.Target[:])
+		encodeSamples(w, t.Samples)
 	case TxRegister:
 		w.Var(uint64(len(t.Partitions)))
 		for _, p := range t.Partitions {
@@ -334,8 +389,30 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		r.Fixed(t.Target[:])
 		r.Fixed(t.TextHash[:])
 		t.TextLen = r.U16()
-	case TxLike:
+	case TxLikes:
+		n := r.Count(MaxLikes)
+		for i := 0; i < n && r.Err == nil; i++ {
+			var l LikeRef
+			l.Height = r.Var()
+			r.Fixed(l.Prefix[:])
+			t.Likes = append(t.Likes, l)
+		}
+		n = r.Count(MaxLikes)
+		for i := 0; i < n && r.Err == nil; i++ {
+			var p Pledge
+			r.Fixed(p.Request[:])
+			p.Amount = r.Var()
+			t.Pledges = append(t.Pledges, p)
+		}
+		n = r.Count(MaxRequestsPerTx)
+		for i := 0; i < n && r.Err == nil; i++ {
+			t.Requests = append(t.Requests, decodeRequest(r))
+		}
+	case TxFundUpload:
 		r.Fixed(t.Target[:])
+	case TxFundProof:
+		r.Fixed(t.Target[:])
+		t.Samples = decodeSamples(r)
 	case TxRegister:
 		n := r.Count(maxPartitions)
 		for i := 0; i < n; i++ {
@@ -565,7 +642,10 @@ func (t *Tx) CheckStateless() error {
 		if err := checkPostContent(t); err != nil {
 			return err
 		}
-	case TxLike:
+	case TxLikes:
+		if err := checkLikes(t); err != nil {
+			return err
+		}
 	case TxUpload:
 		if t.Size == 0 {
 			return errors.New("empty upload")
@@ -595,6 +675,19 @@ func (t *Tx) CheckStateless() error {
 		if t.Limit == 0 || t.Amount == 0 {
 			return errors.New("membership needs a limit and a bond")
 		}
+	case TxFundUpload:
+		if t.Target.IsZero() {
+			return errors.New("funded upload names no request")
+		}
+	case TxFundProof:
+		if t.Target.IsZero() || len(t.Samples) != FundSamples {
+			return fmt.Errorf("funding proof needs %d samples", FundSamples)
+		}
+		for _, x := range t.Samples {
+			if len(x.Sub) == 0 || len(x.Sub) > params.SubChunkSize {
+				return errors.New("funding proof: bad sample")
+			}
+		}
 	case TxTransfer, TxStake, TxUnstake, TxRegister, TxRLNLeave:
 	case TxProof:
 		if t.Proof == nil || len(t.Proof.PackedSub) != params.SubChunkSize {
@@ -610,14 +703,44 @@ func (t *Tx) CheckStateless() error {
 	return nil
 }
 
+func checkLikes(t *Tx) error {
+	n := len(t.Likes) + len(t.Pledges)
+	if n == 0 || n > MaxLikes {
+		return fmt.Errorf("a like batch carries 1 to %d entries", MaxLikes)
+	}
+	seen := make(map[LikeRef]bool, len(t.Likes))
+	for _, l := range t.Likes {
+		if seen[l] {
+			return errors.New("the same post is liked twice in one batch")
+		}
+		seen[l] = true
+	}
+	pledged := make(map[Hash]bool, len(t.Pledges))
+	for _, p := range t.Pledges {
+		if p.Amount == 0 || pledged[p.Request] {
+			return errors.New("pledges need an amount and distinct requests")
+		}
+		pledged[p.Request] = true
+	}
+	for _, r := range t.Requests {
+		if err := r.Check(); err != nil {
+			return err
+		}
+		if !pledged[r.ID()] {
+			return errors.New("a carried funding request needs a pledge in the same batch")
+		}
+		pledged[r.ID()] = false // carried once
+	}
+	return nil
+}
+
 // IsPost reports whether the tx creates a post.
 func (t *Tx) IsPost() bool { return t.Kind == TxPost || t.Kind == TxAnonPost }
 
 // Solution is the storage proof that wins a block.
 type Solution struct {
 	Partition uint64 // bucket<<32 | index
-	K         uint8  // which challenge of the step
-	Position  uint64 // chunk position inside the bucket
+	Position  uint64 // chunk position inside the bucket (in the step's recall range)
 	Sub       uint8
 	PackedSub []byte
 	Path      chunk.Proof
@@ -632,6 +755,7 @@ type Header struct {
 	Target    Hash // big-endian
 	TxRoot    Hash
 	BoardRoot Hash
+	StateRoot Hash // the state after this block (see state.Root)
 	// TextBundles places the texts of the closing seal window into the
 	// weave, one bundle per retention bucket. Empty except in seal blocks.
 	TextBundles []TextBundle
@@ -660,6 +784,7 @@ func (h *Header) encodeBody(w *codec.Writer) {
 	w.Fixed(h.Target[:])
 	w.Fixed(h.TxRoot[:])
 	w.Fixed(h.BoardRoot[:])
+	w.Fixed(h.StateRoot[:])
 	w.Var(uint64(len(h.TextBundles)))
 	for _, tb := range h.TextBundles {
 		w.U32(tb.Bucket)
@@ -672,7 +797,6 @@ func (h *Header) encodeBody(w *codec.Writer) {
 		w.Fixed(o[:])
 	}
 	w.U64(h.Sol.Partition)
-	w.U8(h.Sol.K)
 	w.Var(h.Sol.Position)
 	w.U8(h.Sol.Sub)
 	w.Bytes(h.Sol.PackedSub)
@@ -732,6 +856,7 @@ func DecodeBlock(b []byte) (*Block, error) {
 	r.Fixed(h.Target[:])
 	r.Fixed(h.TxRoot[:])
 	r.Fixed(h.BoardRoot[:])
+	r.Fixed(h.StateRoot[:])
 	nb := r.Count(params.MaxTextBundles)
 	for i := 0; i < nb && r.Err == nil; i++ {
 		var tb TextBundle
@@ -748,7 +873,6 @@ func DecodeBlock(b []byte) (*Block, error) {
 		h.VDFOutputs = append(h.VDFOutputs, o)
 	}
 	h.Sol.Partition = r.U64()
-	h.Sol.K = r.U8()
 	h.Sol.Position = r.Var()
 	h.Sol.Sub = r.U8()
 	h.Sol.PackedSub = r.Bytes(params.SubChunkSize)

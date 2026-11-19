@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/types"
 )
@@ -150,10 +152,12 @@ func TestThreeNodes(t *testing.T) {
 		v, _ := e.Index.post(post.ID())
 		return e.Chain.Height() > v.Height+p.BlocksPerDay+1
 	})
-	e.sweep(e.Chain.Tip())
-	if e.Store.HasText(hash) {
-		t.Fatal("body kept past the cache")
-	}
+	// A fetch answer still in flight may store the body once more right
+	// after a sweep; the next sweep drops it again.
+	waitFor(t, "body dropped past the cache", 20*time.Second, func() bool {
+		e.sweep(e.Chain.Tip())
+		return !e.Store.HasText(hash)
+	})
 	waitFor(t, "fetched again when opened", 30*time.Second, func() bool {
 		vs := e.Board("테스트", 0, 10)
 		return len(vs) == 1 && vs[0].TextState == "ok" && vs[0].Text == "세 노드 시험 글"
@@ -189,7 +193,9 @@ func TestAnonymousPosts(t *testing.T) {
 	waitFor(t, "stake", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).StakePending > 0 })
 	start := b.Chain.Height()
 	waitFor(t, "stake aging", 60*time.Second, func() bool { return b.Chain.Height() > start+p.StakeAgingBlocks })
-	if err := b.JoinRLN(3 * params.Coin); err != nil {
+	// The bond follows the storage price: offer what three messages need
+	// now, with room for the price to move before the join is mined.
+	if err := b.JoinRLN(b.Chain.Tip().BondFor(3) * 13 / 10); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "membership", 60*time.Second, func() bool { return b.RLNStatus().Status == "active" })
@@ -329,5 +335,96 @@ func TestBurstWarning(t *testing.T) {
 	}
 	if err := a.SendChecked(&types.Tx{Kind: types.TxTransfer, To: a.Wallet.Address(), Amount: 1}, true); err != nil {
 		t.Fatalf("confirmed send: %v", err)
+	}
+}
+
+// TestLikeBatch: likes wait in the queue (and can be taken back), leave as
+// one batch, and are counted by the index once mined.
+func TestLikeBatch(t *testing.T) {
+	p := fastParams()
+	a := start(t, p, true)
+	waitFor(t, "funds", 60*time.Second, func() bool { return a.Chain.Tip().Peek(a.Wallet.Address()).Balance > 10*params.Coin })
+	var ids []cryptox.Hash
+	for i := 0; i < 3; i++ {
+		tx := &types.Tx{Kind: types.TxPost, Board: "좋아요", Lane: types.LaneFee}
+		tx.SetText([]byte(fmt.Sprintf("좋아요 시험 글 %d", i)))
+		if err := a.Send(tx); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, tx.ID())
+	}
+	waitFor(t, "posts indexed", 60*time.Second, func() bool {
+		for _, id := range ids {
+			if _, ok := a.Index.post(id); !ok {
+				return false
+			}
+		}
+		return true
+	})
+	for _, id := range ids {
+		if _, err := a.QueueLike(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := a.QueueLike(ids[0]); err == nil {
+		t.Fatal("the same like queued twice")
+	}
+	if !a.UnqueueLike(ids[2]) || len(a.QueuedLikes()) != 2 {
+		t.Fatal("take-back failed")
+	}
+	if n, err := a.FlushLikes(true); err != nil || n != 2 {
+		t.Fatalf("flush sent %d: %v", n, err)
+	}
+	if len(a.QueuedLikes()) != 0 {
+		t.Fatal("sent likes still queued")
+	}
+	waitFor(t, "likes counted", 60*time.Second, func() bool {
+		v0, _ := a.Index.post(ids[0])
+		v1, _ := a.Index.post(ids[1])
+		v2, _ := a.Index.post(ids[2])
+		return v0.Likes == 1 && v1.Likes == 1 && v2.Likes == 0
+	})
+	if _, err := a.QueueLike(ids[0]); err == nil {
+		t.Fatal("a counted like queued again")
+	}
+}
+
+// TestCrowdfunding: a creator with no coins signs a request; a backer
+// checks a sample of the data, pledges (carrying the request), and the
+// creator's node uploads and proves by itself once the deadline nears.
+func TestCrowdfunding(t *testing.T) {
+	p := fastParams()
+	p.FundProofBlocks = 20
+	a := start(t, p, true)
+	b := start(t, p, false, a.Host.Addr())
+	waitFor(t, "funds", 60*time.Second, func() bool { return a.Chain.Tip().Peek(a.Wallet.Address()).Balance > 10*params.Coin })
+	if b.Chain.Tip().Peek(b.Wallet.Address()).Balance != 0 {
+		t.Fatal("creator should have no coins")
+	}
+	q, code, err := b.CreateFund(pngBytes(), "후원", "남기고 싶은 그림", 12, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CheckFund(code); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "spot check", 30*time.Second, func() bool {
+		fc, err := a.FundStatus(q.ID())
+		return err == nil && fc.Verified == fc.Asked && fc.Asked > 0 && len(fc.Preview) > 0
+	})
+	if err := a.Pledge(q.ID(), 2*params.Coin, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "request on chain", 60*time.Second, func() bool { return b.Chain.Tip().Funds.Has(q.ID()) })
+	waitFor(t, "data stored", 120*time.Second, func() bool { return a.Chain.Tip().Data.Has(q.DataRoot) })
+	if a.Chain.Tip().Funds.Has(q.ID()) {
+		t.Fatal("campaign open after its data was stored")
+	}
+	vs := a.Board("후원", 0, 10)
+	if len(vs) != 1 || vs[0].Fund == nil || vs[0].Fund.Status != "stored" || vs[0].Likes != 1 {
+		t.Fatalf("listing: %+v", vs)
+	}
+	if err := a.Chain.Tip().CheckSupply(); err != nil {
+		t.Fatal(err)
 	}
 }

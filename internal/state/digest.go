@@ -17,8 +17,8 @@ func (s *State) Digest() Hash {
 	fmt.Fprintf(h, "%d %x %x %x %d %x|", s.Height, s.Tip, s.VDFOut, s.EpochSeed, s.VDFStep, s.CumWork.Bytes())
 	fmt.Fprintf(h, "%d %d %d %d %d %d %d %d %d %d %d|", s.Supply, s.Burned, s.Endowment, s.RepairPool, s.Price,
 		s.PriceEMA, s.BaseFee, s.Congestion, s.PermBytes, s.TermBytes, s.Proven)
-	fmt.Fprintf(h, "%v|%v|%v|%v|%d %d %d %d|", s.Recent, s.TextQueue, s.RLNRoots, s.RLNExits,
-		s.RLNCap, s.RLNCapPrev, s.RLNCapEpoch, s.MemberCount)
+	fmt.Fprintf(h, "%v|%v|%v|%v|%d %d %d %d %d|", s.Recent, s.TextQueue, s.RLNRoots, s.RLNExits,
+		s.RLNCap, s.RLNCapPrev, s.RLNCapEpoch, s.MemberCount, s.MemberSlots)
 	root := s.RLNRoot()
 	fmt.Fprintf(h, "%x|", root)
 
@@ -44,6 +44,9 @@ func (s *State) Digest() Hash {
 		for i := 0; i < b.Records.Len(); i++ {
 			fmt.Fprintf(&rec, "%+v;", b.Records.At(i))
 		}
+		for i := 0; i < b.Posts.Len(); i++ {
+			fmt.Fprintf(&rec, "p%x;", b.Posts.At(i))
+		}
 		lines = append(lines, fmt.Sprintf("%d %d %d %d %d %s\n", id, b.Len, b.EpochLen, b.Escrow, b.Bytes, rec.String()))
 	}
 	sorted(lines)
@@ -54,7 +57,19 @@ func (s *State) Digest() Hash {
 	s.Posts.Range(func(k Hash, v *PostInfo) bool { lines = append(lines, fmt.Sprintf("%x %+v\n", k, *v)); return true })
 	sorted(lines)
 	lines = nil
-	s.Likes.Range(func(k [52]byte, _ bool) bool { lines = append(lines, fmt.Sprintf("%x\n", k)); return true })
+	s.Funds.Range(func(k Hash, c *Campaign) bool {
+		var ps bytes.Buffer
+		for i := 0; i < c.Pledges.Len(); i++ {
+			fmt.Fprintf(&ps, "%+v;", c.Pledges.At(i))
+		}
+		lines = append(lines, fmt.Sprintf("%x %x %x %d %d %d %d %d %d %d %d %d %d %d %x %s\n", k, c.Creator, c.DataRoot, c.Size,
+			c.Media, c.MinTier, c.Deadline, c.Status, c.Escrow, c.Raised, c.Upload, c.Tier, c.Bucket, c.Held, c.Seed, ps.String()))
+		return true
+	})
+	s.FundDue.Range(func(h uint64, ids []Hash) bool {
+		lines = append(lines, fmt.Sprintf("due %d %x\n", h, ids))
+		return true
+	})
 	sorted(lines)
 	lines = nil
 	// Repeat counts as they read at the next height (generations are an

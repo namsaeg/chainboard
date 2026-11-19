@@ -40,8 +40,9 @@ func TestRLNLane(t *testing.T) {
 	idc := rln.ToBytes(rln.IdentityCommitment(sec))
 	idc2 := rln.ToBytes(rln.IdentityCommitment(sec2))
 	r.pool.Reset(r.c.Tip())
-	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: 3 * params.Coin, Commitment: idc, Limit: 3, MaxFee: params.Coin})
-	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: 1 * params.Coin, Commitment: idc2, Limit: 1, MaxFee: params.Coin})
+	// Bonds follow the storage price; a little more than needed is fine.
+	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: r.c.Tip().BondFor(3) * 11 / 10, Commitment: idc, Limit: 3, MaxFee: params.Coin})
+	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: r.c.Tip().BondFor(4) / 4 * 11 / 10, Commitment: idc2, Limit: 1, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	st := r.c.Tip()
 	if memberOf(st, idc) == nil || memberOf(st, idc).Status != state.MemberActive {
@@ -82,7 +83,7 @@ func TestRLNLane(t *testing.T) {
 	}
 	r.mineN(t, 1)
 	st = r.c.Tip()
-	if pi := postOf(st, a0.ID()); pi == nil || pi.Author != (types.Address{}) {
+	if pi := postOf(st, a0.ID()); pi == nil || a0.Author() != (types.Address{}) {
 		t.Fatal("anonymous post not mined or not anonymous")
 	}
 
@@ -124,7 +125,7 @@ func TestRLNLane(t *testing.T) {
 	r.mineN(t, 1)
 	st = r.c.Tip()
 	m2 := memberOf(st, idc2)
-	if m2.Status != state.MemberLeaving || m2.Bond != params.Coin {
+	if m2.Status != state.MemberLeaving || m2.Bond == 0 {
 		t.Fatal("leave not recorded")
 	}
 	r.mineTo(t, m2.Release)

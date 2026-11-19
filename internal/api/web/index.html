@@ -28,10 +28,30 @@
       <div id="rln" class="small"></div>
       <form id="rlnJoinForm"><input name="amount" placeholder="보증금 (코인)" required>
         <button>등록</button></form>
-      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1코인마다 1시간에 익명 글 1개를 쓸 수 있어요(최대 30개). 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
+      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1시간에 익명 글을 보증금만큼 쓸 수 있어요(최대 30개). 1개당 보증금은 저장 가격을 따르고, 익명 차선이 많이 예약될수록 커져요. 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
       <div id="rlnForeign" class="warn" hidden>다른 기기에서 같은 익명 키로 글을 쓰고 있어요. 두 기기가 같은 번호를 쓰면 보증금이 몰수돼요. 이 노드의 익명 글쓰기를 멈췄어요.
         <button id="rlnAck" class="small">한 기기에서만 쓸게요</button></div>
       <button id="rlnLeave" class="small">등록 해제</button>
+    </div>
+    <div class="card">
+      <h2>크라우드 펀딩</h2>
+      <details><summary>모금 요청 만들기</summary>
+        <form id="fundNewForm">
+          <input type="file" name="file" accept="image/png,image/jpeg,image/gif" required>
+          <input name="board" placeholder="게시판" maxlength="32" required>
+          <textarea name="note" maxlength="300" placeholder="무엇을 남기려는지 (300바이트까지)"></textarea>
+          <select name="tier" title="최소 보존 기간"><option value="1y">최소 1년</option><option value="5y">최소 5년</option>
+            <option value="20y">최소 20년</option><option value="perm" selected>영구</option></select>
+          <input name="days" type="number" min="1" max="30" value="14" title="마감까지 일수"> 일 안에
+          <button>요청 만들기</button>
+        </form>
+        <p class="small muted">코인이 없어도 돼요. 파일은 이 노드에만 두고, 서명한 요청 코드를 나눠 주세요. 첫 후원자가 요청을 체인에 올려요. 모인 코인은 이 파일을 저장하는 데만 쓰이고, 기간 안에 올리지 못하면 후원자에게 돌아가요.</p>
+        <textarea id="fundCode" class="mono small" readonly hidden></textarea>
+      </details>
+      <details><summary>요청 코드로 후원하기</summary>
+        <form id="fundCheckForm"><textarea name="code" class="mono small" placeholder="요청 코드 붙여넣기" required></textarea><button>확인</button></form>
+        <div id="fundCheck" class="small"></div>
+      </details>
     </div>
     <div class="card">
       <h2>게시판</h2>

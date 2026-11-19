@@ -84,6 +84,10 @@ type Bucket struct {
 	Records  pmap.Vec[Record] // persistent: copying a bucket is O(1)
 	Escrow   uint64           // prepaid fees still to be paid out to storage
 	Bytes    uint64           // live (not moved) bytes
+	// Posts lists the posts whose life ends with this bucket (their body is
+	// kept here, or they have no body and live one month). Their records are
+	// dropped from the state when the bucket expires.
+	Posts pmap.Vec[Hash]
 }
 
 // DataInfo is where a data root currently lives.
@@ -95,17 +99,16 @@ type DataInfo struct {
 	Record int // index in the bucket's records
 }
 
-// PostInfo is what the chain remembers about a post.
+// PostInfo is what the chain remembers about a post while it lives: what
+// comments and extensions need. Board, author, likes and counts are in each
+// node's index, not in the state. A post lives as long as its body is kept
+// (one month when it has none) and is then dropped.
 type PostInfo struct {
-	Board    string
-	Author   Address
-	Parent   Hash
-	Height   uint64
-	Likes    uint64
-	Comments uint64
+	Parent Hash
 
 	// The body: its commitment, retention, and where the seal put it
-	// (TextRoot is zero until the window's seal block).
+	// (TextRoot is zero until the window's seal block). TextBucket is the
+	// bucket the post's life ends with, also for a post without a body.
 	TextHash   Hash
 	TextLen    uint16
 	TextTier   uint16
@@ -128,6 +131,13 @@ type State struct {
 	// replay is set while re-applying a block this node already validated:
 	// the expensive proofs are not checked again (see ReplayBlock).
 	replay bool
+	// noRoot skips the state-root check: set while a miner computes the
+	// root its new block must carry (see NextRoot).
+	noRoot bool
+	// vdfCheck: 0 verifies every VDF step of the next block, n > 0 only n
+	// random steps (the chain checks the rest in the background), -1 none
+	// (a block this node mined: it computed the steps itself).
+	vdfCheck int
 	// textCheck, while set, verifies each text bundle a seal places.
 	textCheck func(BundleSpec, Hash) error
 
@@ -146,7 +156,8 @@ type State struct {
 	Buckets  map[uint32]*Bucket // a few thousand at most; entries copy-on-write
 	Data     pmap.Map[Hash, *DataInfo]
 	Posts    pmap.Map[Hash, *PostInfo]
-	Likes    pmap.Map[[52]byte, bool]
+	Funds    pmap.Map[Hash, *Campaign] // funding requests on chain, by request id
+	FundDue  pmap.Map[uint64, []Hash]  // height -> campaigns to look at then
 	// Repeat counts in two generations of DupWindowBlocks: an entry older
 	// than that can only read as zero, so older generations are dropped.
 	dupGen          uint64
@@ -175,6 +186,7 @@ type State struct {
 	// Anonymous lane (RLN).
 	Members     pmap.Map[Hash, *Member] // by identity commitment
 	MemberCount uint64                  // memberships not gone
+	MemberSlots uint64                  // their message limits, summed
 	RLNTree     *rln.Tree
 	RLNRoots    []RootEntry                      // accepted membership roots, newest (current) last
 	RLNNulls    map[uint64]pmap.Map[Hash, Share] // epoch -> nullifier -> share
@@ -188,7 +200,7 @@ type State struct {
 // O(number of buckets + small windows), not O(size of the state).
 func (s *State) Clone() *State {
 	c := *s
-	c.replay = false
+	c.replay, c.noRoot, c.vdfCheck = false, false, 0
 	c.textCheck = nil
 	c.TextQueue = append([]TextEntry(nil), s.TextQueue...)
 	c.Buckets = make(map[uint32]*Bucket, len(s.Buckets))
@@ -380,20 +392,21 @@ func (s *State) Locked(a *Account, h uint64) uint64 {
 func Genesis(p *params.Params) (*State, []byte) {
 	s := &State{
 		P:          p,
-		Accounts:   pmap.New[Address, *Account](pmap.Hash20[Address]),
-		Vesters:    pmap.New[Address, bool](pmap.Hash20[Address]),
+		Accounts:   pmap.Committed(pmap.Hash20[Address], accountSum),
+		Vesters:    pmap.Committed(pmap.Hash20[Address], flagSum),
 		Buckets:    map[uint32]*Bucket{},
-		Data:       pmap.New[Hash, *DataInfo](pmap.Hash32[Hash]),
-		Posts:      pmap.New[Hash, *PostInfo](pmap.Hash32[Hash]),
-		Likes:      pmap.New[[52]byte, bool](pmap.Hash52[[52]byte]),
-		dupCur:     pmap.New[Hash, dupEntry](pmap.Hash32[Hash]),
-		dupPrev:    pmap.New[Hash, dupEntry](pmap.Hash32[Hash]),
+		Data:       pmap.Committed(pmap.Hash32[Hash], dataSum),
+		Posts:      pmap.Committed(pmap.Hash32[Hash], postSum),
+		Funds:      pmap.Committed(pmap.Hash32[Hash], campaignSum),
+		FundDue:    pmap.Committed(pmap.Uint64, dueSum),
+		dupCur:     newDupMap(),
+		dupPrev:    newDupMap(),
 		Price:      p.InitialPrice,
 		PriceEMA:   p.InitialPrice,
 		BaseFee:    p.BaseFeeInit,
 		Congestion: 1000,
 		CumWork:    new(big.Int),
-		Members:    pmap.New[Hash, *Member](pmap.Hash32[Hash]),
+		Members:    pmap.Committed(pmap.Hash32[Hash], memberSum),
 		RLNTree:    rln.NewTree(),
 		RLNNulls:   map[uint64]pmap.Map[Hash, Share]{},
 		RLNCap:     p.RLNMaxLimit,
@@ -411,7 +424,7 @@ func Genesis(p *params.Params) (*State, []byte) {
 	s.VDFOut = cryptox.Tagged("cb/genesis/vdf", []byte(p.Name))
 	s.Tip = GenesisHash(p)
 	s.Recent = []HeaderMeta{{Time: GenesisTime, Target: types.HashToTarget(p.GenesisTarget)}}
-	s.Proven = ProvenBytes(p, types.Work(p.GenesisTarget), 1)
+	s.Proven = s.ProvenBytes(types.Work(p.GenesisTarget), 1)
 	return s, data
 }
 
@@ -450,6 +463,10 @@ func (s *State) CheckSupply() error {
 	}
 	s.Members.Range(func(_ Hash, m *Member) bool {
 		total += m.Bond
+		return true
+	})
+	s.Funds.Range(func(_ Hash, c *Campaign) bool {
+		total += c.Escrow
 		return true
 	})
 	total += s.Endowment + s.RepairPool

@@ -3,7 +3,7 @@ package state
 import (
 	"errors"
 	"fmt"
-	"github.com/namsaeg/chainboard/internal/pmap"
+	"math/big"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
@@ -156,11 +156,35 @@ func (s *State) MemberPath(idc Hash) (m Member, path [rln.Depth]fr.Element, bits
 	return *mp, path, bits, true
 }
 
-// RLNLimitFor is the message limit a bond buys.
+// LaneSlots is the anonymous lane's capacity per epoch, in reference posts.
+func (s *State) LaneSlots() uint64 {
+	return max(1, s.P.TextCapFree()*s.P.RLNEpochBlocks/s.P.RLNRefPostBytes)
+}
+
+// BondFor is the bond a membership of limit messages per epoch needs now:
+// the base per message follows the storage price, and grows with how much
+// of the lane memberships would book after this one (see params).
+func (s *State) BondFor(limit uint64) uint64 {
+	base := mulDiv(s.P.RLNBondPerMsg, s.Price, s.P.InitialPrice)
+	u := new(big.Int).SetUint64(s.MemberSlots + limit) // u = slots / LaneSlots
+	u4 := new(big.Int).Exp(u, big.NewInt(4), nil)
+	slots4 := new(big.Int).Exp(new(big.Int).SetUint64(s.LaneSlots()), big.NewInt(4), nil)
+	// bond = limit × base × (1 + curve × u⁴)
+	x := new(big.Int).Mul(u4, new(big.Int).SetUint64(s.P.RLNBondCurve))
+	x.Add(x, slots4)
+	x.Mul(x, new(big.Int).SetUint64(limit*base))
+	x.Div(x, slots4)
+	if !x.IsUint64() {
+		return ^uint64(0)
+	}
+	return x.Uint64()
+}
+
+// RLNLimitFor is the largest message limit a bond buys now.
 func (s *State) RLNLimitFor(bond uint64) uint64 {
-	l := bond / s.P.RLNBondPerMsg
-	if l > s.P.RLNMaxLimit {
-		l = s.P.RLNMaxLimit
+	l := uint64(0)
+	for l < s.P.RLNMaxLimit && s.BondFor(l+1) <= bond {
+		l++
 	}
 	return l
 }
@@ -184,8 +208,8 @@ func (s *State) checkJoin(t *types.Tx, acc *Account) error {
 	if uint64(t.Limit) > s.P.RLNMaxLimit {
 		return fmt.Errorf("limit above %d per epoch", s.P.RLNMaxLimit)
 	}
-	if t.Amount < uint64(t.Limit)*s.P.RLNBondPerMsg {
-		return fmt.Errorf("bond too small: %d messages need %d units", t.Limit, uint64(t.Limit)*s.P.RLNBondPerMsg)
+	if need := s.BondFor(uint64(t.Limit)); t.Amount < need {
+		return fmt.Errorf("bond too small: %d messages need %d units now", t.Limit, need)
 	}
 	if acc.StakeMature < t.Amount {
 		if acc.StakeMature+acc.StakePending >= t.Amount {
@@ -206,6 +230,7 @@ func (s *State) applyJoin(t *types.Tx, owner Address, acc *Account, h uint64) {
 	i := s.RLNTree.Append(rln.Leaf(idc, uint64(t.Limit)))
 	s.Members.Set(t.Commitment, &Member{Owner: owner, Index: i, Limit: t.Limit, Bond: t.Amount, Status: MemberActive})
 	s.MemberCount++
+	s.MemberSlots += uint64(t.Limit)
 	s.pushRoot(h)
 }
 
@@ -252,6 +277,7 @@ func (s *State) releaseExits(h uint64) {
 		m.Bond = 0
 		m.Status = MemberGone
 		s.MemberCount--
+		s.MemberSlots -= uint64(m.Limit)
 	}
 }
 
@@ -347,17 +373,12 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 	s.fund(dest, fee)
 	nulls, ok := s.RLNNulls[p.Epoch]
 	if !ok {
-		nulls = pmap.New[Hash, Share](pmap.Hash32[Hash])
+		nulls = newNullMap()
 	}
 	nulls.Set(p.Nullifier, share)
 	s.RLNNulls[p.Epoch] = nulls
-	s.notePost(t, h, dupKey)
-	id := t.ID()
-	pp, _ := s.Posts.Get(id)
-	pi := *pp
-	pi.TextBucket = dest
-	s.Posts.Set(id, &pi)
-	s.queueText(id, t.TextHash, t.TextLen, dest)
+	s.notePost(t, h, dupKey, dest)
+	s.queueText(t.ID(), t.TextHash, t.TextLen, dest)
 	return nil
 }
 
@@ -386,6 +407,7 @@ func (s *State) applySlash(t *types.Tx, ctx *BlockCtx) error {
 	m.Bond = 0
 	m.Status = MemberGone
 	s.MemberCount--
+	s.MemberSlots -= uint64(m.Limit)
 	return nil
 }
 

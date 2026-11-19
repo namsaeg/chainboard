@@ -146,16 +146,25 @@ func TestTextSealExtendExpire(t *testing.T) {
 		t.Fatal("fresh node did not demand bodies or did not catch up")
 	}
 
-	// The one-month body expires; the post stays.
-	for tip := r.c.Tip(); !tip.TextExpired(postOf(tip, short.ID())); tip = r.c.Tip() {
-		r.mineN(t, 2)
+	// The one-month post leaves the state with its body's bucket, and
+	// comments on it are refused from then on; longer retention stays.
+	b := postOf(r.c.Tip(), short.ID()).TextBucket
+	for r.c.Height() < r.c.Tip().BucketExpiry(b) {
+		r.mineN(t, 1)
 	}
 	tip = r.c.Tip()
-	if tip.TextExpired(postOf(tip, keep.ID())) || tip.TextExpired(postOf(tip, later.ID())) {
-		t.Fatal("longer retention expired early")
+	if _, ok := tip.Posts.Get(short.ID()); ok {
+		t.Fatal("expired post kept in the state")
 	}
-	if _, ok := tip.Posts.Get(short.ID()); !ok {
-		t.Fatal("expired post vanished from the chain")
+	if postOf(tip, keep.ID()) == nil || postOf(tip, later.ID()) == nil {
+		t.Fatal("longer retention dropped early")
+	}
+	r.pool.Reset(tip)
+	late := textPost("자유", "늦은 댓글", short.ID())
+	late.MaxFee, late.Nonce = params.Coin, tip.Peek(k.Address()).Nonce
+	late.Sign(k)
+	if err := r.pool.Add(late); err == nil {
+		t.Fatal("comment on an expired post accepted")
 	}
 	r.check(t)
 }

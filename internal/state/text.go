@@ -206,6 +206,9 @@ func (s *State) applyPostExtend(t *types.Tx, dest uint32) {
 	c := *p
 	c.TextTier, c.TextBucket = t.Tier, dest
 	s.Posts.Set(t.Target, &c)
+	if dest != 0 {
+		s.bucket(dest).Posts.Append(t.Target)
+	}
 	s.queueText(t.Target, t.TextHash, t.TextLen, dest)
 }
 
@@ -233,7 +236,13 @@ func decayBurst(score, dh, tau uint64) uint64 {
 
 // countsForBurst reports whether a kind raises the sender's burst score.
 // Storage duties do not.
-func countsForBurst(k types.TxKind) bool { return k != types.TxProof && k != types.TxRegister }
+func countsForBurst(k types.TxKind) bool {
+	switch k {
+	case types.TxProof, types.TxRegister, types.TxFundUpload, types.TxFundProof:
+		return false
+	}
+	return true
+}
 
 // BurstScore is an account's score at height h before its next transaction.
 func (s *State) BurstScore(a *Account, h uint64) uint64 {

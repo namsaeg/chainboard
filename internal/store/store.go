@@ -1,6 +1,7 @@
-// Package store keeps data on disk in one bbolt database: raw chunks of
-// uploaded data (verified against their data root) and this node's packed
-// replicas. Every write is a single atomic transaction.
+// Package store keeps data on disk: raw chunks of uploaded data (verified
+// against their data root) and post bodies in one bbolt database, and this
+// node's packed replicas in flat segment files that mining reads in long
+// sequential runs.
 package store
 
 import (
@@ -26,19 +27,23 @@ import (
 type Hash = cryptox.Hash
 
 var (
-	bMeta   = []byte("meta")   // root -> size (u64)
-	bChunks = []byte("chunks") // root || index (u64) -> raw chunk
-	bPacked = []byte("packed") // miner || bucket (u32) || position (u64) -> packed replica
-	bTexts  = []byte("texts")  // text hash -> post body
-	bInfo   = []byte("info")   // "genesis" -> genesis the packed replicas belong to
+	bMeta    = []byte("meta")    // root -> size (u64)
+	bChunks  = []byte("chunks")  // root || index (u64) -> raw chunk
+	bPackIdx = []byte("packidx") // miner || bucket (u32) || segment (u64) -> presence bitmap
+	bTexts   = []byte("texts")   // text hash -> post body
+	bInfo    = []byte("info")    // "genesis" -> genesis the packed replicas belong to
+
+	bLegacyPacked = []byte("packed") // 0.3.x: replicas inside the database
 )
 
 // Store is safe for concurrent use.
 type Store struct {
-	db *bolt.DB
-	mu sync.RWMutex
+	db  *bolt.DB
+	dir string
+	mu  sync.RWMutex
 	// leaves caches the chunk leaves of complete data, to build proofs.
 	leaves map[Hash][]Hash
+	files  fileCache
 }
 
 // Open opens (or creates) dir/store.db.
@@ -51,7 +56,12 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bMeta, bChunks, bPacked, bTexts} {
+		if tx.Bucket(bLegacyPacked) != nil {
+			if err := tx.DeleteBucket(bLegacyPacked); err != nil {
+				return err
+			}
+		}
+		for _, b := range [][]byte{bMeta, bChunks, bPackIdx, bTexts} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -62,28 +72,20 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, leaves: map[Hash][]Hash{}}, nil
+	return &Store{db: db, dir: dir, leaves: map[Hash][]Hash{}, files: fileCache{open: map[string]*os.File{}}}, nil
 }
 
-// Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+// Close closes the database and the replica files.
+func (s *Store) Close() error {
+	s.files.closeAll()
+	return s.db.Close()
+}
 
 func chunkKey(root Hash, i uint64) []byte {
 	k := make([]byte, 40)
 	copy(k, root[:])
 	binary.BigEndian.PutUint64(k[32:], i)
 	return k
-}
-
-func packedPrefix(miner cryptox.Address, bucket uint32) []byte {
-	k := make([]byte, 24, 32)
-	copy(k, miner[:])
-	binary.BigEndian.PutUint32(k[20:], bucket)
-	return k
-}
-
-func packedKey(miner cryptox.Address, bucket uint32, pos uint64) []byte {
-	return binary.BigEndian.AppendUint64(packedPrefix(miner, bucket), pos)
 }
 
 func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
@@ -285,71 +287,6 @@ func (s *Store) SubProof(root Hash, i uint64, sub int) (chunk.Proof, error) {
 	return chunk.ProveSub(l, int(i), c, sub)
 }
 
-// Packed is one packed replica to store.
-type Packed struct {
-	Bucket   uint32
-	Position uint64
-	Data     []byte
-}
-
-// PutPacked stores packed replicas of one miner in a single transaction.
-// Replicas are unique to a miner address, so they are keyed by it.
-func (s *Store) PutPacked(miner cryptox.Address, ps ...Packed) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bPacked)
-		for _, p := range ps {
-			if err := b.Put(packedKey(miner, p.Bucket, p.Position), p.Data); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-// HasPacked reports whether a packed replica exists.
-func (s *Store) HasPacked(miner cryptox.Address, bucket uint32, pos uint64) bool {
-	var ok bool
-	_ = s.db.View(func(tx *bolt.Tx) error {
-		ok = tx.Bucket(bPacked).Get(packedKey(miner, bucket, pos)) != nil
-		return nil
-	})
-	return ok
-}
-
-// PackedSub reads one packed sub-chunk.
-func (s *Store) PackedSub(miner cryptox.Address, bucket uint32, pos uint64, sub int) ([]byte, error) {
-	var out []byte
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bPacked).Get(packedKey(miner, bucket, pos))
-		lo, hi := sub*params.SubChunkSize, (sub+1)*params.SubChunkSize
-		if v == nil || sub < 0 || hi > len(v) {
-			return os.ErrNotExist
-		}
-		out = append([]byte(nil), v[lo:hi]...)
-		return nil
-	})
-	return out, err
-}
-
-// DropBucket removes the packed replicas of an expired bucket.
-func (s *Store) DropBucket(miner cryptox.Address, bucket uint32) error {
-	prefix := packedPrefix(miner, bucket)
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bPacked)
-		var keys [][]byte
-		c := b.Cursor()
-		for k, _ := c.Seek(prefix); k != nil && string(k[:24]) == string(prefix); k, _ = c.Next() {
-			keys = append(keys, append([]byte(nil), k...))
-		}
-		for _, k := range keys {
-			if err := b.Delete(k); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
 // UseGenesis binds the store to a chain. Packed replicas and post bodies of
 // another genesis (an older testnet) are dropped: positions and posts no
 // longer mean the same thing. Raw data is kept; the node's sweep removes
@@ -363,7 +300,7 @@ func (s *Store) UseGenesis(g Hash) (bool, error) {
 		}
 		old := b.Get([]byte("genesis"))
 		if old != nil && !bytes.Equal(old, g[:]) {
-			for _, name := range [][]byte{bPacked, bTexts} {
+			for _, name := range [][]byte{bPackIdx, bTexts} {
 				if err := tx.DeleteBucket(name); err != nil {
 					return err
 				}
@@ -375,6 +312,10 @@ func (s *Store) UseGenesis(g Hash) (bool, error) {
 		}
 		return b.Put([]byte("genesis"), g[:])
 	})
+	if err == nil && dropped {
+		s.files.closeAll()
+		err = os.RemoveAll(filepath.Join(s.dir, "packed"))
+	}
 	return dropped, err
 }
 

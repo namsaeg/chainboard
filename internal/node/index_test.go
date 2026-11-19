@@ -34,7 +34,7 @@ func fakePost(board, text string, parent types.Hash) *types.Tx {
 }
 
 func openTestIndex(t *testing.T) *Index {
-	ix, err := OpenIndex(filepath.Join(t.TempDir(), "index.db"))
+	ix, err := OpenIndex(filepath.Join(t.TempDir(), "index.db"), cryptox.Hash{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func snapshot(ix *Index) (map[string]int, []string, []string) {
 		}
 		return
 	}
-	return ix.Boards(), ids(ix.Board(nil, "a", 0, 100)), ids(ix.Board(nil, "b", 0, 100))
+	return ix.Boards(), ids(ix.Board("a", 0, 100)), ids(ix.Board("b", 0, 100))
 }
 
 // TestIndexReorg: a reorganisation undoes only the replaced blocks, and the
@@ -74,10 +74,10 @@ func TestIndexReorg(t *testing.T) {
 	if got := ix.Boards(); got["a"] != 2 || got["b"] != 1 {
 		t.Fatalf("boards %v", got)
 	}
-	if vs := ix.Board(nil, "a", 0, 1); len(vs) != 1 || vs[0].Height != 3 {
+	if vs := ix.Board("a", 0, 1); len(vs) != 1 || vs[0].Height != 3 {
 		t.Fatalf("newest first, limited: %+v", vs)
 	}
-	if p, cs := ix.Thread(nil, p1.ID()); p == nil || len(cs) != 1 || cs[0].ID != c1.ID().String() {
+	if p, cs := ix.Thread(p1.ID()); p == nil || len(cs) != 1 || cs[0].ID != c1.ID().String() {
 		t.Fatal("thread")
 	}
 	if ids := ix.postsWithText(p1.TextHash); len(ids) != 1 || ids[0] != p1.ID() {
@@ -104,5 +104,53 @@ func TestIndexReorg(t *testing.T) {
 	b2, a2, bb2 := snapshot(direct)
 	if !reflect.DeepEqual(b1, b2) || !reflect.DeepEqual(a1, a2) || !reflect.DeepEqual(bb1, bb2) {
 		t.Fatalf("after reorg %v %v %v, direct %v %v %v", b1, a1, bb1, b2, a2, bb2)
+	}
+}
+
+func fakeLikes(from byte, refs ...types.LikeRef) *types.Tx {
+	pub := make([]byte, 32)
+	pub[0] = from
+	return &types.Tx{Kind: types.TxLikes, From: pub, Likes: refs}
+}
+
+// Likes are resolved from short references, counted once per account and
+// post within the window, and undone with the blocks that carried them.
+func TestIndexLikes(t *testing.T) {
+	p1 := fakePost("a", "좋아요 받을 글", types.Hash{})
+	c1 := fakePost("a", "댓글", p1.ID())
+	ref := types.RefOf(p1.ID(), 1)
+	wrong := ref
+	wrong.Prefix[0]++
+	common := fakeChain{
+		fakeBlock(1, 0, p1),
+		fakeBlock(2, 0, c1, fakeLikes(1, ref, wrong)),
+	}
+	lost := append(append(fakeChain(nil), common...),
+		fakeBlock(3, 1, fakeLikes(2, ref)),
+		fakeBlock(4, 1, fakeLikes(1, ref))) // the same account again
+	won := append(append(fakeChain(nil), common...),
+		fakeBlock(3, 2), fakeBlock(4, 2), fakeBlock(5, 2), fakeBlock(6, 2),
+		fakeBlock(7, 2, fakeLikes(3, ref))) // past the window
+	ix := openTestIndex(t)
+	ix.LikeWindow = 5
+	if err := ix.Sync(lost); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := ix.post(p1.ID())
+	if v.Likes != 2 || v.Comments != 1 {
+		t.Fatalf("likes %d comments %d, want 2 and 1", v.Likes, v.Comments)
+	}
+	if err := ix.Sync(won); err != nil {
+		t.Fatal(err)
+	}
+	v, _ = ix.post(p1.ID())
+	var b, c cryptox.Address
+	b = cryptox.AddressOf(fakeLikes(2).From)
+	c = cryptox.AddressOf(fakeLikes(3).From)
+	if v.Likes != 1 || ix.Liked(p1.ID(), b) || ix.Liked(p1.ID(), c) {
+		t.Fatalf("after reorg: likes %d", v.Likes)
+	}
+	if vs := ix.Board("a", 1, 10); len(vs) != 1 {
+		t.Fatal("best-of filter")
 	}
 }

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version = "0.3.1"
+	Version = "0.4.0"
 
 	Coin = 100_000_000 // units per coin
 
@@ -39,9 +39,14 @@ type Params struct {
 	BlockTime time.Duration
 
 	// VDF and mining.
-	VDFIterations     uint64 // SHA-256 iterations per VDF step (testnet: ~43 ms with SHA-NI)
-	ChallengesPerStep int    // challenges unlocked per stored partition per VDF step
-	PartitionChunks   uint64 // chunks per partition
+	VDFIterations   uint64 // SHA-256 iterations per VDF step (testnet: about 1 s with SHA-NI)
+	PartitionChunks uint64 // chunks per partition
+	// Each VDF step unlocks, per partition, one recall range of RecallChunks
+	// consecutive chunks: every sub-chunk in it is a ticket. The range offset
+	// is drawn over the partition's span (see State.Span), so the reads per
+	// step grow with stored data, not with the number of partitions.
+	RecallChunks      uint64
+	SpanDivisor       uint64
 	PackMemoryKiB     uint32 // Argon2id memory per packing seed (packing cost)
 	PackTime          uint32 // Argon2id passes
 	GenesisTarget     *big.Int
@@ -101,11 +106,24 @@ type Params struct {
 
 	// Anonymous lane (RLN). A membership bonds stake for a per-epoch message
 	// limit; posts prove membership without revealing which member wrote them.
-	RLNEpochBlocks   uint64 // blocks per rate-limit epoch
-	RLNMaxLimit      uint64 // most messages per epoch of one membership (≤ 65535)
-	RLNBondPerMsg    uint64 // bond needed per message of limit
+	RLNEpochBlocks uint64 // blocks per rate-limit epoch
+	RLNMaxLimit    uint64 // most messages per epoch of one membership (≤ 65535)
+	RLNBondPerMsg  uint64 // bond per message of limit at the initial storage price, empty lane
+	// The bond per message grows with the anonymous lane's booked share u
+	// (message slots of all memberships over the lane's capacity per epoch,
+	// in posts of RLNRefPostBytes): × (1 + RLNBondCurve·u⁴). Joining is about
+	// as cheap as before while the lane is lightly booked; booking half of it
+	// for spam ties up an order of magnitude more.
+	RLNBondCurve     uint64
+	RLNRefPostBytes  uint64
 	RLNRootWindow    uint64 // blocks a replaced membership root stays usable in proofs
 	RLNSlashPermille uint64 // share of a slashed bond paid to the block's miner; the rest is burned
+
+	// Crowdfunding: a request's deadline is at most FundMaxBlocks after it
+	// is carried on chain; after a funded upload, its proof must follow
+	// within FundProofBlocks.
+	FundMaxBlocks   uint64
+	FundProofBlocks uint64
 
 	// Media.
 	MinMediaPerBlock  uint64 // bytes; floor of the automatic media cap
@@ -125,14 +143,15 @@ func mustHex(s string) *big.Int {
 func Testnet() *Params {
 	p := &Params{
 		Name:              "testnet",
-		Magic:             0xCB0A0003, // 0.3.0: new genesis (texts moved off-chain)
+		Magic:             0xCB0A0004, // 0.4.0: new genesis (1 s VDF steps, recall ranges, state root)
 		BlockTime:         60 * time.Second,
-		VDFIterations:     400_000,
-		ChallengesPerStep: 4,
-		PartitionChunks:   4096, // 1 GiB
+		VDFIterations:     9_000_000,
+		PartitionChunks:   1 << 21, // 512 GiB
+		RecallChunks:      2,       // 512 KiB read per partition per step
+		SpanDivisor:       32,
 		PackMemoryKiB:     4096, // 4 MiB per 256 KiB chunk
 		PackTime:          1,
-		GenesisTarget:     mustHex("0400000000000000000000000000000000000000000000000000000000000000"),
+		GenesisTarget:     mustHex("0011000000000000000000000000000000000000000000000000000000000000"),
 		MaxTarget:         mustHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
 		RetargetWindow:    30,
 		GenesisDataChunks: 64,
@@ -146,14 +165,15 @@ func Testnet() *Params {
 func Devnet() *Params {
 	p := &Params{
 		Name:              "devnet",
-		Magic:             0xCB0D0003,
+		Magic:             0xCB0D0004,
 		BlockTime:         2 * time.Second,
-		VDFIterations:     100_000,
-		ChallengesPerStep: 4,
+		VDFIterations:     400_000,
 		PartitionChunks:   16,
+		RecallChunks:      2,
+		SpanDivisor:       32,
 		PackMemoryKiB:     64,
 		PackTime:          1,
-		GenesisTarget:     mustHex("0200000000000000000000000000000000000000000000000000000000000000"),
+		GenesisTarget:     mustHex("0018000000000000000000000000000000000000000000000000000000000000"),
 		MaxTarget:         mustHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
 		RetargetWindow:    10,
 		GenesisDataChunks: 32,
@@ -203,6 +223,8 @@ func (p *Params) setEconomics() {
 	p.RLNEpochBlocks = p.BlocksPerDay / 24 // one hour
 	p.RLNMaxLimit = 30                     // 30 posts an hour = 720 a day
 	p.RLNBondPerMsg = Coin
+	p.RLNBondCurve = 256
+	p.RLNRefPostBytes = 512
 	p.RLNRootWindow = 15 // covers the send delay (≤ 5 min) and propagation
 	p.RLNSlashPermille = 500
 	p.StakeAgingBlocks = 7 * p.BlocksPerDay
@@ -213,6 +235,8 @@ func (p *Params) setEconomics() {
 	p.BurstFree = 30 // the honest ceiling: 30 an hour
 	p.BurstStep = 10
 	p.TextSealBlocks = p.BlocksPerDay / 24 // hourly bundles
+	p.FundMaxBlocks = 30 * p.BlocksPerDay
+	p.FundProofBlocks = p.BlocksPerDay
 	p.MinMediaPerBlock = 4 * 1024 * 1024
 	p.MediaHeadroomPerm = 500
 	p.FileCapDivisor = 100

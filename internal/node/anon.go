@@ -159,8 +159,10 @@ type RLNInfo struct {
 	EpochLeft  uint64 `json:"epoch_blocks_left"`
 	Members    int    `json:"members"`
 	Pseudonym  string `json:"pseudonym,omitempty"`
-	Remaining  uint64 `json:"remaining"`   // anonymous posts left this epoch
-	ForeignUse bool   `json:"foreign_use"` // another device uses this key
+	Remaining  uint64 `json:"remaining"`        // anonymous posts left this epoch
+	ForeignUse bool   `json:"foreign_use"`      // another device uses this key
+	BondPerMsg uint64 `json:"bond_per_message"` // bond of one message per epoch now
+	BondFull   uint64 `json:"bond_full"`        // bond of the largest limit now
 }
 
 // RLNStatus reports the membership. Active means mined: proofs are made
@@ -173,6 +175,7 @@ func (n *Node) RLNStatus() RLNInfo {
 	cap, _ := tip.CapFor(e)
 	info := RLNInfo{Status: "none", Epoch: e, Cap: cap, EpochLeft: (e+1)*tip.P.RLNEpochBlocks - h}
 	info.Members = int(tip.MemberCount)
+	info.BondPerMsg, info.BondFull = tip.BondFor(1), tip.BondFor(tip.P.RLNMaxLimit)
 	joining := n.joining()
 	n.rlnMu.Lock()
 	defer n.rlnMu.Unlock()
@@ -212,10 +215,14 @@ func (n *Node) RLNStatus() RLNInfo {
 // limit per epoch is what the bond buys.
 func (n *Node) JoinRLN(bond uint64) error {
 	st := n.trialState()
-	limit := st.RLNLimitFor(bond)
+	// The whole offered bond is used. The limit leaves room for two days
+	// of the largest price move, as the bond follows the storage price and
+	// the join may be mined a little later.
+	headroom := 1_000_000 + 2*st.P.PriceMaxDayPPM
+	limit := st.RLNLimitFor(bond / headroom * 1_000_000)
 	if limit == 0 {
-		return fmt.Errorf("bond too small: one message per epoch needs %d.%08d coin",
-			st.P.RLNBondPerMsg/params.Coin, st.P.RLNBondPerMsg%params.Coin)
+		need := st.BondFor(1)
+		return fmt.Errorf("bond too small: one message per epoch needs %d.%08d coin now", need/params.Coin, need%params.Coin)
 	}
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
@@ -236,7 +243,7 @@ func (n *Node) JoinRLN(bond uint64) error {
 		idc, _ = n.commitment()
 	}
 	n.rlnMu.Unlock()
-	return n.Send(&types.Tx{Kind: types.TxRLNJoin, Amount: limit * st.P.RLNBondPerMsg, Commitment: idc, Limit: uint16(limit)})
+	return n.Send(&types.Tx{Kind: types.TxRLNJoin, Amount: bond, Commitment: idc, Limit: uint16(limit)})
 }
 
 // pendingJoin finds our membership join while it is on its way: queued

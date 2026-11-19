@@ -85,7 +85,13 @@ func (n *Node) fillText(v *PostView, tip *state.State) {
 		v.TextState = "ok"
 		return
 	}
-	if pi, ok := tip.Posts.Get(v.id); ok {
+	pi, ok := tip.Posts.Get(v.id)
+	if !ok && !v.Pending {
+		// The chain drops a post's record when its body's retention ends.
+		v.Text, v.TextState = "", "expired"
+		return
+	}
+	if ok {
 		v.Tier, v.Until = pi.TextTier, tip.TextUntil(pi)
 		if tip.TextExpired(pi) {
 			v.Text, v.TextState = "", "expired"
@@ -107,9 +113,10 @@ func (n *Node) fillText(v *PostView, tip *state.State) {
 // Board returns a board's newest posts with their bodies.
 func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 	tip := n.Chain.Tip()
-	vs := n.Index.Board(tip, name, minLikes, limit)
+	vs := n.Index.Board(name, minLikes, limit)
 	for i := range vs {
 		n.fillText(&vs[i], tip)
+		n.fillFund(&vs[i], tip)
 	}
 	return vs
 }
@@ -117,11 +124,12 @@ func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 // Thread returns a post and its comments with their bodies.
 func (n *Node) Thread(id cryptox.Hash) (*PostView, []PostView) {
 	tip := n.Chain.Tip()
-	p, cs := n.Index.Thread(tip, id)
+	p, cs := n.Index.Thread(id)
 	if p == nil {
 		return nil, nil
 	}
 	n.fillText(p, tip)
+	n.fillFund(p, tip)
 	for i := range cs {
 		n.fillText(&cs[i], tip)
 	}

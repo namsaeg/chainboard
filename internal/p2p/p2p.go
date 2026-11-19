@@ -76,6 +76,7 @@ type Host struct {
 	waiting  map[Hash]*types.Tx // uploads whose chunks are being fetched
 	parked   map[Hash]*parkedBlock
 	askedTxt map[Hash]time.Time // bodies requested, by hash
+	probes   map[Hash]*probe    // spot checks of data not on chain
 
 	ln   net.Listener
 	quit chan struct{}
@@ -113,7 +114,7 @@ func New(cfg Config) (*Host, error) {
 	return &Host{cfg: cfg, tls: tc, nonce: binary.BigEndian.Uint64(nb[:]),
 		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]bool{}, seenOld: map[Hash]bool{},
 		embargo: map[Hash]*time.Timer{}, fetching: map[string]time.Time{}, waiting: map[Hash]*types.Tx{},
-		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{},
+		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{}, probes: map[Hash]*probe{},
 		quit: make(chan struct{})}, nil
 }
 
@@ -580,6 +581,7 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		if err := r.Done(); err != nil {
 			return err
 		}
+		h.probed(root, idx, size, c, path)
 		if _, ok := h.cfg.Store.Size(root); !ok {
 			if !h.wanted(root, size) {
 				return nil

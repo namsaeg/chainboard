@@ -30,12 +30,23 @@ func Reseed(last Hash, blockHash Hash) Hash {
 }
 
 // VerifyChain checks that outputs[0] = Step(start) and each next output is the
-// step of the previous one. Steps are checked in parallel.
+// step of the previous one. Steps are checked in parallel on every core.
 func VerifyChain(start Hash, outputs []Hash, iterations uint64) bool {
+	idx := make([]int, len(outputs))
+	for i := range idx {
+		idx[i] = i
+	}
+	return VerifySteps(start, outputs, iterations, idx, runtime.NumCPU())
+}
+
+// VerifySteps checks only the steps at idx (each from the output before it),
+// on the given number of workers. Checking a random sample catches a forged
+// step with the sampled share's probability; the rest can be checked later.
+func VerifySteps(start Hash, outputs []Hash, iterations uint64, idx []int, workers int) bool {
 	if len(outputs) == 0 {
 		return false
 	}
-	workers := runtime.NumCPU()
+	workers = max(1, workers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	ok := true
@@ -57,7 +68,10 @@ func VerifyChain(start Hash, outputs []Hash, iterations uint64) bool {
 			}
 		}()
 	}
-	for i := range outputs {
+	for _, i := range idx {
+		if i < 0 || i >= len(outputs) {
+			continue
+		}
 		jobs <- i
 	}
 	close(jobs)

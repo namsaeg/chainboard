@@ -162,8 +162,8 @@ func TestMineAndPost(t *testing.T) {
 	}
 	r.mineTo(t, tip.Height+1)
 	tip = r.c.Tip()
-	if postOf(tip, post.ID()).Comments != 1 {
-		t.Fatal("comment not counted")
+	if pi := postOf(tip, cm.ID()); pi.Parent != post.ID() {
+		t.Fatal("comment not recorded")
 	}
 	if err := tip.CheckSupply(); err != nil {
 		t.Fatal(err)
