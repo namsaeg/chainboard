@@ -136,3 +136,44 @@ func (t *Tree) nodes() int {
 	})
 	return n
 }
+
+// A like batch proves its tags: the same member and post always give the
+// same tag, and a tag for another post (or member) does not verify.
+func TestLikeBatchProof(t *testing.T) {
+	tr, s, i := setupMember(t)
+	a1 := A1(s, 9, 1, 3)
+	x := SignalX([]byte("likes"))
+	pub := LikePublic{Public: Public{Root: tr.Root(), X: x, Y: Share(s, a1, x), Nullifier: Nullifier(a1), Epoch: 9, Scope: 1, Cap: 10}}
+	pub.Posts[0], pub.Posts[1] = 1_000<<32|0xdeadbeef, 2_000<<32|7
+	for j := range pub.Posts {
+		pub.Tags[j] = LikeTag(s, 1, pub.Posts[j])
+	}
+	path, bits := tr.Path(i)
+	t0 := time.Now()
+	pr, err := ProveLikes(pub, Witness{Secret: s, Limit: 5, MsgID: 3, Path: path, Bits: bits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("like batch: prove %v, %d bytes", time.Since(t0), len(pr))
+	if err := VerifyLikes(pr, pub); err != nil {
+		t.Fatal(err)
+	}
+	if !pub.Tags[2].IsZero() || pub.Tags[0] != LikeTag(s, 1, pub.Posts[0]) {
+		t.Fatal("tags")
+	}
+	bad := pub
+	bad.Posts[1]++
+	if VerifyLikes(pr, bad) == nil {
+		t.Fatal("tag accepted for another post")
+	}
+	bad = pub
+	var other fr.Element
+	other.SetUint64(5)
+	bad.Tags[0] = LikeTag(other, 1, pub.Posts[0])
+	if VerifyLikes(pr, bad) == nil {
+		t.Fatal("another member's tag accepted")
+	}
+	if Verify(pr, pub.Public) == nil {
+		t.Fatal("like proof accepted as a post proof")
+	}
+}

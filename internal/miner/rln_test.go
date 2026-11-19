@@ -136,3 +136,83 @@ func TestRLNLane(t *testing.T) {
 	}
 	r.check(t)
 }
+
+func anonLikes(t *testing.T, st *state.State, sec fr.Element, msgID uint64, heights ...uint64) *types.Tx {
+	t.Helper()
+	tx := &types.Tx{Kind: types.TxAnonLikes}
+	for _, h := range heights {
+		tx.Likes = append(tx.Likes, types.LikeRef{Height: h, Prefix: [4]byte{1, 2, 3, byte(h)}})
+	}
+	if err := st.ProveAnon(tx, sec, msgID); err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}
+
+// TestAnonLikes: a like batch spends one message of the member's epoch,
+// shares the budget (and the slashing) with anonymous posts, and its tags
+// are bound to the member and the posts.
+func TestAnonLikes(t *testing.T) {
+	p := FastParams()
+	p.RLNEpochBlocks = 1000
+	r := newRig(t, p, 4)
+	r.mineTo(t, 10)
+	k := r.m.Key
+	r.pool.Reset(r.c.Tip())
+	r.send(t, k, &types.Tx{Kind: types.TxStake, Amount: 10 * params.Coin, MaxFee: params.Coin})
+	r.mineN(t, 1+p.StakeAgingBlocks)
+	var sec fr.Element
+	sec.SetUint64(5150)
+	r.pool.Reset(r.c.Tip())
+	r.send(t, k, &types.Tx{Kind: types.TxRLNJoin, Amount: r.c.Tip().BondFor(2) * 11 / 10,
+		Commitment: rln.ToBytes(rln.IdentityCommitment(sec)), Limit: 2, MaxFee: params.Coin})
+	r.mineN(t, 1)
+	st := r.c.Tip()
+	r.pool.Reset(st)
+
+	batch := anonLikes(t, st, sec, 0, 3, 4, 5)
+	if batch.Author() != (types.Address{}) || len(batch.Tags) != 3 {
+		t.Fatal("like batch not anonymous or tags missing")
+	}
+	bad := *batch
+	bad.Tags = append([]types.Hash(nil), batch.Tags...)
+	bad.Tags[1][31] ^= 1
+	if r.pool.Add(&bad) == nil {
+		t.Fatal("tampered tag accepted")
+	}
+	if err := r.pool.Add(batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.pool.Add(anonLikes(t, st, sec, 0, 3, 4, 5)); !errors.Is(err, state.ErrDuplicateAnon) {
+		t.Fatalf("resend of the same batch: %v", err)
+	}
+	// The second message of the epoch goes to a post; there is no third.
+	if err := r.pool.Add(anon(t, st, sec, "좋아요 뒤의 글", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if st.ProveAnon(&types.Tx{Kind: types.TxAnonLikes, Likes: []types.LikeRef{{Height: 6}}}, sec, 2) == nil {
+		t.Fatal("like batch beyond the limit was provable")
+	}
+	// Reusing message 0 for other likes reveals the secret.
+	var ds *state.DoubleSignal
+	if err := r.pool.Add(anonLikes(t, st, sec, 0, 7)); !errors.As(err, &ds) {
+		t.Fatalf("double signal not detected: %v", err)
+	}
+	if s, ok := ds.Secret(); !ok || s != rln.ToBytes(sec) {
+		t.Fatal("secret not recovered")
+	}
+	r.mineN(t, 1)
+	st = r.c.Tip()
+	blk := r.c.BlockAt(st.Height)
+	found := false
+	for _, tx := range blk.Txs {
+		found = found || tx.ID() == batch.ID()
+	}
+	if !found {
+		t.Fatal("like batch not mined")
+	}
+	if !st.AnonMined(batch) {
+		t.Fatal("like batch's nullifier not recorded")
+	}
+	r.check(t)
+}

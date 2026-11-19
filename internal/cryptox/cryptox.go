@@ -13,8 +13,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 )
 
@@ -121,27 +119,4 @@ func Verify(pub, msg, sig []byte) bool {
 		return false
 	}
 	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
-}
-
-// LoadOrCreateKey reads a hex seed from path, creating it (mode 0600) if absent.
-func LoadOrCreateKey(path string) (*Key, error) {
-	b, err := os.ReadFile(path)
-	if err == nil {
-		seed, err := hex.DecodeString(strings.TrimSpace(string(b)))
-		if err != nil || len(seed) != ed25519.SeedSize {
-			return nil, fmt.Errorf("key file %s is corrupt", path)
-		}
-		return KeyFromSeed(seed), nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	k, err := NewKey()
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, []byte(hex.EncodeToString(k.Priv.Seed())+"\n"), 0o600); err != nil {
-		return nil, err
-	}
-	return k, nil
 }

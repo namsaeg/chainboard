@@ -19,6 +19,18 @@ type Hash = cryptox.Hash
 
 const maxPool = 20_000
 
+// Orphans: transactions whose sender has an earlier nonce not seen yet.
+// Relayed transactions can overtake each other (stem embargoes end in any
+// order), so they wait here, bounded, until the gap fills.
+const (
+	maxOrphans      = 512
+	maxSenderOrphan = 16
+	orphanTTL       = 10 * time.Minute
+)
+
+// ErrOrphan: kept until the sender's earlier transaction arrives.
+var ErrOrphan = errors.New("mempool: waiting for an earlier transaction of the sender")
+
 // DataCheck tells whether an upload's data is fully stored and acceptable.
 type DataCheck func(t *types.Tx) error
 
@@ -28,6 +40,9 @@ type Pool struct {
 	// anonymous post double-signals: the member's secret can be recovered
 	// and the member slashed.
 	OnDoubleSignal func(*state.DoubleSignal)
+	// OnPromote, if set, is called (outside the pool lock) for each orphan
+	// that entered the pool once the gap before it filled.
+	OnPromote func(*types.Tx)
 	// Bodies, if set, keeps the post bodies of accepted transactions, so
 	// blocks that include them can be checked and sealed.
 	Bodies interface {
@@ -41,6 +56,13 @@ type Pool struct {
 	pending *state.State // tip with all pool txs applied
 	ctx     *state.BlockCtx
 	seq     uint64
+	orphans map[cryptox.Address]map[uint64]orphan
+	nOrphan int
+}
+
+type orphan struct {
+	tx *types.Tx
+	at time.Time
 }
 
 type item struct {
@@ -51,7 +73,7 @@ type item struct {
 
 // New creates a pool on top of a tip.
 func New(tip *state.State, check DataCheck) *Pool {
-	p := &Pool{txs: map[Hash]*item{}, check: check}
+	p := &Pool{txs: map[Hash]*item{}, check: check, orphans: map[cryptox.Address]map[uint64]orphan{}}
 	p.Reset(tip)
 	return p
 }
@@ -66,6 +88,13 @@ func (p *Pool) Add(t *types.Tx) error {
 		if _, err := p.Bodies.PutText(t.Text); err != nil {
 			return err
 		}
+	}
+	if errors.Is(err, state.ErrFutureNonce) {
+		p.keepOrphan(t)
+		return fmt.Errorf("%w (%v)", ErrOrphan, err)
+	}
+	if err == nil && t.Kind.Signed() {
+		p.promote(t.Sender())
 	}
 	var ds *state.DoubleSignal
 	if errors.As(err, &ds) && p.OnDoubleSignal != nil {
@@ -133,6 +162,7 @@ func (p *Pool) ordered() []*item {
 // (mined, conflicting or expired). A pooled anonymous post that now collides
 // with a mined one is still reported as a double signal.
 func (p *Pool) Reset(tip *state.State) {
+	defer p.promoteAll()
 	var signals []*state.DoubleSignal
 	p.mu.Lock()
 	p.tip = tip
@@ -214,4 +244,96 @@ func (p *Pool) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.txs)
+}
+
+// keepOrphan holds a transaction whose sender has an earlier one missing.
+func (p *Pool) keepOrphan(t *types.Tx) {
+	if t.NeedsBody() && t.CheckBody() != nil {
+		return
+	}
+	from := t.Sender()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m := p.orphans[from]
+	if _, ok := m[t.Nonce]; ok || len(m) >= maxSenderOrphan {
+		return
+	}
+	if p.nOrphan >= maxOrphans {
+		p.dropOldestOrphan()
+	}
+	if m == nil {
+		m = map[uint64]orphan{}
+		p.orphans[from] = m
+	}
+	m[t.Nonce] = orphan{tx: t, at: time.Now()}
+	p.nOrphan++
+}
+
+func (p *Pool) dropOldestOrphan() {
+	var who cryptox.Address
+	var nonce uint64
+	var at time.Time
+	for a, m := range p.orphans {
+		for n, o := range m {
+			if at.IsZero() || o.at.Before(at) {
+				who, nonce, at = a, n, o.at
+			}
+		}
+	}
+	p.dropOrphan(who, nonce)
+}
+
+func (p *Pool) dropOrphan(a cryptox.Address, nonce uint64) {
+	if m, ok := p.orphans[a]; ok {
+		if _, ok := m[nonce]; ok {
+			delete(m, nonce)
+			p.nOrphan--
+		}
+		if len(m) == 0 {
+			delete(p.orphans, a)
+		}
+	}
+}
+
+// promote moves a sender's orphans that now follow on into the pool.
+func (p *Pool) promote(from cryptox.Address) {
+	for {
+		p.mu.Lock()
+		next := p.pending.Peek(from).Nonce
+		o, ok := p.orphans[from][next]
+		if ok {
+			p.dropOrphan(from, next)
+		}
+		p.mu.Unlock()
+		if !ok {
+			return
+		}
+		if err := p.Add(o.tx); err != nil {
+			return
+		}
+		if p.OnPromote != nil {
+			p.OnPromote(o.tx)
+		}
+	}
+}
+
+// promoteAll forgets stale orphans and promotes the ones a new tip enabled.
+func (p *Pool) promoteAll() {
+	p.mu.Lock()
+	var ready []cryptox.Address
+	for a, m := range p.orphans {
+		have := p.pending.Peek(a).Nonce
+		for n, o := range m {
+			if n < have || time.Since(o.at) > orphanTTL {
+				p.dropOrphan(a, n)
+			}
+		}
+		if _, ok := m[have]; ok {
+			ready = append(ready, a)
+		}
+	}
+	p.mu.Unlock()
+	for _, a := range ready {
+		p.promote(a)
+	}
 }

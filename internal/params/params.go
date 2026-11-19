@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version = "0.4.0"
+	Version = "0.5.0"
 
 	Coin = 100_000_000 // units per coin
 
@@ -124,6 +124,10 @@ type Params struct {
 	// within FundProofBlocks.
 	FundMaxBlocks   uint64
 	FundProofBlocks uint64
+	// FundPoWBits is the proof of work a funding request carries to be
+	// gossiped before it is on chain (2^bits hashes on average; about ten
+	// seconds of a common four-core PC at 28).
+	FundPoWBits uint8
 
 	// Media.
 	MinMediaPerBlock  uint64 // bytes; floor of the automatic media cap
@@ -143,7 +147,7 @@ func mustHex(s string) *big.Int {
 func Testnet() *Params {
 	p := &Params{
 		Name:              "testnet",
-		Magic:             0xCB0A0004, // 0.4.0: new genesis (1 s VDF steps, recall ranges, state root)
+		Magic:             0xCB0A0005, // 0.5.0: new genesis (anonymous likes, tips, gossiped funding requests)
 		BlockTime:         60 * time.Second,
 		VDFIterations:     9_000_000,
 		PartitionChunks:   1 << 21, // 512 GiB
@@ -165,7 +169,7 @@ func Testnet() *Params {
 func Devnet() *Params {
 	p := &Params{
 		Name:              "devnet",
-		Magic:             0xCB0D0004,
+		Magic:             0xCB0D0005,
 		BlockTime:         2 * time.Second,
 		VDFIterations:     400_000,
 		PartitionChunks:   16,
@@ -190,6 +194,7 @@ func Devnet() *Params {
 	p.RLNEpochBlocks = 30 // one minute
 	p.TextSealBlocks = 10
 	p.BurstTauBlocks = 30
+	p.FundPoWBits = 8
 	return p
 }
 
@@ -237,6 +242,7 @@ func (p *Params) setEconomics() {
 	p.TextSealBlocks = p.BlocksPerDay / 24 // hourly bundles
 	p.FundMaxBlocks = 30 * p.BlocksPerDay
 	p.FundProofBlocks = p.BlocksPerDay
+	p.FundPoWBits = 28
 	p.MinMediaPerBlock = 4 * 1024 * 1024
 	p.MediaHeadroomPerm = 500
 	p.FileCapDivisor = 100

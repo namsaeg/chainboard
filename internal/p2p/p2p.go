@@ -18,11 +18,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/namsaeg/chainboard/internal/anonnet"
 	"github.com/namsaeg/chainboard/internal/chain"
 	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/mempool"
 	"github.com/namsaeg/chainboard/internal/merkle"
+	"github.com/namsaeg/chainboard/internal/nat"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/store"
 	"github.com/namsaeg/chainboard/internal/types"
@@ -56,6 +58,18 @@ type Config struct {
 	// Text finds a post body to serve to a peer: from the text store, or
 	// cut out of a sealed bundle. Defaults to the text store.
 	Text func(Hash) ([]byte, bool)
+	// Funds holds the funding requests gossiped before they are on chain.
+	Funds FundGossip
+	// NAT, if set, asks the router to forward the listening port.
+	NAT *nat.Config
+	// Proxy, if set, carries every outbound connection (Tor or Nym's
+	// SOCKS5 client); onion addresses are only dialled through it.
+	Proxy *anonnet.Proxy
+	// ProxyOnly: never connect directly (with Proxy; e.g. Tor only).
+	ProxyOnly bool
+	// Cover sends fixed-size frames to the stem peer at a fixed rate, and
+	// stem transactions only inside them (zero: off).
+	Cover CoverConfig
 }
 
 // Host is the p2p node.
@@ -75,8 +89,12 @@ type Host struct {
 	fetching map[string]time.Time
 	waiting  map[Hash]*types.Tx // uploads whose chunks are being fetched
 	parked   map[Hash]*parkedBlock
-	askedTxt map[Hash]time.Time // bodies requested, by hash
-	probes   map[Hash]*probe    // spot checks of data not on chain
+	askedTxt map[Hash]time.Time  // bodies requested, by hash
+	probes   map[Hash]*probe     // spot checks of data not on chain
+	relays   map[relayKey]*relay // chunk requests passed on for peers
+	nat      natState
+	onion    string // announced onion service address, if any
+	cover    coverState
 
 	ln   net.Listener
 	quit chan struct{}
@@ -111,11 +129,16 @@ func New(cfg Config) (*Host, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
-	return &Host{cfg: cfg, tls: tc, nonce: binary.BigEndian.Uint64(nb[:]),
+	h := &Host{cfg: cfg, tls: tc, nonce: binary.BigEndian.Uint64(nb[:]),
 		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]bool{}, seenOld: map[Hash]bool{},
 		embargo: map[Hash]*time.Timer{}, fetching: map[string]time.Time{}, waiting: map[Hash]*types.Tx{},
 		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{}, probes: map[Hash]*probe{},
-		quit: make(chan struct{})}, nil
+		relays: map[relayKey]*relay{}, quit: make(chan struct{})}
+	if cfg.Pool != nil && cfg.Pool.OnPromote == nil {
+		// An orphan that entered the pool is relayed like any fluffed one.
+		cfg.Pool.OnPromote = func(t *types.Tx) { h.broadcast(msgTx, t.EncodeWire(), nil) }
+	}
+	return h, nil
 }
 
 // Start listens and dials seeds.
@@ -128,12 +151,20 @@ func (h *Host) Start() error {
 		h.ln = ln
 		h.wg.Add(1)
 		go h.acceptLoop()
+		if h.cfg.NAT != nil {
+			h.wg.Add(1)
+			go h.natLoop()
+		}
 	}
 	for _, s := range h.cfg.Seeds {
 		h.known[s] = true
 	}
 	h.wg.Add(1)
 	go h.maintain()
+	if h.cfg.Cover.On() {
+		h.wg.Add(1)
+		go h.coverLoop()
+	}
 	return nil
 }
 
@@ -206,6 +237,7 @@ func (h *Host) maintain() {
 		h.dialMore()
 		h.refetchWaiting()
 		h.retryParked()
+		h.expireRelays()
 		select {
 		case <-h.quit:
 			return
@@ -244,8 +276,7 @@ func (h *Host) dialMore() {
 		}
 		out++
 		go func(a string) {
-			d := &net.Dialer{Timeout: 5 * time.Second}
-			c, err := tls.DialWithDialer(d, "tcp", a, h.tls)
+			c, err := h.dialTLS(a)
 			if err != nil {
 				return
 			}
@@ -278,7 +309,9 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 		return
 	}
 	c.SetDeadline(time.Time{})
-	if addr == "" && them.Listen != "" {
+	if addr == "" && anonnet.IsOnion(them.Listen) {
+		addr = them.Listen // reached through Tor: only its onion address is dialable
+	} else if addr == "" && them.Listen != "" {
 		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 		_, port, err := net.SplitHostPort(them.Listen)
 		if err == nil {
@@ -296,6 +329,7 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 	go p.writeLoop()
 	go p.readLoop()
 	p.send(msgGetPeers, nil)
+	h.sendFundInv(p)
 	if them.Height > tip.Height || (them.Height == tip.Height && them.Best != tip.Tip) {
 		h.requestSync(p)
 	}
@@ -304,6 +338,18 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 func (h *Host) announce() string {
 	if h.ln == nil {
 		return ""
+	}
+	h.mu.Lock()
+	onion := h.onion
+	h.mu.Unlock()
+	if onion != "" {
+		return onion
+	}
+	if ext, _ := h.NATStatus(); ext != "" {
+		return ext // the router forwards it: peers dial the external port
+	}
+	if h.cfg.ProxyOnly {
+		return "" // a direct address would reveal us
 	}
 	return h.ln.Addr().String()
 }
@@ -348,6 +394,7 @@ func (p *peer) readLoop() {
 			p.h.stem = nil
 		}
 		p.h.mu.Unlock()
+		p.h.forgetPeer(p)
 		p.close()
 	}()
 	for {
@@ -494,6 +541,11 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 			return err
 		}
 		h.receiveStem(t, b)
+	case msgFundInv, msgGetFunds, msgFunds:
+		return h.handleFunds(p, typ, b)
+	case msgPad:
+	case msgPadded:
+		return h.receivePadded(p, b)
 	case msgGetTexts:
 		r := codec.NewReader(b)
 		n := r.Count(maxTextsPerMsg)
@@ -548,12 +600,14 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		var root Hash
 		r.Fixed(root[:])
 		idx := r.Var()
+		ttl := r.U8()
 		if err := r.Done(); err != nil {
 			return err
 		}
 		c, path, err := h.cfg.Store.ChunkProof(root, idx)
 		if err != nil {
-			return nil // we do not have it
+			h.relayGet(p, root, idx, ttl) // we do not have it: maybe a peer does
+			return nil
 		}
 		size, _ := h.cfg.Store.Size(root)
 		var w codec.Writer
@@ -581,6 +635,7 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		if err := r.Done(); err != nil {
 			return err
 		}
+		h.relayChunk(root, idx, size, c, path, b)
 		h.probed(root, idx, size, c, path)
 		if _, ok := h.cfg.Store.Size(root); !ok {
 			if !h.wanted(root, size) {

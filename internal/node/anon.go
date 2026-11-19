@@ -13,6 +13,7 @@ import (
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/keystore"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/rln"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -28,12 +29,15 @@ import (
 //	pseudonym.key  optional Ed25519 key for signed pseudonymous posts, kept
 //	               apart from the wallet so posts cannot be linked to stake
 
-// AnonRequest is an anonymous post waiting to be proven and sent.
+// AnonRequest is an anonymous post, or a batch of anonymous likes (Likes
+// set, nothing else), waiting to be proven and sent. Both spend one message
+// of the member's epoch.
 type AnonRequest struct {
 	Board  string
 	Text   string
 	Parent cryptox.Hash
 	Pseudo bool
+	Likes  []types.LikeRef
 	// Confirm accepts the warning shown before the epoch's last post.
 	Confirm bool
 }
@@ -51,6 +55,7 @@ type rlnUsage struct {
 // mined yet. waitJoin marks one held back until our membership is mined.
 type outboxItem struct {
 	req      AnonRequest
+	tx       *types.Tx // as last sent; its nullifier shows when it is mined
 	id       cryptox.Hash
 	sentAt   uint64
 	tries    int
@@ -102,7 +107,7 @@ func (n *Node) loadRLN() error {
 			n.usage.Epochs = map[uint64]map[uint16]string{}
 		}
 	}
-	b, err := os.ReadFile(n.rlnPath("rln.key"))
+	b, err := keystore.Read(n.rlnPath("rln.key"), n.cfg.Password)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -131,7 +136,7 @@ func (n *Node) newIdentity() error {
 		return err
 	}
 	b := rln.ToBytes(s)
-	if err := writeFileAtomic(n.rlnPath("rln.key"), []byte(`{"secret":"`+hex.EncodeToString(b[:])+`"}`+"\n")); err != nil {
+	if err := keystore.Write(n.rlnPath("rln.key"), []byte(`{"secret":"`+hex.EncodeToString(b[:])+`"}`+"\n"), n.cfg.Password); err != nil {
 		return err
 	}
 	n.secret = &s
@@ -301,13 +306,18 @@ func (n *Node) LeaveRLN() error {
 // AnonPost queues an anonymous post. It is proven when it leaves, after the
 // same random delay as other own transactions.
 func (n *Node) AnonPost(req AnonRequest) error {
-	if len(req.Text) == 0 {
+	if len(req.Text) == 0 && len(req.Likes) == 0 {
 		return errors.New("empty post")
+	}
+	what := "익명 글"
+	if len(req.Likes) > 0 {
+		req.Board, req.Text, req.Parent, req.Pseudo = "", "", cryptox.Hash{}, false
+		what = "익명 좋아요 묶음"
 	}
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
 	if ok && req.Pseudo && n.pseudo == nil {
-		k, err := cryptox.LoadOrCreateKey(n.rlnPath("pseudonym.key"))
+		k, err := loadKey(n.rlnPath("pseudonym.key"), n.cfg.Password)
 		if err != nil {
 			n.rlnMu.Unlock()
 			return err
@@ -339,6 +349,9 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		draft.PseudoPub = append([]byte(nil), n.pseudo.Pub...)
 	}
 	draft.RLN = &types.RLNProof{Proof: []byte{0}}
+	for range draft.Likes {
+		draft.Tags = append(draft.Tags, types.Hash{31: 1}) // placeholders: the signal does not cover tags
+	}
 	if err := checkAnonContent(draft); err != nil {
 		return err
 	}
@@ -364,8 +377,8 @@ func (n *Node) AnonPost(req AnonRequest) error {
 			if used+1 == limit && !req.Confirm {
 				n.rlnMu.Unlock()
 				return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
-					"이번 에포크에 쓸 수 있는 마지막 익명 글이에요(%d/%d). 보내면 약 %d분(%d블록) 뒤 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
-					limit, limit, mins, left)}}}
+					"이번 에포크의 마지막 익명 메시지를 %s에 써요(%d/%d). 보내면 약 %d분(%d블록) 뒤 다음 에포크까지 익명 글도 익명 좋아요도 더 보낼 수 없어요.",
+					what, limit, limit, mins, left)}}}
 			}
 		}
 		_, err := n.allocMsgID(e, limit, sig)
@@ -384,8 +397,8 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		}
 		if waiting+1 == limit && !req.Confirm {
 			return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
-				"가입이 처리되면 이 글이 이번 에포크의 마지막 익명 글이 돼요(%d/%d). 그 뒤로는 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
-				limit, limit)}}}
+				"가입이 처리되면 이 %s이(가) 이번 에포크의 마지막 익명 메시지가 돼요(%d/%d). 그 뒤로는 다음 에포크까지 익명으로 더 보낼 수 없어요.",
+				what, limit, limit)}}}
 		}
 	}
 	n.enqueue(queued{anon: &req})
@@ -502,8 +515,12 @@ func checkAnonContent(t *types.Tx) error {
 	return t.CheckStateless()
 }
 
-// newAnonTx is an anonymous post's content: kept for one month.
+// newAnonTx is an anonymous post's content (kept for one month) or a like
+// batch's references.
 func newAnonTx(req AnonRequest) *types.Tx {
+	if len(req.Likes) > 0 {
+		return &types.Tx{Kind: types.TxAnonLikes, Likes: append([]types.LikeRef(nil), req.Likes...)}
+	}
 	t := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Parent: req.Parent, Tier: params.TierFree}
 	t.SetText([]byte(req.Text))
 	return t
@@ -552,7 +569,7 @@ func (n *Node) sendAnon(req AnonRequest, tries int) error {
 		return err
 	}
 	n.rlnMu.Lock()
-	n.outbox = append(n.outbox, &outboxItem{req: req, id: t.ID(), sentAt: tip.Height, tries: tries, since: time.Now()})
+	n.outbox = append(n.outbox, &outboxItem{req: req, tx: t, id: t.ID(), sentAt: tip.Height, tries: tries, since: time.Now()})
 	n.rlnMu.Unlock()
 	return nil
 }
@@ -575,7 +592,7 @@ func (n *Node) tendOutbox(st *state.State) {
 			} else {
 				keep = append(keep, it)
 			}
-		case st.Posts.Has(it.id):
+		case st.Posts.Has(it.id) || (it.tx != nil && st.AnonMined(it.tx)):
 		case n.Pool.Has(it.id) || st.Height < it.sentAt+resendAfter || time.Since(it.since) < n.resendOwnAfter():
 			keep = append(keep, it) // pooled, or may still be in the stem
 		default:

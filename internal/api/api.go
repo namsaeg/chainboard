@@ -45,7 +45,7 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/likes", s.likes)
 	mux.HandleFunc("/api/fund/new", s.fundNew)
 	mux.HandleFunc("/api/fund/check", s.fundCheck)
-	mux.HandleFunc("/api/fund/pledge", s.fundPledge)
+	mux.HandleFunc("/api/funds", s.funds)
 	mux.HandleFunc("/api/stake", s.stake)
 	mux.HandleFunc("/api/unstake", s.stake)
 	mux.HandleFunc("/api/transfer", s.transfer)
@@ -53,6 +53,7 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/rln/join", s.rlnJoin)
 	mux.HandleFunc("/api/rln/leave", s.rlnLeave)
 	mux.HandleFunc("/api/rln/ack", s.rlnAck)
+	mux.HandleFunc("/api/pseudo/send", s.pseudoSend)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return guard(mux)
@@ -129,6 +130,11 @@ func parseCoins(s string) (uint64, error) {
 	return v, nil
 }
 
+func natView(n *node.Node) map[string]string {
+	ext, status := n.Host.NATStatus()
+	return map[string]string{"external": ext, "status": status}
+}
+
 func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	n := s.n
 	st := n.Chain.Tip()
@@ -153,6 +159,9 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		"need_bytes":         st.NeedBytes(),
 		"mempool":            n.Pool.Len(),
 		"mining":             n.Miner.Stats(),
+		"block_seconds":      int(n.P.BlockTime / time.Second),
+		"nat":                natView(n),
+		"privacy":            n.Privacy(),
 	})
 }
 
@@ -396,10 +405,18 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"queued": true})
 }
 
+// like queues a like: of a post (with an optional tip to its author), of a
+// funding request (a pledge) or anonymous; "now" sends its queue at once,
+// "undo" takes back a waiting like.
 func (s *server) like(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID   string `json:"id"`
-		Undo bool   `json:"undo"` // take back a like that has not left yet
+		ID      string `json:"id"`
+		Amount  string `json:"amount"` // coins; empty or 0: a plain like
+		Fund    bool   `json:"fund"`
+		Anon    bool   `json:"anon"`
+		Now     bool   `json:"now"`
+		Confirm bool   `json:"confirm"`
+		Undo    bool   `json:"undo"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
@@ -411,31 +428,78 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Undo {
-		writeJSON(w, map[string]bool{"removed": s.n.UnqueueLike(id)})
+		writeJSON(w, map[string]bool{"removed": s.n.UnqueueLike(id, req.Anon)})
 		return
 	}
-	waiting, err := s.n.QueueLike(id)
+	var amt uint64
+	if strings.TrimSpace(req.Amount) != "" {
+		if amt, err = parseCoins(req.Amount); err != nil {
+			fail(w, 400, err)
+			return
+		}
+	}
+	waiting, err := s.n.QueueLike(node.LikeRequest{ID: id, Amount: amt, Fund: req.Fund, Anon: req.Anon, Now: req.Now, Confirm: req.Confirm})
 	if err != nil {
-		fail(w, 400, err)
+		sendFail(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"queued": true, "waiting": waiting})
+	writeJSON(w, map[string]any{"queued": !req.Now, "sent": req.Now, "waiting": waiting})
 }
 
-// likes shows the waiting likes (GET) or sends them now (POST).
+type likeView struct {
+	ID      string `json:"id"`
+	Height  uint64 `json:"height,omitempty"`
+	Added   int64  `json:"added"`
+	Amount  string `json:"amount,omitempty"`
+	To      string `json:"to,omitempty"`
+	Fund    bool   `json:"fund,omitempty"`
+	Anon    bool   `json:"anon,omitempty"`
+	Expires uint64 `json:"expires,omitempty"` // last height the like counts at (plain likes)
+}
+
+func (s *server) likeQueue(q node.LikeQueue, window uint64) map[string]any {
+	views := []likeView{}
+	for _, l := range q.Likes {
+		v := likeView{ID: l.ID, Height: l.Height, Added: l.Added, To: l.To, Fund: l.Fund, Anon: l.Anon}
+		if l.Amount > 0 {
+			v.Amount = coins(l.Amount)
+		}
+		if !l.Fund && l.Amount == 0 {
+			v.Expires = l.Height + window
+		}
+		views = append(views, v)
+	}
+	return map[string]any{"likes": views, "coins": coins(q.Coins), "fee": coins(q.Fee), "next": q.Next, "expiring_soon": q.Soon}
+}
+
+// likes shows the waiting likes and the auto-send setting (GET), sends a
+// queue now (POST {anon, confirm}) or changes auto-send (POST {auto}).
 func (s *server) likes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, s.n.QueuedLikes())
+		signed, anon := s.n.QueuedLikes()
+		window := s.n.Index.LikeWindow
+		writeJSON(w, map[string]any{"signed": s.likeQueue(signed, window), "anon": s.likeQueue(anon, window),
+			"auto": s.n.LikeAutoSend(), "min_amount": coins(s.n.MinLikeAmount()), "window_days": node.LikeWindowDays})
 		return
 	}
 	var req struct {
-		Confirm bool `json:"confirm"`
+		Anon    bool           `json:"anon"`
+		Confirm bool           `json:"confirm"`
+		Auto    *node.LikeAuto `json:"auto"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		fail(w, 400, err)
 		return
 	}
-	n, err := s.n.FlushLikes(req.Confirm)
+	if req.Auto != nil {
+		if err := s.n.SetLikeAutoSend(*req.Auto); err != nil {
+			fail(w, 400, err)
+			return
+		}
+		writeJSON(w, req.Auto)
+		return
+	}
+	n, err := s.n.FlushLikes(req.Anon, req.Confirm)
 	if err != nil {
 		sendFail(w, err)
 		return
@@ -495,10 +559,46 @@ func (s *server) transfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"queued": true})
 }
 
+// pseudoSend moves coins tipped to the pseudonym out of its address.
+func (s *server) pseudoSend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To      string `json:"to"` // empty: this node's wallet
+		Amount  string `json:"amount"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	to := s.n.Wallet.Address()
+	if strings.TrimSpace(req.To) != "" {
+		var err error
+		if to, err = cryptox.ParseAddress(strings.TrimSpace(req.To)); err != nil {
+			fail(w, 400, err)
+			return
+		}
+	}
+	amt, err := parseCoins(req.Amount)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if err := s.n.SendPseudo(to, amt, req.Confirm); err != nil {
+		sendFail(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"sent": true})
+}
+
 func (s *server) rlnStatus(w http.ResponseWriter, r *http.Request) {
 	info := s.n.RLNStatus()
+	pseudoBal := ""
+	if _, bal, ok := s.n.PseudoBalance(); ok {
+		pseudoBal = coins(bal)
+	}
 	writeJSON(w, map[string]any{
-		"member": info.Member, "status": info.Status, "commitment": info.Commitment,
+		"pseudonym_balance": pseudoBal,
+		"member":            info.Member, "status": info.Status, "commitment": info.Commitment,
 		"limit": info.Limit, "bond": coins(info.Bond), "release": info.Release,
 		"epoch": info.Epoch, "cap": info.Cap, "used": info.Used, "epoch_blocks_left": info.EpochLeft,
 		"members": info.Members, "pseudonym": info.Pseudonym,
@@ -593,6 +693,15 @@ func (s *server) fundNew(w http.ResponseWriter, r *http.Request) {
 
 // fundCheck reads a request code and spot-checks its data (POST {code}),
 // or reports how far the check got (GET ?id=).
+// funds lists crowdfunding in progress, nearest deadline first.
+func (s *server) funds(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	writeJSON(w, s.n.FundList(limit))
+}
+
 func (s *server) fundCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var req struct {
@@ -615,37 +724,14 @@ func (s *server) fundCheck(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	fc, err := s.n.FundStatus(id)
+	check := s.n.FundStatus
+	if r.URL.Query().Get("probe") != "" {
+		check = s.n.SpotCheck // start the spot check if none is under way
+	}
+	fc, err := check(id)
 	if err != nil {
 		fail(w, 404, err)
 		return
 	}
 	writeJSON(w, fc)
-}
-
-func (s *server) fundPledge(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID      string `json:"id"`
-		Amount  string `json:"amount"`
-		Confirm bool   `json:"confirm"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-		fail(w, 400, err)
-		return
-	}
-	id, err := cryptox.ParseHash(req.ID)
-	if err != nil {
-		fail(w, 400, err)
-		return
-	}
-	amt, err := parseCoins(req.Amount)
-	if err != nil {
-		fail(w, 400, err)
-		return
-	}
-	if err := s.n.Pledge(id, amt, req.Confirm); err != nil {
-		sendFail(w, err)
-		return
-	}
-	writeJSON(w, map[string]bool{"queued": true})
 }

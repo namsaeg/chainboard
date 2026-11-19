@@ -93,9 +93,11 @@ func (n *Node) fillFund(v *PostView, tip *state.State) {
 	}
 }
 
-// ownFunds is fund.json: the requests this node's wallet signed.
+// ownFunds is fund.json: the requests this node's wallet signed, with the
+// proof of work that lets them be gossiped (by request id) once found.
 type ownFunds struct {
-	Codes []string `json:"codes"`
+	Codes []string          `json:"codes"`
+	PoW   map[string]uint64 `json:"pow,omitempty"`
 }
 
 func (n *Node) loadFunds() {
@@ -109,16 +111,23 @@ func (n *Node) loadFunds() {
 	}
 	for _, code := range f.Codes {
 		if q, err := decodeCode(code); err == nil {
-			n.funds[q.ID()] = &fundTend{req: q, own: true}
+			ft := &fundTend{req: q, own: true}
+			if nonce, ok := f.PoW[q.ID().String()]; ok {
+				ft.pow, ft.hasPoW, ft.bits = nonce, true, types.PoWBits(q.ID(), nonce)
+			}
+			n.funds[q.ID()] = ft
 		}
 	}
 }
 
 func (n *Node) saveFundsLocked() {
-	var f ownFunds
-	for _, ft := range n.funds {
+	f := ownFunds{PoW: map[string]uint64{}}
+	for id, ft := range n.funds {
 		if ft.own {
 			f.Codes = append(f.Codes, hex.EncodeToString(ft.req.Encode()))
+			if ft.hasPoW {
+				f.PoW[id.String()] = ft.pow
+			}
 		}
 	}
 	b, _ := json.Marshal(f)
@@ -128,10 +137,15 @@ func (n *Node) saveFundsLocked() {
 }
 
 // fundTend is a request this node knows: its own (it uploads and proves
-// once funded) or one a user pasted (to carry with a pledge).
+// once funded), one a user pasted, or one gossiped by peers (to carry with
+// a pledge). One with its proof of work is gossiped on.
 type fundTend struct {
 	req     *types.FundRequest
 	own     bool
+	gossip  bool // came from peers (counts against the pool's bounds)
+	hasPoW  bool
+	pow     uint64
+	bits    int
 	sentAt  uint64 // height when the last upload or proof was sent
 	sentFor state.FundStatus
 }
@@ -163,6 +177,9 @@ func (n *Node) CreateFund(raw []byte, board, note string, minTier uint16, days u
 	if uint64(len(data)) > tip.FileCap() {
 		return nil, "", fmt.Errorf("file larger than the cap of %d bytes", tip.FileCap())
 	}
+	if root, _ := chunk.Root(data); tip.Data.Has(root) {
+		return nil, "", errors.New("that file is already stored on the network")
+	}
 	root, err := n.Store.PutData(data)
 	if err != nil {
 		return nil, "", err
@@ -177,6 +194,7 @@ func (n *Node) CreateFund(raw []byte, board, note string, minTier uint16, days u
 	n.funds[q.ID()] = &fundTend{req: q, own: true}
 	n.saveFundsLocked()
 	n.fundMu.Unlock()
+	n.solveFund(q)
 	return q, hex.EncodeToString(q.Encode()), nil
 }
 
@@ -208,18 +226,7 @@ func (n *Node) CheckFund(code string) (*FundCheck, error) {
 		n.funds[q.ID()] = &fundTend{req: q}
 	}
 	n.fundMu.Unlock()
-	if !n.Store.Complete(q.DataRoot) {
-		count := chunk.Count(q.Size)
-		idx := []uint64{0}
-		for len(idx) < min(4, int(count)) {
-			i := rand.Uint64N(count)
-			if !contains(idx, i) {
-				idx = append(idx, i)
-			}
-		}
-		n.Host.Probe(q.DataRoot, q.Size, idx)
-	}
-	return n.FundStatus(q.ID())
+	return n.SpotCheck(q.ID())
 }
 
 func contains(xs []uint64, x uint64) bool {
@@ -231,55 +238,100 @@ func contains(xs []uint64, x uint64) bool {
 	return false
 }
 
-// FundStatus reports a known request and how far its spot check got.
-func (n *Node) FundStatus(id cryptox.Hash) (*FundCheck, error) {
+// fundCheckOf describes a request this node knows: from its pool (pasted,
+// gossiped or own) or, once carried, from the chain and the index.
+func (n *Node) fundCheckOf(id cryptox.Hash) (*FundCheck, cryptox.Hash, uint64, bool) {
+	tip := n.Chain.Tip()
 	n.fundMu.Lock()
 	ft, ok := n.funds[id]
 	n.fundMu.Unlock()
+	if ok {
+		q := ft.req
+		fc := &FundCheck{ID: id.String(), Board: q.Board, Note: q.Note, Creator: q.CreatorAddr().String(), Media: q.Media}
+		_, fc.OnChain = tip.Funds.Get(id)
+		fc.Fund = n.fundView(tip, id, q.DataRoot, q.Size, q.MinTier, q.CreatorAddr())
+		if fc.Fund.Deadline == 0 {
+			fc.Fund.Deadline = q.Deadline
+		}
+		if fc.Fund.Status == "closed" && q.Deadline > tip.Height {
+			fc.Fund.Status = "new" // not carried on chain yet
+		}
+		return fc, q.DataRoot, q.Size, true
+	}
+	c, ok := tip.Funds.Get(id)
 	if !ok {
-		return nil, errors.New("unknown funding request: paste its code first")
+		return nil, cryptox.Hash{}, 0, false
 	}
-	q := ft.req
-	tip := n.Chain.Tip()
-	fc := &FundCheck{ID: id.String(), Board: q.Board, Note: q.Note, Creator: q.CreatorAddr().String(), Media: q.Media}
-	_, fc.OnChain = tip.Funds.Get(id)
-	fc.Fund = n.fundView(tip, id, q.DataRoot, q.Size, q.MinTier, q.CreatorAddr())
-	if fc.Fund.Deadline == 0 {
-		fc.Fund.Deadline = q.Deadline
+	fc := &FundCheck{ID: id.String(), Creator: c.Creator.String(), Media: c.Media, OnChain: true,
+		Fund: n.fundView(tip, id, c.DataRoot, c.Size, c.MinTier, c.Creator)}
+	if v, ok := n.Index.post(id); ok {
+		fc.Board, fc.Note = v.Board, v.Text
 	}
-	if fc.Fund.Status == "closed" && q.Deadline > tip.Height {
-		fc.Fund.Status = "new" // not carried on chain yet
+	return fc, c.DataRoot, c.Size, true
+}
+
+// SpotCheck starts (once) the spot check of a known request's data and
+// reports how far it got.
+func (n *Node) SpotCheck(id cryptox.Hash) (*FundCheck, error) {
+	_, root, size, ok := n.fundCheckOf(id)
+	if !ok {
+		return nil, errors.New("unknown funding request")
 	}
-	count := chunk.Count(q.Size)
+	if !n.Store.Complete(root) && !n.Host.Probing(root) {
+		count := chunk.Count(size)
+		idx := []uint64{0}
+		for len(idx) < min(4, int(count)) {
+			i := rand.Uint64N(count)
+			if !contains(idx, i) {
+				idx = append(idx, i)
+			}
+		}
+		n.Host.Probe(root, size, idx)
+	}
+	return n.FundStatus(id)
+}
+
+// FundStatus reports a known request and how far its spot check got.
+func (n *Node) FundStatus(id cryptox.Hash) (*FundCheck, error) {
+	fc, root, size, ok := n.fundCheckOf(id)
+	if !ok {
+		return nil, errors.New("unknown funding request")
+	}
+	count := chunk.Count(size)
 	fc.Asked = min(4, int(count))
-	if n.Store.Complete(q.DataRoot) {
+	if n.Store.Complete(root) {
 		fc.Verified = fc.Asked
-		if c, err := n.Store.Chunk(q.DataRoot, 0); err == nil {
+		if c, err := n.Store.Chunk(root, 0); err == nil {
 			fc.Preview = c
 		}
 		return fc, nil
 	}
-	got := n.Host.ProbeResult(q.DataRoot)
+	got := n.Host.ProbeResult(root)
 	fc.Verified = len(got)
 	fc.Preview = got[0]
 	return fc, nil
 }
 
-// Pledge backs a request with coins. A request not on chain yet is
-// carried with the pledge.
-func (n *Node) Pledge(id cryptox.Hash, amount uint64, confirm bool) error {
-	tip := n.trialState()
-	tx := &types.Tx{Kind: types.TxLikes, Pledges: []types.Pledge{{Request: id, Amount: amount}}}
-	if !tip.Funds.Has(id) {
-		n.fundMu.Lock()
-		ft, ok := n.funds[id]
-		n.fundMu.Unlock()
-		if !ok {
-			return errors.New("unknown funding request: paste its code first")
+// openRequest checks that a funding request takes pledges at height h. It
+// returns the request to carry with a pledge when the chain does not hold it
+// yet (nil when it does).
+func (n *Node) openRequest(id cryptox.Hash, st *state.State, h uint64) (*types.FundRequest, error) {
+	if c, ok := st.Funds.Get(id); ok {
+		if c.Status != state.FundOpen || h >= c.Deadline {
+			return nil, errors.New("that funding request no longer takes pledges")
 		}
-		tx.Requests = []*types.FundRequest{ft.req}
+		return nil, nil
 	}
-	return n.SendChecked(tx, confirm)
+	n.fundMu.Lock()
+	ft, ok := n.funds[id]
+	n.fundMu.Unlock()
+	switch {
+	case !ok:
+		return nil, errors.New("unknown funding request: paste its code first")
+	case h >= ft.req.Deadline:
+		return nil, errors.New("that funding request's deadline has passed")
+	}
+	return ft.req, nil
 }
 
 // fundLead is how long before the deadline an own request is uploaded on
@@ -326,6 +378,9 @@ func (n *Node) tendFunds(st *state.State) {
 				continue
 			}
 			tx = &types.Tx{Kind: types.TxFundProof, Target: id, Samples: samples}
+		}
+		if pc, ok := n.trialState().Funds.Get(id); !ok || pc.Status != c.Status {
+			continue // what we would send is already in the pool
 		}
 		if err := n.Send(tx); err != nil {
 			n.cfg.Logf("node: funding %s: %v", tx.Kind, err)

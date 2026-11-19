@@ -2,12 +2,14 @@ package miner
 
 import (
 	"crypto/rand"
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
 
 	"github.com/namsaeg/chainboard/internal/chain"
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/mempool"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
@@ -385,4 +387,70 @@ func TestSampledVDFCaughtLater(t *testing.T) {
 	if c.Height() != at {
 		t.Fatal("honest block removed")
 	}
+}
+
+// TestOrphans: a transaction that overtakes its sender's earlier one waits
+// outside the pool and enters (and is announced) once the gap fills.
+func TestOrphans(t *testing.T) {
+	r := newRig(t, FastParams(), 4)
+	r.mineTo(t, 5)
+	k := r.m.Key
+	r.pool.Reset(r.c.Tip())
+	var promoted []*types.Tx
+	r.pool.OnPromote = func(tx *types.Tx) { promoted = append(promoted, tx) }
+	base := r.pool.PendingState().Peek(k.Address()).Nonce
+	var txs []*types.Tx
+	for i := uint64(0); i < 3; i++ {
+		tx := &types.Tx{Kind: types.TxTransfer, To: types.Address{1}, Amount: 1, MaxFee: params.Coin, Nonce: base + i}
+		tx.Sign(k)
+		txs = append(txs, tx)
+	}
+	for _, tx := range []*types.Tx{txs[2], txs[1]} {
+		if err := r.pool.Add(tx); !errors.Is(err, mempool.ErrOrphan) {
+			t.Fatalf("nonce %d ahead: %v", tx.Nonce, err)
+		}
+	}
+	if r.pool.Has(txs[1].ID()) {
+		t.Fatal("orphan in the pool")
+	}
+	if err := r.pool.Add(txs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if !r.pool.Has(txs[1].ID()) || !r.pool.Has(txs[2].ID()) || len(promoted) != 2 {
+		t.Fatalf("orphans not promoted (%d)", len(promoted))
+	}
+	r.mineN(t, 1)
+	if r.c.Tip().Peek(k.Address()).Nonce != base+3 {
+		t.Fatal("promoted transactions not mined")
+	}
+}
+
+// TestTips: a tip moves coins to the named receiver, at least the minimum,
+// never to the sender itself.
+func TestTips(t *testing.T) {
+	r := newRig(t, FastParams(), 4)
+	r.mineTo(t, 5)
+	k := r.m.Key
+	r.pool.Reset(r.c.Tip())
+	to := types.Address{9}
+	min := r.c.Tip().MinPledge()
+	ref := types.LikeRef{Height: 3, Prefix: [4]byte{1, 2, 3, 4}}
+	small := &types.Tx{Kind: types.TxLikes, Tips: []types.Tip{{Ref: ref, To: to, Amount: min - 1}}, MaxFee: params.Coin,
+		Nonce: r.pool.PendingState().Peek(k.Address()).Nonce}
+	small.Sign(k)
+	if r.pool.Add(small) == nil {
+		t.Fatal("tip below the minimum accepted")
+	}
+	self := &types.Tx{Kind: types.TxLikes, Tips: []types.Tip{{Ref: ref, To: k.Address(), Amount: min}}, MaxFee: params.Coin,
+		Nonce: small.Nonce}
+	self.Sign(k)
+	if r.pool.Add(self) == nil {
+		t.Fatal("tip to oneself accepted")
+	}
+	r.send(t, k, &types.Tx{Kind: types.TxLikes, Likes: []types.LikeRef{{Height: 2}}, Tips: []types.Tip{{Ref: ref, To: to, Amount: 5 * min}}, MaxFee: params.Coin})
+	r.mineN(t, 1)
+	if got := r.c.Tip().Peek(to).Balance; got != 5*min {
+		t.Fatalf("receiver has %d, want %d", got, 5*min)
+	}
+	r.check(t)
 }

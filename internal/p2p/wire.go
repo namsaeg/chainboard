@@ -29,6 +29,11 @@ const (
 	msgPeers
 	msgGetTexts // post bodies by hash
 	msgTexts
+	msgFundInv  // ids of the funding requests a node gossips
+	msgGetFunds // funding requests by id
+	msgFunds    // funding requests (each with its proof of work)
+	msgPad      // cover traffic: a fixed-size frame carrying nothing
+	msgPadded   // cover traffic: a fixed-size frame carrying part of a stem transaction
 )
 
 const maxMessage = 32 << 20

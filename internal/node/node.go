@@ -5,23 +5,28 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
+	"github.com/namsaeg/chainboard/internal/anonnet"
 	"github.com/namsaeg/chainboard/internal/chain"
 	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/keystore"
 	"github.com/namsaeg/chainboard/internal/media"
 	"github.com/namsaeg/chainboard/internal/mempool"
 	"github.com/namsaeg/chainboard/internal/miner"
+	"github.com/namsaeg/chainboard/internal/nat"
 	"github.com/namsaeg/chainboard/internal/p2p"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -39,6 +44,18 @@ type Config struct {
 	PledgeBytes  uint64
 	SendDelayMax time.Duration // own transactions leave after a random delay up to this
 	Embargo      time.Duration // Dandelion++ embargo override (tests)
+	// NAT, if set, asks the home router to forward the listening port.
+	NAT *nat.Config
+	// Proxy carries outbound connections (Tor, Nym); with ProxyOnly the
+	// node never connects directly.
+	Proxy     *anonnet.Proxy
+	ProxyOnly bool
+	// TorControl, if set, publishes the listener as a Tor onion service
+	// (its key is kept in onion.key) and announces that address.
+	TorControl  string
+	TorPassword string
+	// Cover turns on cover traffic to the stem peer.
+	Cover p2p.CoverConfig
 	// TextCacheDays is how long post bodies (and data) are kept locally when
 	// this node does not store them as a miner; older ones are fetched when
 	// opened. 0 means 30.
@@ -46,10 +63,11 @@ type Config struct {
 	// TextWindowSec overrides how recent a block must be to need its
 	// bodies before it is accepted (tests).
 	TextWindowSec int64
-	// LikeFlushAfter overrides how long likes wait for their batch (tests).
-	LikeFlushAfter time.Duration
-	Params         *params.Params
-	Logf           func(string, ...any)
+	// Password locks the secret key files (wallet, membership, pseudonym);
+	// empty keeps them plain.
+	Password string
+	Params   *params.Params
+	Logf     func(string, ...any)
 }
 
 // Node is a running chainboard node.
@@ -77,6 +95,7 @@ type Node struct {
 	nextFree   time.Time
 	regFor     []uint64 // partitions we last registered
 	cancel     context.CancelFunc
+	ctx        context.Context // set by Start; done when the node stops
 	wg         sync.WaitGroup
 
 	fundMu sync.Mutex // guards funds
@@ -84,6 +103,7 @@ type Node struct {
 
 	likesMu        sync.Mutex // guards likes
 	likes          []QueuedLike
+	likeAuto       LikeAuto
 	likesFlush     sync.Mutex // one batch at a time
 	likeWarnLogged time.Time
 
@@ -124,11 +144,22 @@ func New(cfg Config) (*Node, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	wallet, err := cryptox.LoadOrCreateKey(filepath.Join(dir, "wallet.key"))
+	// Secret keys follow the password: with one, plain key files left by
+	// an older version are locked now; without one, locked files refuse.
+	if err := keystore.Check(dir, cfg.Password); err != nil {
+		return nil, err
+	}
+	if plain, _ := keystore.State(dir); cfg.Password != "" && len(plain) > 0 {
+		if err := keystore.Rekey(dir, cfg.Password, cfg.Password); err != nil {
+			return nil, err
+		}
+		cfg.Logf("node: locked %v with the password", plain)
+	}
+	wallet, err := loadKey(filepath.Join(dir, "wallet.key"), cfg.Password)
 	if err != nil {
 		return nil, err
 	}
-	nodeKey, err := cryptox.LoadOrCreateKey(filepath.Join(dir, "node.key"))
+	nodeKey, err := loadKey(filepath.Join(dir, "node.key"), "") // never locked: see keystore.SecretFiles
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +181,13 @@ func New(cfg Config) (*Node, error) {
 	}()
 	if ch.SetAside != "" {
 		cfg.Logf("node: the chain database belonged to another network; moved it to %s", ch.SetAside)
+		// What waited to be sent, queued likes, own funding requests and
+		// spent message ids all belong to that chain.
+		for _, name := range []string{"outbox.json", "likes.json", "fund.json", "rln_used.json"} {
+			if err := os.Remove(filepath.Join(dir, name)); err == nil {
+				cfg.Logf("node: dropped %s of the other network", name)
+			}
+		}
 	}
 	if dropped, err := st.UseGenesis(ch.Genesis()); err != nil {
 		return nil, err
@@ -167,7 +205,7 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	if k, err := os.Stat(filepath.Join(dir, "pseudonym.key")); err == nil && !k.IsDir() {
-		if n.pseudo, err = cryptox.LoadOrCreateKey(filepath.Join(dir, "pseudonym.key")); err != nil {
+		if n.pseudo, err = loadKey(filepath.Join(dir, "pseudonym.key"), cfg.Password); err != nil {
 			return nil, err
 		}
 	}
@@ -180,7 +218,7 @@ func New(cfg Config) (*Node, error) {
 	ch.Logf = cfg.Logf
 	host, err := p2p.New(p2p.Config{P: p, Chain: ch, Pool: n.Pool, Store: st,
 		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo,
-		Text: n.textBody})
+		Text: n.textBody, Funds: n, NAT: cfg.NAT, Proxy: cfg.Proxy, ProxyOnly: cfg.ProxyOnly, Cover: cfg.Cover})
 	if err != nil {
 		return nil, err
 	}
@@ -228,6 +266,12 @@ func (n *Node) Start() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
+	n.ctx = ctx
+	n.solveOwnFunds()
+	if n.cfg.TorControl != "" && n.Host.Addr() != "" {
+		n.wg.Add(1)
+		go n.onionLoop(ctx)
+	}
 	tips := n.Chain.Subscribe()
 	n.wg.Add(4)
 	go n.tipLoop(ctx, tips)
@@ -274,6 +318,7 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 			n.checkForeign(st)
 			n.tendOutbox(st)
 			n.tendFunds(st)
+			n.pruneFunds(st)
 			n.storageDuties(st)
 		case <-t.C:
 			n.storageDuties(n.Chain.Tip())
@@ -476,23 +521,33 @@ func (n *Node) finish(t *types.Tx) error {
 
 // Quote prices a fee-lane transaction at the current pending state: base fee,
 // storage and tip, without the amount it moves.
-func (n *Node) Quote(t *types.Tx) (uint64, error) {
+func (n *Node) Quote(t *types.Tx) (uint64, error) { return n.quoteAs(t, n.Wallet) }
+
+func (n *Node) quoteAs(t *types.Tx, k *cryptox.Key) (uint64, error) {
 	n.syncPool()
 	st := n.Pool.PendingState()
-	acc := st.Account(n.Wallet.Address())
+	st.Settle(k.Address(), st.Height+1) // what settles is not spent
+	acc := st.Account(k.Address())
 	acc.Balance = ^uint64(0) >> 2 // quote even without funds
 	start := acc.Balance
 	probe := *t
 	probe.Nonce = acc.Nonce
 	probe.MaxFee = ^uint64(0) >> 8
-	probe.Sign(n.Wallet)
+	probe.Sign(k)
 	if err := st.ApplyTx(&probe, st.NewCtx()); err != nil {
 		return 0, err
 	}
-	spent := start - st.Peek(n.Wallet.Address()).Balance
+	spent := start - st.Peek(k.Address()).Balance
 	switch t.Kind {
 	case types.TxTransfer, types.TxStake:
 		spent -= t.Amount
+	case types.TxLikes:
+		for _, p := range t.Pledges {
+			spent -= p.Amount
+		}
+		for _, p := range t.Tips {
+			spent -= p.Amount
+		}
 	}
 	return spent, nil
 }
@@ -654,4 +709,25 @@ func (n *Node) Upload(raw []byte, tier uint16, confirm bool) (UploadResult, erro
 		return UploadResult{Root: root}, err
 	}
 	return UploadResult{Root: root, Action: "upload", Until: st.BucketExpiry(st.BucketFor(st.Height+1, months, perm))}, nil
+}
+
+// loadKey reads an Ed25519 key (hex seed) from a key file, unlocking it
+// with password, and creates it (locked with password, if set) when absent.
+func loadKey(path, password string) (*cryptox.Key, error) {
+	b, err := keystore.Read(path, password)
+	if errors.Is(err, os.ErrNotExist) {
+		k, err := cryptox.NewKey()
+		if err != nil {
+			return nil, err
+		}
+		return k, keystore.Write(path, []byte(hex.EncodeToString(k.Priv.Seed())+"\n"), password)
+	}
+	if err != nil {
+		return nil, err
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(seed) != 32 {
+		return nil, fmt.Errorf("key file %s is corrupt", filepath.Base(path))
+	}
+	return cryptox.KeyFromSeed(seed), nil
 }

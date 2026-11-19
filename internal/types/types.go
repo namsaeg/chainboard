@@ -39,16 +39,20 @@ const (
 	TxRLNSlash          // unsigned: reveals a member's secret recovered from a double signal
 	TxFundUpload        // stores funded data, paid from its request's escrow (anyone may send)
 	TxFundProof         // proves the funded data's sampled sub-chunks, paid from the escrow
+	TxAnonLikes         // unsigned: a batch of anonymous likes, carrying an RLN like proof
 )
 
 var kindNames = [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "likes",
-	"anonpost", "rlnjoin", "rlnleave", "rlnslash", "fundupload", "fundproof"}
+	"anonpost", "rlnjoin", "rlnleave", "rlnslash", "fundupload", "fundproof", "anonlikes"}
 
 func (k TxKind) String() string { return kindNames[min(int(k), len(kindNames)-1)] }
 
 // Signed reports whether a kind is signed by an account. Anonymous posts and
 // slashes have no sender, nonce, fee or signature.
-func (k TxKind) Signed() bool { return k != TxAnonPost && k != TxRLNSlash }
+func (k TxKind) Signed() bool { return k != TxAnonPost && k != TxRLNSlash && k != TxAnonLikes }
+
+// Anonymous reports whether a kind travels the anonymous lane.
+func (k TxKind) Anonymous() bool { return k == TxAnonPost || k == TxAnonLikes }
 
 // Lane selects how a text transaction pays.
 type Lane uint8
@@ -60,7 +64,7 @@ const (
 
 // LaneOf is the lane a transaction uses.
 func (t *Tx) LaneOf() Lane {
-	if t.Kind == TxAnonPost {
+	if t.Kind.Anonymous() {
 		return LaneAnon
 	}
 	return LaneFee
@@ -119,7 +123,20 @@ type Pledge struct {
 	Amount  uint64
 }
 
-// MaxLikes bounds the entries (likes plus pledges) of one batch.
+// Tip is a like that also sends coins to the post's author. The chain does
+// not know who wrote a post (references are resolved by nodes), so the tip
+// names the receiver; nodes count it for the post only when the receiver is
+// the post's author (its signer, or its pseudonym's address).
+type Tip struct {
+	Ref    LikeRef
+	To     Address
+	Amount uint64
+}
+
+// MaxAnonLikes bounds an anonymous like batch (rln.LikeBatch).
+const MaxAnonLikes = 16
+
+// MaxLikes bounds the entries (likes, tips and pledges) of one batch.
 const MaxLikes = 256
 
 // MaxRLNProof bounds the encoded Groth16 proof.
@@ -152,8 +169,10 @@ type Tx struct {
 
 	Likes    []LikeRef      // likes
 	Pledges  []Pledge       // likes
+	Tips     []Tip          // likes
 	Requests []*FundRequest // likes: funding requests carried on chain with their first pledge
 	Samples  []FundSample   // fundproof
+	Tags     []Hash         // anonlikes: one per like (see rln.LikeTag)
 
 	// Text is the body of a post. It is not part of the encoding, ID or
 	// signature, which commit to TextHash: it travels next to the
@@ -224,6 +243,13 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 			w.Fixed(p.Request[:])
 			w.Var(p.Amount)
 		}
+		w.Var(uint64(len(t.Tips)))
+		for _, p := range t.Tips {
+			w.Var(p.Ref.Height)
+			w.Fixed(p.Ref.Prefix[:])
+			w.Fixed(p.To[:])
+			w.Var(p.Amount)
+		}
 		w.Var(uint64(len(t.Requests)))
 		for _, r := range t.Requests {
 			r.encodeBody(w)
@@ -247,6 +273,12 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 		w.U8(p.Sub)
 		w.Bytes(p.PackedSub)
 		chunk.EncodeProof(w, p.Path)
+	case TxAnonLikes:
+		encodeRefs(w, t.Likes)
+		for _, tag := range t.Tags {
+			w.Fixed(tag[:])
+		}
+		encodeRLN(w, t.RLN)
 	case TxAnonPost:
 		t.encodeAnonContent(w)
 		r := t.RLN
@@ -270,6 +302,24 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 	}
 }
 
+func encodeRLN(w *codec.Writer, r *RLNProof) {
+	w.Fixed(r.Root[:])
+	w.Var(r.Epoch)
+	w.Fixed(r.Nullifier[:])
+	w.Fixed(r.Y[:])
+	w.Bytes(r.Proof)
+}
+
+func decodeRLN(r *codec.Reader) *RLNProof {
+	p := &RLNProof{}
+	r.Fixed(p.Root[:])
+	p.Epoch = r.Var()
+	r.Fixed(p.Nullifier[:])
+	r.Fixed(p.Y[:])
+	p.Proof = r.Bytes(MaxRLNProof)
+	return p
+}
+
 // encodeAnonContent is what an anonymous post says: board, text (by hash),
 // tier, parent and the optional pseudonym key.
 func (t *Tx) encodeAnonContent(w *codec.Writer) {
@@ -289,8 +339,26 @@ func (t *Tx) encodeAnonContent(w *codec.Writer) {
 // Two posts with the same nullifier and different signals reveal the secret.
 func (t *Tx) Signal() Hash {
 	var w codec.Writer
+	if t.Kind == TxAnonLikes {
+		encodeRefs(&w, t.Likes)
+		return cryptox.Tagged("cb/anon/likes", w.B)
+	}
 	t.encodeAnonContent(&w)
 	return cryptox.Tagged("cb/anon/signal", w.B)
+}
+
+func encodeRefs(w *codec.Writer, refs []LikeRef) {
+	w.Var(uint64(len(refs)))
+	for _, l := range refs {
+		w.Var(l.Height)
+		w.Fixed(l.Prefix[:])
+	}
+}
+
+// Post is the field value a like proof names a post by: height << 32 |
+// the first four id bytes. Heights start at 1, so it is never 0.
+func (r LikeRef) Post() uint64 {
+	return r.Height<<32 | uint64(r.Prefix[0])<<24 | uint64(r.Prefix[1])<<16 | uint64(r.Prefix[2])<<8 | uint64(r.Prefix[3])
 }
 
 // PseudoHash is what a pseudonym key signs.
@@ -404,6 +472,15 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 			p.Amount = r.Var()
 			t.Pledges = append(t.Pledges, p)
 		}
+		n = r.Count(MaxLikes)
+		for i := 0; i < n && r.Err == nil; i++ {
+			var p Tip
+			p.Ref.Height = r.Var()
+			r.Fixed(p.Ref.Prefix[:])
+			r.Fixed(p.To[:])
+			p.Amount = r.Var()
+			t.Tips = append(t.Tips, p)
+		}
 		n = r.Count(MaxRequestsPerTx)
 		for i := 0; i < n && r.Err == nil; i++ {
 			t.Requests = append(t.Requests, decodeRequest(r))
@@ -427,6 +504,20 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		p.PackedSub = r.Bytes(params.SubChunkSize)
 		p.Path = chunk.DecodeProof(r)
 		t.Proof = p
+	case TxAnonLikes:
+		n := r.Count(MaxAnonLikes)
+		for i := 0; i < n && r.Err == nil; i++ {
+			var l LikeRef
+			l.Height = r.Var()
+			r.Fixed(l.Prefix[:])
+			t.Likes = append(t.Likes, l)
+		}
+		for i := 0; i < n && r.Err == nil; i++ {
+			var tag Hash
+			r.Fixed(tag[:])
+			t.Tags = append(t.Tags, tag)
+		}
+		t.RLN = decodeRLN(r)
 	case TxAnonPost:
 		t.Board = string(r.Bytes(params.MaxBoardBytes))
 		r.Fixed(t.TextHash[:])
@@ -630,6 +721,21 @@ func (t *Tx) CheckStateless() error {
 		return nil
 	case TxRLNSlash:
 		return nil
+	case TxAnonLikes:
+		if t.RLN == nil || len(t.RLN.Proof) == 0 || len(t.RLN.Proof) > MaxRLNProof {
+			return errors.New("anonymous likes need an RLN proof")
+		}
+		if len(t.Likes) == 0 || len(t.Likes) > MaxAnonLikes || len(t.Tags) != len(t.Likes) {
+			return fmt.Errorf("an anonymous like batch carries 1 to %d likes, each with a tag", MaxAnonLikes)
+		}
+		seen := map[LikeRef]bool{}
+		for i, l := range t.Likes {
+			if seen[l] || l.Height == 0 || l.Height >= 1<<31 || t.Tags[i].IsZero() {
+				return errors.New("anonymous likes: repeated or bad entry")
+			}
+			seen[l] = true
+		}
+		return nil
 	}
 	if len(t.From) != ed25519.PublicKeySize || len(t.Sig) != ed25519.SignatureSize {
 		return errors.New("bad key or signature length")
@@ -704,16 +810,27 @@ func (t *Tx) CheckStateless() error {
 }
 
 func checkLikes(t *Tx) error {
-	n := len(t.Likes) + len(t.Pledges)
+	n := len(t.Likes) + len(t.Pledges) + len(t.Tips)
 	if n == 0 || n > MaxLikes {
 		return fmt.Errorf("a like batch carries 1 to %d entries", MaxLikes)
 	}
-	seen := make(map[LikeRef]bool, len(t.Likes))
+	seen := make(map[LikeRef]bool, len(t.Likes)+len(t.Tips))
 	for _, l := range t.Likes {
 		if seen[l] {
 			return errors.New("the same post is liked twice in one batch")
 		}
 		seen[l] = true
+	}
+	for _, p := range t.Tips {
+		switch {
+		case seen[p.Ref]:
+			return errors.New("the same post is liked twice in one batch")
+		case p.Amount == 0 || p.To.IsZero():
+			return errors.New("a tip needs an amount and a receiver")
+		case p.To == t.Sender():
+			return errors.New("a tip to yourself")
+		}
+		seen[p.Ref] = true
 	}
 	pledged := make(map[Hash]bool, len(t.Pledges))
 	for _, p := range t.Pledges {

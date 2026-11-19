@@ -6,7 +6,6 @@ import (
 	mrand "math/rand"
 	"time"
 
-	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/mempool"
 	"github.com/namsaeg/chainboard/internal/types"
 )
@@ -23,7 +22,7 @@ func (h *Host) receiveFluff(from *peer, t *types.Tx, raw []byte) {
 		if errors.Is(err, mempool.ErrWaitingData) {
 			h.wait(t, from)
 		}
-		return
+		return // an orphan is relayed once it enters the pool (OnPromote)
 	}
 	h.broadcast(msgTx, raw, from)
 }
@@ -48,7 +47,7 @@ func (h *Host) receiveStem(t *types.Tx, raw []byte) {
 		return
 	}
 	h.armEmbargo(t, raw)
-	next.send(msgStemTx, raw)
+	h.sendStem(next, raw)
 }
 
 // SubmitOwn sends one of our own transactions. It never enters our pool
@@ -65,7 +64,7 @@ func (h *Host) SubmitOwn(t *types.Tx) error {
 		return h.fluffErr(t, raw)
 	}
 	h.armEmbargo(t, raw)
-	next.send(msgStemTx, raw)
+	h.sendStem(next, raw)
 	return nil
 }
 
@@ -76,8 +75,10 @@ func (h *Host) fluffErr(t *types.Tx, raw []byte) error {
 	h.cancelEmbargo(id)
 	h.markSeen(id)
 	if err := h.cfg.Pool.Add(t); err != nil {
-		if errors.Is(err, mempool.ErrWaitingData) {
-			h.wait(t, nil)
+		if errors.Is(err, mempool.ErrWaitingData) || errors.Is(err, mempool.ErrOrphan) {
+			if errors.Is(err, mempool.ErrWaitingData) {
+				h.wait(t, nil)
+			}
 			return nil
 		}
 		return err
@@ -185,7 +186,8 @@ func (h *Host) FetchData(root Hash, prefer *peer) {
 	for i, idx := range missing {
 		key := fmt.Sprintf("%s:%d", root, idx)
 		h.mu.Lock()
-		if last, ok := h.fetching[key]; ok && time.Since(last) < refetchAfter {
+		last, again := h.fetching[key]
+		if again && time.Since(last) < refetchAfter {
 			h.mu.Unlock()
 			continue
 		}
@@ -195,10 +197,13 @@ func (h *Host) FetchData(root Hash, prefer *peer) {
 		if prefer != nil && i%2 == 0 {
 			p = prefer
 		}
-		var w codec.Writer
-		w.Fixed(root[:])
-		w.Var(idx)
-		p.send(msgGetChunk, w.B)
+		// Asked again: no peer had it, so let the peer ask its own peers
+		// (a node behind NAT may hold it, reachable only through them).
+		ttl := uint8(0)
+		if again {
+			ttl = relayTTL
+		}
+		p.send(msgGetChunk, encodeGetChunk(root, idx, ttl))
 	}
 }
 

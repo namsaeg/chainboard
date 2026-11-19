@@ -72,8 +72,9 @@ func (s *State) campaign(id Hash) (*Campaign, bool) {
 	return &cp, true
 }
 
-// MinPledge is the smallest pledge: what its 32 state bytes cost as block
-// bytes, so pledges cannot be used to fill the state for nothing.
+// MinPledge is the smallest pledge or tip: what 32 state bytes cost as
+// block bytes, so neither can fill the state (pledge records, receiving
+// accounts) for nothing.
 func (s *State) MinPledge() uint64 { return 32 * s.PermByteFee() }
 
 func (s *State) checkRequest(r *types.FundRequest, h uint64) error {
@@ -94,6 +95,8 @@ func (s *State) checkRequest(r *types.FundRequest, h uint64) error {
 
 // checkPledges validates a batch's carried requests and pledges and returns
 // what it moves from the sender.
+// checkPledges checks a like batch's pledges and tips and returns the coins
+// they move out of the sender's balance.
 func (s *State) checkPledges(t *types.Tx, h uint64) (uint64, error) {
 	carried := map[Hash]*types.FundRequest{}
 	for _, r := range t.Requests {
@@ -105,6 +108,15 @@ func (s *State) checkPledges(t *types.Tx, h uint64) (uint64, error) {
 		carried[r.ID()] = r
 	}
 	var total uint64
+	for _, p := range t.Tips {
+		if p.Amount < s.MinPledge() {
+			return 0, fmt.Errorf("tip below the minimum %d", s.MinPledge())
+		}
+		total += p.Amount
+		if total < p.Amount {
+			return 0, errors.New("tips overflow")
+		}
+	}
 	for _, p := range t.Pledges {
 		if p.Amount < s.MinPledge() {
 			return 0, fmt.Errorf("pledge below the minimum %d", s.MinPledge())
@@ -133,6 +145,9 @@ func (s *State) applyPledges(t *types.Tx, from Address, h uint64) {
 		s.Funds.Set(id, &Campaign{Creator: r.CreatorAddr(), DataRoot: r.DataRoot, Size: r.Size, Media: r.Media,
 			MinTier: r.MinTier, Deadline: r.Deadline, Status: FundOpen})
 		s.due(r.Deadline, id)
+	}
+	for _, p := range t.Tips {
+		s.Account(p.To).Balance += p.Amount
 	}
 	for _, p := range t.Pledges {
 		c, _ := s.campaign(p.Request)

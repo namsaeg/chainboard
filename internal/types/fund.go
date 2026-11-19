@@ -2,8 +2,14 @@ package types
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
+	"runtime"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
@@ -146,4 +152,65 @@ func decodeSamples(r *codec.Reader) []FundSample {
 		out = append(out, s)
 	}
 	return out
+}
+
+// PoWBits is the work of a funding request's gossip nonce: the leading
+// zero bits of SHA-256(tag || id || nonce). Requests are gossiped before
+// any pledge carries them on chain, so this work is what makes a flood of
+// them cost something.
+func PoWBits(id Hash, nonce uint64) int {
+	var buf [32 + 32 + 8]byte
+	copy(buf[:32], powTag[:])
+	copy(buf[32:64], id[:])
+	binary.BigEndian.PutUint64(buf[64:], nonce)
+	h := sha256.Sum256(buf[:])
+	n := 0
+	for _, b := range h {
+		if b != 0 {
+			return n + bits.LeadingZeros8(b)
+		}
+		n += 8
+	}
+	return n
+}
+
+var powTag = sha256.Sum256([]byte("cb/fund/pow"))
+
+// SolvePoW finds a nonce of at least want bits, on all cores. It stops
+// early (returning false) when stop is closed.
+func SolvePoW(id Hash, want int, stop <-chan struct{}) (uint64, bool) {
+	workers := max(1, runtime.NumCPU())
+	found := make(chan uint64, workers)
+	done := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(done) }) }
+	defer finish()
+	var start [8]byte
+	_, _ = rand.Read(start[:])
+	base := binary.BigEndian.Uint64(start[:])
+	for w := 0; w < workers; w++ {
+		go func(n uint64) {
+			for i := 0; ; i++ {
+				if i&0xffff == 0 {
+					select {
+					case <-done:
+						return
+					default:
+					}
+				}
+				if PoWBits(id, n) >= want {
+					found <- n
+					finish()
+					return
+				}
+				n += uint64(workers)
+			}
+		}(base + uint64(w))
+	}
+	select {
+	case n := <-found:
+		return n, true
+	case <-stop:
+		return 0, false
+	}
 }

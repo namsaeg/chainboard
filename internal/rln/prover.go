@@ -158,6 +158,10 @@ func Verify(proof []byte, pub Public) error {
 	if err != nil {
 		return err
 	}
+	return verifyWith(v, proof, pub.vector())
+}
+
+func verifyWith(v *groth16.VerifyingKey, proof []byte, public fr.Vector) error {
 	if len(proof) == 0 || len(proof) > MaxProofSize {
 		return ErrProof
 	}
@@ -170,7 +174,7 @@ func Verify(proof []byte, pub Public) error {
 	if _, err := pr.WriteTo(&re); err != nil || !bytes.Equal(re.Bytes(), proof) {
 		return ErrProof // non-canonical encoding
 	}
-	if err := groth16.Verify(&pr, v, pub.vector()); err != nil {
+	if err := groth16.Verify(&pr, v, public); err != nil {
 		return ErrProof
 	}
 	return nil
@@ -190,13 +194,17 @@ const maxVerifiedCache = 1 << 16
 // VerifyCached is Verify with a cache of successes. key must commit to the
 // proof bytes and every public input.
 func VerifyCached(key [32]byte, proof []byte, pub Public) error {
+	return cached(key, func() error { return Verify(proof, pub) })
+}
+
+func cached(key [32]byte, verify func() error) error {
 	verified.Lock()
 	_, ok := verified.m[key]
 	verified.Unlock()
 	if ok {
 		return nil
 	}
-	if err := Verify(proof, pub); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
 	verified.Lock()

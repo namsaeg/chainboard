@@ -31,9 +31,15 @@ type PostView struct {
 	Time     int64    `json:"time"`
 	Likes    uint64   `json:"likes"`
 	Comments uint64   `json:"comments"`
-	Lane     string   `json:"lane"`                // "anon" or "fee"
-	Pseudo   bool     `json:"pseudonym,omitempty"` // author is a pseudonym key
-	Pending  bool     `json:"pending,omitempty"`
+	Tips     uint64   `json:"tips"`     // coins tipped to the author (base units)
+	Tippable bool     `json:"tippable"` // has an author address to tip
+	// Liked and LikedAnon: this node's like (signed, or anonymous by its
+	// member's tag) is counted.
+	Liked     bool   `json:"liked,omitempty"`
+	LikedAnon bool   `json:"liked_anon,omitempty"`
+	Lane      string `json:"lane"`                // "anon" or "fee"
+	Pseudo    bool   `json:"pseudonym,omitempty"` // author is a pseudonym key
+	Pending   bool   `json:"pending,omitempty"`
 	// Retention of the text: tier code, the height it is kept until (0 is
 	// permanent) and whether the body is here ("ok"), being fetched
 	// ("loading") or past its retention ("expired").
@@ -80,7 +86,7 @@ var (
 	ixData     = []byte("data")     // data root -> height first placed
 	ixUndo     = []byte("undo")     // height -> what that block added
 	ixAt       = []byte("at")       // height id -> nil (resolves like references)
-	ixLiked    = []byte("liked")    // post id, account -> 1
+	ixLiked    = []byte("liked")    // post id, account (or anonymous like tag) -> 1
 	ixStats    = []byte("stats")    // post id -> likes (u64) comments (u64)
 	ixMeta     = []byte("meta")     // "chain" -> format and genesis
 )
@@ -234,10 +240,11 @@ func (r *postRec) view() PostView {
 	if r.Fund {
 		v.Text, v.Lane = r.Note, "fund"
 	}
+	v.Tippable = !r.Fund
 	if r.Anon {
-		v.Lane, v.Author = "anon", ""
+		v.Lane, v.Author, v.Tippable = "anon", "", false
 		if r.Pseudo {
-			v.Author, v.Pseudo = r.Author.String(), true
+			v.Author, v.Pseudo, v.Tippable = r.Author.String(), true, true
 		}
 	}
 	if !r.Parent.IsZero() {
@@ -342,6 +349,8 @@ const (
 	undoData = 1 // data root first placed
 	undoPost = 2 // post indexed
 	undoLike = 3 // like counted: post id, account
+	undoAnon = 4 // anonymous like counted: post id, tag
+	undoTip  = 5 // tip counted: post id, amount
 )
 
 // indexBlock records one block and remembers how to undo it. It returns
@@ -385,14 +394,8 @@ func indexBlock(tx *bolt.Tx, b *types.Block, h, likeWindow uint64) ([]cryptox.Ha
 				if tx.Bucket(ixPosts).Get(p.Request[:]) == nil {
 					continue
 				}
-				added, err := addLike(tx, p.Request, from)
-				if err != nil {
+				if err := countLike(tx, &undo, undoLike, p.Request, from[:]); err != nil {
 					return nil, 0, err
-				}
-				if added {
-					undo.U8(undoLike)
-					undo.Fixed(p.Request[:])
-					undo.Fixed(from[:])
 				}
 			}
 			for _, ref := range t.Likes {
@@ -400,14 +403,25 @@ func indexBlock(tx *bolt.Tx, b *types.Block, h, likeWindow uint64) ([]cryptox.Ha
 				if !ok || (likeWindow > 0 && h > ref.Height+likeWindow) {
 					continue
 				}
-				added, err := addLike(tx, id, from)
-				if err != nil {
+				if err := countLike(tx, &undo, undoLike, id, from[:]); err != nil {
 					return nil, 0, err
 				}
-				if added {
-					undo.U8(undoLike)
-					undo.Fixed(id[:])
-					undo.Fixed(from[:])
+			}
+			for _, p := range t.Tips {
+				if err := countTip(tx, &undo, p, from, h, likeWindow); err != nil {
+					return nil, 0, err
+				}
+			}
+		case t.Kind == types.TxAnonLikes:
+			// Counted once per (post, tag): a member's tag for a post never
+			// changes, and says nothing about its other likes.
+			for i, ref := range t.Likes {
+				id, ok := resolveRef(tx, ref)
+				if !ok || (likeWindow > 0 && h > ref.Height+likeWindow) {
+					continue
+				}
+				if err := countLike(tx, &undo, undoAnon, id, t.Tags[i][:]); err != nil {
+					return nil, 0, err
 				}
 			}
 		case t.IsPost():
@@ -458,42 +472,75 @@ func resolveRef(tx *bolt.Tx, ref types.LikeRef) (cryptox.Hash, bool) {
 	return id, true
 }
 
-func likedKey(id cryptox.Hash, a cryptox.Address) []byte {
-	return append(append(make([]byte, 0, 52), id[:]...), a[:]...)
+// likedKey names one like: the post and who liked it, an account (20
+// bytes) or an anonymous tag (32 bytes), so the two never collide.
+func likedKey(id cryptox.Hash, who []byte) []byte {
+	return append(append(make([]byte, 0, 64), id[:]...), who...)
 }
 
-// addLike counts one account's like of a post once.
-func addLike(tx *bolt.Tx, id cryptox.Hash, from cryptox.Address) (bool, error) {
+// countLike counts one like of a post once per liker, noting how to undo it.
+func countLike(tx *bolt.Tx, undo *codec.Writer, kind uint8, id cryptox.Hash, who []byte) error {
 	lb := tx.Bucket(ixLiked)
-	k := likedKey(id, from)
+	k := likedKey(id, who)
 	if lb.Get(k) != nil {
-		return false, nil
+		return nil
 	}
 	if err := lb.Put(k, []byte{1}); err != nil { // a nil value reads back as absent
-		return false, err
+		return err
 	}
-	return true, addStat(tx, id, 1, 0)
+	undo.U8(kind)
+	undo.Fixed(k)
+	return addStat(tx, id, 1, 0, 0)
+}
+
+// countTip counts a tip for its post when it went to the post's author: the
+// coins always (whenever they came), the like within the like window.
+func countTip(tx *bolt.Tx, undo *codec.Writer, p types.Tip, from cryptox.Address, h, likeWindow uint64) error {
+	id, ok := resolveRef(tx, p.Ref)
+	if !ok {
+		return nil
+	}
+	r, err := decodeRec(id, tx.Bucket(ixPosts).Get(id[:]))
+	if err != nil || r.Fund || r.Author != p.To || (r.Anon && !r.Pseudo) {
+		return nil
+	}
+	if err := addStat(tx, id, 0, 0, int64(p.Amount)); err != nil {
+		return err
+	}
+	undo.U8(undoTip)
+	undo.Fixed(id[:])
+	undo.Fixed(u64(p.Amount))
+	if likeWindow > 0 && h > p.Ref.Height+likeWindow {
+		return nil
+	}
+	return countLike(tx, undo, undoLike, id, from[:])
 }
 
 // addStat moves a post's like and comment counts.
-func addStat(tx *bolt.Tx, id cryptox.Hash, likes, comments int64) error {
+// postStats are a post's counts: likes, comments and coins tipped.
+type postStats struct{ likes, comments, tips uint64 }
+
+func addStat(tx *bolt.Tx, id cryptox.Hash, likes, comments, tips int64) error {
 	sb := tx.Bucket(ixStats)
-	var l, c uint64
-	if v := sb.Get(id[:]); len(v) == 16 {
-		l, c = binary.BigEndian.Uint64(v), binary.BigEndian.Uint64(v[8:])
-	}
-	l, c = uint64(int64(l)+likes), uint64(int64(c)+comments)
-	if l == 0 && c == 0 {
+	st := stats(tx, id)
+	st.likes = uint64(int64(st.likes) + likes)
+	st.comments = uint64(int64(st.comments) + comments)
+	st.tips = uint64(int64(st.tips) + tips)
+	if st == (postStats{}) {
 		return sb.Delete(id[:])
 	}
-	return sb.Put(id[:], binary.BigEndian.AppendUint64(u64(l), c))
+	return sb.Put(id[:], binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint64(u64(st.likes), st.comments), st.tips))
 }
 
-func stats(tx *bolt.Tx, id cryptox.Hash) (likes, comments uint64) {
-	if v := tx.Bucket(ixStats).Get(id[:]); len(v) == 16 {
-		return binary.BigEndian.Uint64(v), binary.BigEndian.Uint64(v[8:])
+func stats(tx *bolt.Tx, id cryptox.Hash) postStats {
+	if v := tx.Bucket(ixStats).Get(id[:]); len(v) == 24 {
+		return postStats{binary.BigEndian.Uint64(v), binary.BigEndian.Uint64(v[8:]), binary.BigEndian.Uint64(v[16:])}
 	}
-	return 0, 0
+	return postStats{}
+}
+
+func (v *PostView) setStats(st postStats) {
+	v.Likes, v.Comments, v.Tips = st.likes, st.comments, st.tips
 }
 
 func putPost(tx *bolt.Tx, r *postRec) error {
@@ -509,7 +556,7 @@ func putPost(tx *bolt.Tx, r *postRec) error {
 		}
 	}
 	if !r.Parent.IsZero() {
-		if err := addStat(tx, r.Parent, 0, 1); err != nil {
+		if err := addStat(tx, r.Parent, 0, 1, 0); err != nil {
 			return err
 		}
 		return tx.Bucket(ixComments).Put(commentKey(r.Parent, r.Height, r.ID), nil)
@@ -535,7 +582,7 @@ func undoHeight(tx *bolt.Tx, h uint64) error {
 	type change struct {
 		kind uint8
 		id   cryptox.Hash
-		from cryptox.Address
+		who  []byte
 	}
 	var changes []change
 	raw := tx.Bucket(ixUndo).Get(u64(h))
@@ -543,9 +590,15 @@ func undoHeight(tx *bolt.Tx, h uint64) error {
 	for rd.Err == nil && len(raw) > 0 && !rd.AtEnd() {
 		c := change{kind: rd.U8()}
 		rd.Fixed(c.id[:])
-		if c.kind == undoLike {
-			rd.Fixed(c.from[:])
+		switch c.kind {
+		case undoLike:
+			c.who = make([]byte, len(cryptox.Address{}))
+		case undoAnon:
+			c.who = make([]byte, len(cryptox.Hash{}))
+		case undoTip:
+			c.who = make([]byte, 8)
 		}
+		rd.Fixed(c.who)
 		changes = append(changes, c)
 	}
 	for i := len(changes) - 1; i >= 0; i-- {
@@ -554,10 +607,12 @@ func undoHeight(tx *bolt.Tx, h uint64) error {
 		switch c.kind {
 		case undoData:
 			err = tx.Bucket(ixData).Delete(c.id[:])
-		case undoLike:
-			if err = tx.Bucket(ixLiked).Delete(likedKey(c.id, c.from)); err == nil {
-				err = addStat(tx, c.id, -1, 0)
+		case undoLike, undoAnon:
+			if err = tx.Bucket(ixLiked).Delete(likedKey(c.id, c.who)); err == nil {
+				err = addStat(tx, c.id, -1, 0, 0)
 			}
+		case undoTip:
+			err = addStat(tx, c.id, 0, 0, -int64(binary.BigEndian.Uint64(c.who)))
 		case undoPost:
 			err = removePost(tx, c.id)
 		}
@@ -589,7 +644,7 @@ func removePost(tx *bolt.Tx, x cryptox.Hash) error {
 	}
 	if !r.Parent.IsZero() {
 		_ = tx.Bucket(ixComments).Delete(commentKey(r.Parent, r.Height, x))
-		return addStat(tx, r.Parent, 0, -1)
+		return addStat(tx, r.Parent, 0, -1, 0)
 	}
 	_ = tx.Bucket(ixBoard).Delete(boardKey(r.Board, r.Height, x))
 	return addCount(tx, r.Board, -1)
@@ -656,7 +711,7 @@ func (ix *Index) post(id cryptox.Hash) (PostView, bool) {
 		var r *postRec
 		if r, ok = ix.get(tx, id); ok {
 			v = r.view()
-			v.Likes, v.Comments = stats(tx, id)
+			v.setStats(stats(tx, id))
 		}
 		return nil
 	})
@@ -664,10 +719,14 @@ func (ix *Index) post(id cryptox.Hash) (PostView, bool) {
 }
 
 // Liked reports whether an account's like of a post is counted.
-func (ix *Index) Liked(id cryptox.Hash, a cryptox.Address) bool {
+func (ix *Index) Liked(id cryptox.Hash, a cryptox.Address) bool { return ix.LikedBy(id, a[:]) }
+
+// LikedBy reports whether a like of a post by an account or an anonymous
+// tag is counted.
+func (ix *Index) LikedBy(id cryptox.Hash, who []byte) bool {
 	ok := false
 	_ = ix.db.View(func(tx *bolt.Tx) error {
-		ok = tx.Bucket(ixLiked).Get(likedKey(id, a)) != nil
+		ok = tx.Bucket(ixLiked).Get(likedKey(id, who)) != nil
 		return nil
 	})
 	return ok
@@ -707,7 +766,7 @@ func (ix *Index) Board(board string, minLikes uint64, limit int) []PostView {
 				continue
 			}
 			v := r.view()
-			v.Likes, v.Comments = stats(tx, id)
+			v.setStats(stats(tx, id))
 			if v.Likes >= minLikes {
 				out = append(out, v)
 			}
@@ -727,7 +786,7 @@ func (ix *Index) Thread(id cryptox.Hash) (*PostView, []PostView) {
 			return nil
 		}
 		v := r.view()
-		v.Likes, v.Comments = stats(tx, id)
+		v.setStats(stats(tx, id))
 		p = &v
 		c := tx.Bucket(ixComments).Cursor()
 		for k, _ := c.Seek(id[:]); k != nil && bytes.HasPrefix(k, id[:]); k, _ = c.Next() {
@@ -735,7 +794,7 @@ func (ix *Index) Thread(id cryptox.Hash) (*PostView, []PostView) {
 			copy(cid[:], k[40:])
 			if cr, ok := ix.get(tx, cid); ok {
 				cv := cr.view()
-				cv.Likes, cv.Comments = stats(tx, cid)
+				cv.setStats(stats(tx, cid))
 				cs = append(cs, cv)
 			}
 		}
@@ -776,6 +835,9 @@ func (n *Node) PendingPosts() []PostView {
 		add(t)
 	}
 	for _, a := range n.ownAnon(false) {
+		if len(a.Likes) > 0 {
+			continue
+		}
 		v := PostView{Board: a.Board, Text: a.Text, Lane: "anon", Pseudo: a.Pseudo, Pending: true}
 		if !a.Parent.IsZero() {
 			v.Parent = a.Parent.String()

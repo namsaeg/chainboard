@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
-	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/merkle"
 )
 
@@ -39,6 +38,14 @@ func (h *Host) Probe(root Hash, size uint64, idx []uint64) {
 	h.askProbe(root)
 }
 
+// Probing reports whether a spot check of root is under way (or recent).
+func (h *Host) Probing(root Hash) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	p, ok := h.probes[root]
+	return ok && time.Since(p.at) <= probeLife
+}
+
 // askProbe asks every peer for the probe's chunks that have not arrived,
 // at most once every few seconds (peers may connect after the probe began).
 func (h *Host) askProbe(root Hash) {
@@ -47,6 +54,10 @@ func (h *Host) askProbe(root Hash) {
 	if !ok || time.Since(pr.sentAt) < 3*time.Second {
 		h.mu.Unlock()
 		return
+	}
+	ttl := uint8(0)
+	if !pr.sentAt.IsZero() {
+		ttl = relayTTL // asked before and still missing: let peers ask theirs
 	}
 	pr.sentAt = time.Now()
 	var idx []uint64
@@ -61,11 +72,9 @@ func (h *Host) askProbe(root Hash) {
 	}
 	h.mu.Unlock()
 	for _, i := range idx {
-		var w codec.Writer
-		w.Fixed(root[:])
-		w.Var(i)
+		msg := encodeGetChunk(root, i, ttl)
 		for _, p := range ps {
-			p.send(msgGetChunk, w.B)
+			p.send(msgGetChunk, msg)
 		}
 	}
 }

@@ -117,8 +117,16 @@ func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 	for i := range vs {
 		n.fillText(&vs[i], tip)
 		n.fillFund(&vs[i], tip)
+		n.fillLiked(&vs[i])
 	}
 	return vs
+}
+
+// fillLiked marks the posts this node's wallet, or its anonymous member,
+// has liked (counted on chain).
+func (n *Node) fillLiked(v *PostView) {
+	v.Liked = n.Index.Liked(v.id, n.Wallet.Address())
+	v.LikedAnon = v.Lane != "fund" && n.LikedAnon(v.id, v.Height)
 }
 
 // Thread returns a post and its comments with their bodies.
@@ -130,8 +138,10 @@ func (n *Node) Thread(id cryptox.Hash) (*PostView, []PostView) {
 	}
 	n.fillText(p, tip)
 	n.fillFund(p, tip)
+	n.fillLiked(p)
 	for i := range cs {
 		n.fillText(&cs[i], tip)
+		n.fillLiked(&cs[i])
 	}
 	return p, cs
 }

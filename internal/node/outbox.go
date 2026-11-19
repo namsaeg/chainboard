@@ -31,10 +31,11 @@ type outboxTx struct {
 }
 
 type outboxAnon struct {
-	Board  string `json:"board"`
-	Text   string `json:"text"`
-	Parent string `json:"parent,omitempty"`
-	Pseudo bool   `json:"pseudo,omitempty"`
+	Board  string          `json:"board"`
+	Text   string          `json:"text"`
+	Parent string          `json:"parent,omitempty"`
+	Pseudo bool            `json:"pseudo,omitempty"`
+	Likes  []types.LikeRef `json:"likes,omitempty"`
 }
 
 func (n *Node) outboxSnapshot() []byte {
@@ -55,7 +56,7 @@ func (n *Node) outboxSnapshot() []byte {
 		f.Txs = append(f.Txs, outboxTx{Raw: hex.EncodeToString(t.EncodeWire()), Sent: true})
 	}
 	for _, r := range n.ownAnon(true) {
-		a := outboxAnon{Board: r.Board, Text: r.Text, Pseudo: r.Pseudo}
+		a := outboxAnon{Board: r.Board, Text: r.Text, Pseudo: r.Pseudo, Likes: r.Likes}
 		if !r.Parent.IsZero() {
 			a.Parent = r.Parent.String()
 		}
@@ -108,7 +109,7 @@ func (n *Node) loadOutbox() {
 		}
 	}
 	for _, a := range f.Anon {
-		req := AnonRequest{Board: a.Board, Text: a.Text, Pseudo: a.Pseudo}
+		req := AnonRequest{Board: a.Board, Text: a.Text, Pseudo: a.Pseudo, Likes: a.Likes}
 		if a.Parent != "" {
 			h, err := cryptox.ParseHash(a.Parent)
 			if err != nil {

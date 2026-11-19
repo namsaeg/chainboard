@@ -68,6 +68,13 @@ func (s *State) settle(a *Account, h uint64) {
 	}
 }
 
+// Settle applies to an account what height h releases (matured stake,
+// ended unbonding, vested rewards), as its next transaction would.
+func (s *State) Settle(a Address, h uint64) {
+	acc := s.Account(a)
+	s.settle(acc, h)
+}
+
 // dupMultiplier is the repeat surcharge of a post: 2^n when the same text
 // (by hash, from anyone) already appeared n times in the window. Texts
 // shorter than DupMinBytes are not counted: short replies are common.
@@ -153,6 +160,10 @@ func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash, bucket uint32) {
 	}
 }
 
+// ErrFutureNonce: an earlier transaction of the sender has not applied yet
+// (it may still be on its way).
+var ErrFutureNonce = errors.New("nonce ahead of the account")
+
 // ApplyTx validates and applies one transaction. It is atomic: on error
 // neither the state nor ctx is modified.
 func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
@@ -162,6 +173,8 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	switch t.Kind {
 	case types.TxAnonPost:
 		return s.applyAnon(t, ctx)
+	case types.TxAnonLikes:
+		return s.applyAnonLikes(t, ctx)
 	case types.TxRLNSlash:
 		return s.applySlash(t, ctx)
 	}
@@ -175,6 +188,9 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	}
 	s.settle(acc, h)
 	if t.Nonce != acc.Nonce {
+		if t.Nonce > acc.Nonce {
+			return fmt.Errorf("%w: have %d want %d", ErrFutureNonce, t.Nonce, acc.Nonce)
+		}
 		return fmt.Errorf("bad nonce: have %d want %d", t.Nonce, acc.Nonce)
 	}
 	size := uint64(t.LaneSize())
@@ -192,7 +208,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		burstMul = s.BurstMultiplier(burstScore)
 	}
 	cost := TxCost{Tip: t.Tip}
-	var pledged uint64 // moved into funding escrows
+	var pledged uint64 // moved into funding escrows or tipped
 	var fund *Campaign // funded upload or proof: its fees come from the escrow
 	var fundBase, fundHeld uint64
 	var fundTier uint16

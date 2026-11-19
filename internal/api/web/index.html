@@ -16,6 +16,16 @@
     <div class="card">
       <h2>지갑</h2>
       <div id="wallet" class="mono small"></div>
+      <div id="likeQueue" class="small"></div>
+      <details class="small"><summary id="autoSummary">좋아요 자동 보내기: 끔</summary>
+        <form id="autoForm">
+          <label>대기 시간 <select name="minutes"><option value="0">안 씀</option><option value="10">10분</option>
+            <option value="60">1시간</option><option value="1440">하루</option></select></label>
+          <label>또는 <input name="count" type="number" min="0" max="256" value="0" style="width:4.5em">개 모이면</label>
+          <button>저장</button>
+        </form>
+        <p class="muted">좋아요는 직접 보낼 때까지 기다려요. 자주 나눠 보내면 묶음마다 수수료가 붙어 더 비싸져요.</p>
+      </details>
       <details><summary>예치 · 송금</summary>
         <form id="stakeForm"><input name="amount" placeholder="코인 수량" required>
           <button data-op="stake">예치</button><button data-op="unstake">예치 해제</button></form>
@@ -28,10 +38,16 @@
       <div id="rln" class="small"></div>
       <form id="rlnJoinForm"><input name="amount" placeholder="보증금 (코인)" required>
         <button>등록</button></form>
-      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1시간에 익명 글을 보증금만큼 쓸 수 있어요(최대 30개). 1개당 보증금은 저장 가격을 따르고, 익명 차선이 많이 예약될수록 커져요. 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
+      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1시간에 익명 메시지를 보증금만큼 보낼 수 있어요(최대 30개). 익명 글 1개, 또는 익명 좋아요 최대 16개 묶음 1개가 메시지 1개예요. 1개당 보증금은 저장 가격을 따르고, 익명 차선이 많이 예약될수록 커져요. 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
       <div id="rlnForeign" class="warn" hidden>다른 기기에서 같은 익명 키로 글을 쓰고 있어요. 두 기기가 같은 번호를 쓰면 보증금이 몰수돼요. 이 노드의 익명 글쓰기를 멈췄어요.
         <button id="rlnAck" class="small">한 기기에서만 쓸게요</button></div>
       <button id="rlnLeave" class="small">등록 해제</button>
+      <div id="pseudoBox" class="small" hidden>
+        <div><span class="muted">가명이 받은 후원 </span><span id="pseudoBal"></span> 코인</div>
+        <form id="pseudoForm"><input name="to" placeholder="받을 주소 (비우면 이 지갑)"><input name="amount" placeholder="코인 수량" required>
+          <button>가명 잔액 보내기</button></form>
+        <p class="muted">가명 주소는 체인에 공개돼요. 이 코인을 지갑으로 옮기면 가명과 지갑이 연결돼요.</p>
+      </div>
     </div>
     <div class="card">
       <h2>크라우드 펀딩</h2>
@@ -45,7 +61,7 @@
           <input name="days" type="number" min="1" max="30" value="14" title="마감까지 일수"> 일 안에
           <button>요청 만들기</button>
         </form>
-        <p class="small muted">코인이 없어도 돼요. 파일은 이 노드에만 두고, 서명한 요청 코드를 나눠 주세요. 첫 후원자가 요청을 체인에 올려요. 모인 코인은 이 파일을 저장하는 데만 쓰이고, 기간 안에 올리지 못하면 후원자에게 돌아가요.</p>
+        <p class="small muted">코인이 없어도 돼요. 파일은 이 노드에만 두고, 요청은 작업증명(몇 초~수십 초)을 마치면 모든 노드의 "진행 중인 크라우드 펀딩" 목록에 올라가요. 요청 코드를 다른 곳에 나눠도 돼요. 첫 후원자가 요청을 체인에 올려요. 모인 코인은 이 파일을 저장하는 데만 쓰이고, 기간 안에 올리지 못하면 후원자에게 돌아가요.</p>
         <textarea id="fundCode" class="mono small" readonly hidden></textarea>
       </details>
       <details><summary>요청 코드로 후원하기</summary>
@@ -59,11 +75,19 @@
       <form id="boardForm"><input name="name" placeholder="게시판 이름" maxlength="32" required><button>열기</button></form>
     </div>
     <div class="card">
+      <h2>연결</h2>
+      <div id="netInfo" class="small"></div>
+    </div>
+    <div class="card">
       <h2>채굴</h2>
       <div id="mining" class="small"></div>
     </div>
   </section>
   <section id="content">
+    <div class="card" id="fundsCard">
+      <h2>진행 중인 크라우드 펀딩</h2>
+      <div id="fundList" class="small muted">불러오는 중…</div>
+    </div>
     <div class="card" id="composeCard">
       <h2 id="boardTitle">게시판을 고르세요</h2>
       <label class="small"><input type="checkbox" id="bestOnly"> 개념글만 (좋아요 <input id="minLikes" type="number" value="3" min="1" style="width:4em">개 이상)</label>
@@ -94,6 +118,21 @@
     <div id="posts"></div>
   </section>
 </main>
+<dialog id="likeDlg">
+  <form method="dialog" id="likeForm">
+    <h2 id="likeTitle">좋아요</h2>
+    <div id="likeInfo" class="small muted"></div>
+    <label class="row">후원 <input name="amount" inputmode="decimal" placeholder="0" style="width:9em"> 코인</label>
+    <div id="likeMin" class="small muted"></div>
+    <label class="small" id="likeAnonRow"><input type="checkbox" name="anon"> 익명으로 (코인 없이 좋아요만, 익명 메시지 1개 사용)</label>
+    <div id="likeNote" class="small"></div>
+    <div class="row">
+      <button value="queue">담기</button>
+      <button value="now">바로 보내기</button>
+      <button value="cancel" class="plain" formnovalidate>취소</button>
+    </div>
+  </form>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>
