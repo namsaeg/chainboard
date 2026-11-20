@@ -328,7 +328,16 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 	}
 	p := &peer{h: h, conn: c, out: out, addr: addr, id: peerKey(c.ConnectionState()), height: them.Height, sendCh: make(chan frame, 256), quit: make(chan struct{})}
 	h.mu.Lock()
-	if h.isBannedLocked(p.id, addr) {
+	stopping := false
+	select {
+	case <-h.quit:
+		stopping = true
+	default:
+	}
+	// A handshake that ends while the host stops must not add a peer that
+	// Stop has not seen: its loops would keep Stop waiting until the peer's
+	// read deadline.
+	if stopping || h.isBannedLocked(p.id, addr) {
 		h.mu.Unlock()
 		c.Close()
 		return
@@ -337,8 +346,8 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 	if addr != "" {
 		h.known[addr] = true
 	}
+	h.wg.Add(2) // under h.mu: Stop's Wait comes after it has closed every listed peer
 	h.mu.Unlock()
-	h.wg.Add(2)
 	go p.writeLoop()
 	go p.readLoop()
 	p.send(msgGetPeers, nil)
