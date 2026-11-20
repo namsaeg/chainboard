@@ -8,123 +8,216 @@
 </head>
 <body>
 <header>
-  <h1>chainboard <small id="ver"></small></h1>
-  <div id="status" class="muted">연결 중…</div>
+  <div class="top">
+    <h1>chainboard <small id="ver"></small></h1>
+    <div id="status" class="muted small">연결 중…</div>
+  </div>
+  <nav id="nav">
+    <a data-page="board">게시판</a>
+    <a data-page="funds">크라우드 펀딩</a>
+    <a data-page="bounties">현상금</a>
+    <a data-page="wallet">지갑</a>
+    <a data-page="activity">내 활동</a>
+    <a data-page="settings">설정</a>
+  </nav>
 </header>
-<main>
-  <section id="side">
-    <div class="card">
-      <h2>지갑</h2>
-      <div id="wallet" class="mono small"></div>
-      <div id="likeQueue" class="small"></div>
-      <details class="small"><summary id="autoSummary">좋아요 자동 보내기: 끔</summary>
-        <form id="autoForm">
-          <label>대기 시간 <select name="minutes"><option value="0">안 씀</option><option value="10">10분</option>
-            <option value="60">1시간</option><option value="1440">하루</option></select></label>
-          <label>또는 <input name="count" type="number" min="0" max="256" value="0" style="width:4.5em">개 모이면</label>
-          <button>저장</button>
-        </form>
-        <p class="muted">좋아요는 직접 보낼 때까지 기다려요. 자주 나눠 보내면 묶음마다 수수료가 붙어 더 비싸져요.</p>
-      </details>
-      <details><summary>예치 · 송금</summary>
-        <form id="stakeForm"><input name="amount" placeholder="코인 수량" required>
-          <button data-op="stake">예치</button><button data-op="unstake">예치 해제</button></form>
-        <form id="sendForm"><input name="to" placeholder="cb1… 주소" required><input name="amount" placeholder="코인 수량" required>
-          <button>송금</button></form>
-      </details>
-    </div>
-    <div class="card">
-      <h2>익명 글쓰기</h2>
-      <div id="rln" class="small"></div>
-      <form id="rlnJoinForm"><input name="amount" placeholder="보증금 (코인)" required>
-        <button>등록</button></form>
-      <p class="small muted">숙성된 예치금에서 보증금을 걸면, 1시간에 익명 메시지를 보증금만큼 보낼 수 있어요(최대 30개). 익명 글 1개, 또는 익명 좋아요 최대 16개 묶음 1개가 메시지 1개예요. 1개당 보증금은 저장 가격을 따르고, 익명 차선이 많이 예약될수록 커져요. 한도를 넘겨 같은 번호로 다른 글을 쓰면 비밀키가 드러나 보증금이 몰수돼요.</p>
-      <div id="rlnForeign" class="warn" hidden>다른 기기에서 같은 익명 키로 글을 쓰고 있어요. 두 기기가 같은 번호를 쓰면 보증금이 몰수돼요. 이 노드의 익명 글쓰기를 멈췄어요.
-        <button id="rlnAck" class="small">한 기기에서만 쓸게요</button></div>
-      <button id="rlnLeave" class="small">등록 해제</button>
-      <div id="pseudoBox" class="small" hidden>
-        <div><span class="muted">가명이 받은 후원 </span><span id="pseudoBal"></span> 코인</div>
-        <form id="pseudoForm"><input name="to" placeholder="받을 주소 (비우면 이 지갑)"><input name="amount" placeholder="코인 수량" required>
-          <button>가명 잔액 보내기</button></form>
-        <p class="muted">가명 주소는 체인에 공개돼요. 이 코인을 지갑으로 옮기면 가명과 지갑이 연결돼요.</p>
-      </div>
-    </div>
-    <div class="card">
-      <h2>크라우드 펀딩</h2>
-      <details><summary>모금 요청 만들기</summary>
-        <form id="fundNewForm">
-          <input type="file" name="file" accept="image/png,image/jpeg,image/gif" required>
-          <input name="board" placeholder="게시판" maxlength="32" required>
-          <textarea name="note" maxlength="300" placeholder="무엇을 남기려는지 (300바이트까지)"></textarea>
-          <select name="tier" title="최소 보존 기간"><option value="1y">최소 1년</option><option value="5y">최소 5년</option>
-            <option value="20y">최소 20년</option><option value="perm" selected>영구</option></select>
-          <input name="days" type="number" min="1" max="30" value="14" title="마감까지 일수"> 일 안에
-          <button>요청 만들기</button>
-        </form>
-        <p class="small muted">코인이 없어도 돼요. 파일은 이 노드에만 두고, 요청은 작업증명(몇 초~수십 초)을 마치면 모든 노드의 "진행 중인 크라우드 펀딩" 목록에 올라가요. 요청 코드를 다른 곳에 나눠도 돼요. 첫 후원자가 요청을 체인에 올려요. 모인 코인은 이 파일을 저장하는 데만 쓰이고, 기간 안에 올리지 못하면 후원자에게 돌아가요.</p>
-        <textarea id="fundCode" class="mono small" readonly hidden></textarea>
-      </details>
-      <details><summary>요청 코드로 후원하기</summary>
-        <form id="fundCheckForm"><textarea name="code" class="mono small" placeholder="요청 코드 붙여넣기" required></textarea><button>확인</button></form>
-        <div id="fundCheck" class="small"></div>
-      </details>
-    </div>
+
+<!-- 게시판 -->
+<main class="page split" id="page-board">
+  <section class="side">
     <div class="card">
       <h2>게시판</h2>
-      <ul id="boards"></ul>
-      <form id="boardForm"><input name="name" placeholder="게시판 이름" maxlength="32" required><button>열기</button></form>
+      <ul id="boards" class="links"></ul>
+      <form id="boardForm" class="row"><input name="name" placeholder="게시판 이름" maxlength="32" required><button>열기</button></form>
     </div>
-    <div class="card">
-      <h2>연결</h2>
-      <div id="netInfo" class="small"></div>
-    </div>
-    <div class="card">
-      <h2>채굴</h2>
-      <div id="mining" class="small"></div>
+    <div class="card small">
+      <h2>익명 글쓰기</h2>
+      <div id="anonHint"></div>
+      <p class="muted">익명 글은 보증금을 건 회원만 쓸 수 있어요. 보증금은 <a data-goto="wallet">지갑</a>에서 걸어요.</p>
     </div>
   </section>
-  <section id="content">
-    <div class="card" id="fundsCard">
-      <h2>진행 중인 크라우드 펀딩</h2>
-      <div id="fundList" class="small muted">불러오는 중…</div>
-    </div>
-    <div class="card" id="composeCard">
+  <section class="content">
+    <div class="card">
       <h2 id="boardTitle">게시판을 고르세요</h2>
-      <label class="small"><input type="checkbox" id="bestOnly"> 개념글만 (좋아요 <input id="minLikes" type="number" value="3" min="1" style="width:4em">개 이상)</label>
+      <label class="small"><input type="checkbox" id="bestOnly"> 개념글만 (좋아요 <input id="minLikes" type="number" value="3" min="1" class="num"> 명 이상)</label>
       <form id="postForm">
         <textarea name="text" maxlength="1000" placeholder="글 내용 (100자 안팎 권장)"></textarea>
         <div class="row">
-          <input type="file" name="file" accept="image/png,image/jpeg,image/gif">
-          <select name="tier" title="첨부 보존 기간">
-            <option value="1m">첨부 1개월</option><option value="1y" selected>첨부 1년</option>
-            <option value="5y">첨부 5년</option><option value="20y">첨부 20년</option><option value="perm">첨부 영구</option>
-          </select>
-          <select name="textTier" title="글 보존 기간">
-            <option value="1m" selected>글 1개월</option><option value="1y">글 1년</option>
-            <option value="5y">글 5년</option><option value="20y">글 20년</option><option value="perm">글 영구</option>
-          </select>
           <select name="lane" title="차선">
             <option value="anon">익명 (무료)</option><option value="fee">수수료 (지갑 주소 공개)</option>
           </select>
-          <label class="small"><input type="checkbox" name="pseudonym"> 가명으로 서명</label>
+          <label class="small" id="pseudoRow"><input type="checkbox" name="pseudonym"> 가명으로 서명</label>
+          <select name="textTier" title="글 보관 기간">
+            <option value="1m" selected>글 1개월</option><option value="1y">글 1년</option>
+            <option value="5y">글 5년</option><option value="20y">글 20년</option><option value="perm">글 영구</option>
+          </select>
+          <input type="file" name="file" accept="image/png,image/jpeg,image/gif">
+          <select name="tier" title="첨부 보관 기간">
+            <option value="1m">첨부 1개월</option><option value="1y" selected>첨부 1년</option>
+            <option value="5y">첨부 5년</option><option value="20y">첨부 20년</option><option value="perm">첨부 영구</option>
+          </select>
           <button>글쓰기</button>
         </div>
-        <p class="small muted">익명 글은 영지식 증명으로 "등록된 회원 중 누군가"라는 것만 드러나요. 증명을 만드는 데 몇 초 걸려요. 첨부는 수수료 차선에서만 가능해요.
-          글 본문은 블록이 아니라 저장소에 보관돼요. 익명 글은 1개월, 수수료 글은 고른 기간만큼 남고, 누구나 수수료를 내고 연장할 수 있어요.
-          보낸 글은 0~5분 무작위 지연 후 다른 노드를 거쳐 나갑니다(발신 위치 보호). 첨부 이미지는 다시 인코딩되어 메타데이터가 지워집니다.</p>
+        <p class="small muted" id="laneNote"></p>
       </form>
     </div>
     <div id="thread"></div>
     <div id="posts"></div>
   </section>
 </main>
+
+<!-- 크라우드 펀딩 -->
+<main class="page" id="page-funds" hidden>
+  <div class="card">
+    <h2>진행 중인 크라우드 펀딩</h2>
+    <p class="small muted">남기고 싶은 파일을 여럿이 코인을 모아 저장하는 곳이에요. 좋아요가 곧 후원이고, 좋아요 수는 후원한 사람 수예요. 마감까지 저장되지 않으면 후원한 코인은 돌아와요.</p>
+    <div id="fundList" class="small muted">불러오는 중…</div>
+  </div>
+  <div class="card">
+    <h2>모금 요청 만들기</h2>
+    <form id="fundNewForm">
+      <input type="file" name="file" accept="image/png,image/jpeg,image/gif" required>
+      <div class="row">
+        <input name="board" placeholder="게시판" maxlength="32" required>
+        <select name="tier" title="최소 보관 기간"><option value="1y">최소 1년</option><option value="5y">최소 5년</option>
+          <option value="20y">최소 20년</option><option value="perm" selected>영구</option></select>
+        <label>마감 <input name="days" type="number" min="1" max="30" value="14" class="num">일 뒤</label>
+      </div>
+      <textarea name="note" maxlength="300" placeholder="무엇을 남기려는지 (300바이트까지)"></textarea>
+      <button>요청 만들기</button>
+    </form>
+    <p class="small muted">코인이 없어도 돼요. 파일은 이 노드에만 두고, 요청은 작업증명(몇 초~수십 초)을 마치면 모든 노드의 목록에 올라가요. 첫 후원자가 요청을 체인에 올리고, 모이면 이 노드가 알아서 올리고 증명해요. 이 노드는 그때까지 켜 두세요.</p>
+    <textarea id="fundCode" class="mono small" readonly hidden></textarea>
+  </div>
+  <div class="card">
+    <h2>요청 코드로 찾기</h2>
+    <form id="fundCheckForm"><textarea name="code" class="mono small" placeholder="다른 곳에서 받은 요청 코드 붙여넣기" required></textarea><button>확인</button></form>
+    <div id="fundCheck" class="small"></div>
+  </div>
+</main>
+
+<!-- 현상금 -->
+<main class="page" id="page-bounties" hidden>
+  <div class="card">
+    <h2>현상금</h2>
+    <p class="small muted">찾는 자료에 코인을 걸면, 누구나(코인 없이도) 결과를 제안할 수 있어요. 요청자만 마감 전에 제안 하나를 고를 수 있고, 고르는 순간 현상금은 잠겨요. 제안자는 하루 안에 데이터를 공개·증명해야 하고, 그 뒤 하루 동안 이의가 없으면 현상금(결과 저장 비용 제외)이 지급돼요. 요청자가 이의를 제기하면 현상금은 아무도 갖지 못하게 소각돼요. 실패하면 다시 모집하거나, 마감이 지났으면 후원한 비율대로 돌아가요.</p>
+    <p class="small warn">현상금 결과는 체인에 올라가 모두에게 공개돼요. 공개를 원하지 않으면 참여자끼리 미리 정한 방식으로 암호화해서 주고받으세요.</p>
+    <div id="bountyList" class="small">불러오는 중…</div>
+  </div>
+  <div class="card">
+    <h2>현상금 걸기</h2>
+    <form id="bountyNewForm">
+      <div class="row">
+        <input name="board" placeholder="게시판" maxlength="32" required>
+        <label>현상금 <input name="amount" inputmode="decimal" placeholder="코인" class="amt" required></label>
+        <label>마감 <input name="days" type="number" min="1" max="90" value="30" class="num">일 뒤 (최대 90일)</label>
+        <select name="tier" title="결과 보관 기간"><option value="1m">결과 1개월</option><option value="1y" selected>결과 1년</option>
+          <option value="5y">결과 5년</option><option value="20y">결과 20년</option><option value="perm">결과 영구</option></select>
+      </div>
+      <textarea name="note" maxlength="1000" placeholder="찾는 자료 설명 (1000바이트까지)" required></textarea>
+      <label class="small">참고 이미지 (4개까지, 1년 보관으로 함께 올라가요) <input type="file" name="refs" accept="image/png,image/jpeg,image/gif" multiple></label>
+      <button>현상금 걸기</button>
+    </form>
+    <p class="small muted">결과 저장 비용은 지급할 때 현상금에서 빠져요. 다른 사람이 좋아요로 현상금을 올릴 수 있고, 실패하면 각자 낸 비율대로 돌려받아요. 마감 전에 직접 거둬들일 수는 없어요.</p>
+  </div>
+</main>
+
+<!-- 지갑 -->
+<main class="page" id="page-wallet" hidden>
+  <div class="grid2">
+    <div class="card">
+      <h2>내 지갑</h2>
+      <div id="wallet" class="small kv"></div>
+    </div>
+    <div class="card">
+      <h2>송금 · 예치</h2>
+      <form id="sendForm"><input name="to" placeholder="cb1… 받는 주소" required class="wide">
+        <div class="row"><input name="amount" placeholder="코인" class="amt" required><button>송금</button></div></form>
+      <form id="stakeForm" class="row"><input name="amount" placeholder="코인" class="amt" required>
+        <button data-op="stake">예치</button><button data-op="unstake" class="plain">예치 해제</button></form>
+      <p class="small muted">예치한 코인은 숙성 기간이 지나면 익명 글쓰기 보증금으로 걸 수 있어요. 처음 코인을 받는 주소에는 새 계정 수수료가 붙어요.</p>
+    </div>
+    <div class="card">
+      <h2>익명 글쓰기 보증금</h2>
+      <div id="rln" class="small kv"></div>
+      <div id="rlnForeign" class="warn small" hidden>다른 기기에서 같은 익명 키로 글을 쓰고 있어요. 두 기기가 같은 번호를 쓰면 그 시간대의 키가 드러나 보증금이 몰수돼요. 이 노드의 익명 글쓰기를 멈췄어요.
+        <button id="rlnAck" class="small">한 기기에서만 쓸게요</button></div>
+      <div id="rlnJoin">
+        <h3>보증금 계산기</h3>
+        <div class="row small">
+          <label><input name="amount" id="calcAmount" inputmode="decimal" placeholder="코인" class="amt"> 코인이면</label>
+          <span id="calcCount" class="strong"></span>
+        </div>
+        <div class="row small">
+          <label><span class="per">1시간에</span> <select id="calcLimit"></select> 개 쓰려면</label>
+          <span id="calcBond" class="strong"></span>
+        </div>
+        <button id="rlnJoinBtn">이 보증금으로 등록</button>
+      </div>
+      <button id="rlnLeave" class="plain small" hidden>등록 해제 (보증금 돌려받기)</button>
+      <p class="small muted">숙성된 예치금에서 보증금을 걸어요. 1개당 보증금은 저장 가격을 따르고, 익명 차선이 많이 예약될수록 커져요. 한도를 넘겨 같은 번호로 다른 글을 쓰면 그 시간대의 키가 드러나 보증금이 몰수돼요(다른 시간대의 글은 연결되지 않아요).</p>
+    </div>
+    <div class="card">
+      <h2>좋아요 대기열</h2>
+      <div id="likeQueue" class="small"></div>
+      <p class="small muted">좋아요는 코인을 보내는 거예요(작성자에게 후원, 펀딩·현상금에 보태기). 담은 좋아요는 직접 보내거나 <a data-goto="settings">설정</a>의 자동 보내기로 나가요. 한 번에 묶어 보내면 수수료가 적어요.</p>
+    </div>
+    <div class="card">
+      <h2>익명·가명으로 받은 후원</h2>
+      <div id="tipAccounts" class="small"></div>
+      <p class="small muted">익명 글마다 한 번만 쓰는 받는 주소가 있고, 가명은 가명 주소로 받아요. 이 코인을 지갑으로 옮기면 그 글(가명)과 지갑이 연결되니, 다른 주소로 바로 쓰는 편이 안전해요.</p>
+    </div>
+  </div>
+</main>
+
+<!-- 내 활동 -->
+<main class="page" id="page-activity" hidden>
+  <div class="card"><h2>보내는 중인 내 글</h2><div id="actPending"></div></div>
+  <div class="card"><h2>내 글</h2><p class="small muted">지갑·가명·익명으로 쓴 글이 모두 보여요. 익명 글은 이 노드만 알아요.</p><div id="actPosts"></div></div>
+  <div class="card"><h2>좋아요·후원한 글</h2><div id="actLiked"></div></div>
+  <div class="card"><h2>내 크라우드 펀딩</h2><div id="actFunds" class="small"></div></div>
+  <div class="card"><h2>내 현상금</h2><div id="actBounties" class="small"></div></div>
+  <div class="card"><h2>내 제안</h2><div id="actOffers" class="small"></div></div>
+</main>
+
+<!-- 설정 -->
+<main class="page" id="page-settings" hidden>
+  <div class="grid2">
+    <div class="card">
+      <h2>좋아요 자동 보내기</h2>
+      <form id="autoForm">
+        <div class="row"><label>대기 시간 <select name="minutes"><option value="0">안 씀</option><option value="10">10분</option>
+          <option value="60">1시간</option><option value="1440">하루</option></select></label>
+        <label>또는 <input name="count" type="number" min="0" max="256" value="0" class="num">개 모이면</label>
+        <button>저장</button></div>
+      </form>
+      <p class="small muted" id="autoSummary"></p>
+      <p class="small muted">자주 나눠 보내면 묶음마다 수수료가 붙어 더 비싸져요.</p>
+    </div>
+    <div class="card">
+      <h2>네트워크 · 개인정보</h2>
+      <div id="netInfo" class="small kv"></div>
+      <p class="small muted">바꾸려면 노드를 끄고 옵션을 붙여 다시 실행하세요. Tor: <code>-proxy socks5://127.0.0.1:9050</code>, 숨은 서비스: <code>-tor-control 127.0.0.1:9051</code>, 직접 연결 막기: <code>-tor-only</code>, 커버 트래픽: <code>-cover</code>. Nym은 Nym의 socks5 클라이언트 주소를 <code>-proxy</code>에 넣으면 돼요.</p>
+    </div>
+    <div class="card">
+      <h2>채굴 · 저장</h2>
+      <div id="mining" class="small kv"></div>
+      <p class="small muted">채굴은 <code>-mine</code>, 내줄 디스크는 <code>-pledge-gb 100</code>처럼 정해요.</p>
+    </div>
+    <div class="card">
+      <h2>비밀번호</h2>
+      <div id="pwInfo" class="small"></div>
+      <p class="small muted">키 파일(지갑, 익명 키, 가명, 익명 글 받는 주소들)을 비밀번호로 잠가요. 노드를 끄고 <code>chainboard -change-password</code>를 실행하면 잠그기, 바꾸기, 풀기를 할 수 있어요. 비밀번호를 잊으면 키를 되찾을 방법이 없어요.</p>
+    </div>
+  </div>
+</main>
+
 <dialog id="likeDlg">
   <form method="dialog" id="likeForm">
     <h2 id="likeTitle">좋아요</h2>
     <div id="likeInfo" class="small muted"></div>
-    <label class="row">후원 <input name="amount" inputmode="decimal" placeholder="0" style="width:9em"> 코인</label>
+    <label class="row">보낼 코인 <input name="amount" inputmode="decimal" placeholder="0.01" class="amt" required></label>
     <div id="likeMin" class="small muted"></div>
-    <label class="small" id="likeAnonRow"><input type="checkbox" name="anon"> 익명으로 (코인 없이 좋아요만, 익명 메시지 1개 사용)</label>
     <div id="likeNote" class="small"></div>
     <div class="row">
       <button value="queue">담기</button>

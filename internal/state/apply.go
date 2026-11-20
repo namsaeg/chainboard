@@ -164,6 +164,28 @@ func (s *State) notePost(t *types.Tx, h uint64, dupKey Hash, bucket uint32) {
 // (it may still be on its way).
 var ErrFutureNonce = errors.New("nonce ahead of the account")
 
+// newAccounts counts the accounts a transaction creates: a transfer's
+// receiver, and the distinct receivers of tips, that do not exist yet.
+func (s *State) newAccounts(t *types.Tx, from Address) uint64 {
+	switch t.Kind {
+	case types.TxTransfer:
+		if t.To != from && !s.Accounts.Has(t.To) {
+			return 1
+		}
+	case types.TxLikes:
+		seen := map[Address]bool{}
+		var n uint64
+		for _, p := range t.Tips {
+			if !seen[p.To] && !s.Accounts.Has(p.To) {
+				n++
+			}
+			seen[p.To] = true
+		}
+		return n
+	}
+	return 0
+}
+
 // ApplyTx validates and applies one transaction. It is atomic: on error
 // neither the state nor ctx is modified.
 func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
@@ -173,8 +195,6 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	switch t.Kind {
 	case types.TxAnonPost:
 		return s.applyAnon(t, ctx)
-	case types.TxAnonLikes:
-		return s.applyAnonLikes(t, ctx)
 	case types.TxRLNSlash:
 		return s.applySlash(t, ctx)
 	}
@@ -212,6 +232,8 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	var fund *Campaign // funded upload or proof: its fees come from the escrow
 	var fundBase, fundHeld uint64
 	var fundTier uint16
+	var bty *Bounty // bounty acceptance, proof or dispute
+	var btyBase, btyHeld uint64
 	if t.Kind == types.TxProof {
 		if next.Proofs >= MaxProofTxs {
 			return errors.New("too many proofs in block")
@@ -254,6 +276,27 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	case types.TxLikes:
 		var err error
 		if pledged, err = s.checkPledges(t, h); err != nil {
+			return err
+		}
+	case types.TxBounty:
+		if err := s.checkNewBounty(t, h); err != nil {
+			return err
+		}
+		pledged = t.Amount
+	case types.TxBountyAccept:
+		var err error
+		if bty, btyHeld, err = s.checkAccept(t, from, h); err != nil {
+			return err
+		}
+	case types.TxBountyProof:
+		var err error
+		if bty, btyBase, err = s.checkBountyProof(t, h, &next); err != nil {
+			return err
+		}
+		cost.Base = 0 // paid from the pot, below
+	case types.TxBountyDispute:
+		var err error
+		if bty, err = s.checkDispute(t, from, h); err != nil {
 			return err
 		}
 	case types.TxFundUpload, types.TxFundProof:
@@ -318,6 +361,11 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		}
 	}
 
+	// Creating accounts costs their state bytes.
+	if n := s.newAccounts(t, from); n > 0 {
+		cost.Base += n * s.NewAccountFee()
+	}
+
 	// Payment checks.
 	total := cost.Total()
 	if total > t.MaxFee {
@@ -337,6 +385,7 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	if fund != nil {
 		next.Burn += fundBase
 	}
+	next.Burn += btyBase
 	next.Tips += cost.Tip
 	s.fund(cost.Dest, cost.Storage)
 	acc.Nonce++
@@ -388,6 +437,15 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	case types.TxLikes:
 		acc.Balance -= pledged
 		s.applyPledges(t, from, h)
+	case types.TxBounty:
+		acc.Balance -= pledged
+		s.applyNewBounty(t, from, h)
+	case types.TxBountyAccept:
+		s.applyAccept(t, bty, btyHeld, h)
+	case types.TxBountyProof:
+		s.applyBountyProof(t, bty, btyBase, h, &next)
+	case types.TxBountyDispute:
+		s.applyDispute(t.Target, bty, &next)
 	case types.TxFundUpload:
 		s.applyFundUpload(t.Target, fund, fundBase, fundHeld, fundTier, h)
 	case types.TxFundProof:
@@ -852,7 +910,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	hd := &b.Header
 
 	s.releaseExits(h)
-	s.fundDue(h, hd.Prev)
+	s.dueAll(h, hd, ctx)
 
 	// Expire term buckets.
 	var ids []uint32

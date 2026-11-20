@@ -46,7 +46,7 @@ var (
 // SecretFiles are the key files of a node directory that a password locks.
 // node.key (the network identity, separate from the wallet) stays plain so
 // the node can connect before it is unlocked.
-var SecretFiles = []string{"wallet.key", "rln.key", "pseudonym.key", "onion.key"}
+var SecretFiles = []string{"wallet.key", "rln.key", "pseudonym.key", "onion.key", "tipkeys.key"}
 
 // Locked reports whether file content is password-locked.
 func Locked(b []byte) bool { return bytes.HasPrefix(b, []byte(prefix)) }

@@ -19,9 +19,15 @@ func setupMember(t *testing.T) (*Tree, fr.Element, uint32) {
 }
 
 func makeProof(t *testing.T, tr *Tree, s fr.Element, i uint32, limit, msg, cap uint64, sig string) (Public, []byte, error) {
-	a1 := A1(s, 9, 1, msg)
+	return makeProofAt(t, tr, s, i, 9, limit, msg, cap, sig)
+}
+
+func makeProofAt(t *testing.T, tr *Tree, s fr.Element, i uint32, epoch, limit, msg, cap uint64, sig string) (Public, []byte, error) {
+	key := EpochKey(s, epoch, 1)
+	a1 := A1(key, msg)
 	x := SignalX([]byte(sig))
-	pub := Public{Root: tr.Root(), X: x, Y: Share(s, a1, x), Nullifier: Nullifier(a1), Epoch: 9, Scope: 1, Cap: cap}
+	pub := Public{Root: tr.Root(), X: x, Y: Share(key, a1, x), Nullifier: Nullifier(a1), Tag: Tag(IdentityCommitment(s), a1),
+		Epoch: epoch, Scope: 1, Cap: cap}
 	path, bits := tr.Path(i)
 	pr, err := Prove(pub, Witness{Secret: s, Limit: limit, MsgID: msg, Path: path, Bits: bits})
 	return pub, pr, err
@@ -53,17 +59,41 @@ func TestProveVerifyRecover(t *testing.T) {
 		t.Fatal("tampered cap accepted")
 	}
 
-	// Same msgID, different signal: secret is recoverable.
+	// Same msgID, different signal: the epoch key is recoverable, and with
+	// it the member (its tag unmasks to the identity commitment).
 	pub2, _, err := makeProof(t, tr, s, i, 5, 2, 10, "spam")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pub2.Nullifier != pub.Nullifier {
-		t.Fatal("nullifier should repeat")
+	if pub2.Nullifier != pub.Nullifier || pub2.Tag != pub.Tag {
+		t.Fatal("nullifier and tag should repeat for a reused message id")
 	}
-	got, ok := Recover(pub.X, pub.Y, pub2.X, pub2.Y)
-	if !ok || got != s {
-		t.Fatal("secret not recovered")
+	key, ok := Recover(pub.X, pub.Y, pub2.X, pub2.Y)
+	if !ok || key != EpochKey(s, 9, 1) || key == s {
+		t.Fatal("epoch key not recovered")
+	}
+	a1, ok := SlopeOf(key, pub.X, pub.Y, pub.Nullifier)
+	if !ok || Unmask(pub.Tag, a1) != IdentityCommitment(s) {
+		t.Fatal("tag does not unmask to the member")
+	}
+	var wrong fr.Element
+	wrong.SetUint64(3)
+	if _, ok := SlopeOf(wrong, pub.X, pub.Y, pub.Nullifier); ok {
+		t.Fatal("a wrong key passed")
+	}
+	// The key opens nothing of another epoch: its tags and nullifiers do
+	// not follow from it.
+	other, _, err := makeProofAt(t, tr, s, i, 10, 5, 2, 10, "next hour")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := SlopeOf(key, other.X, other.Y, other.Nullifier); ok {
+		t.Fatal("one epoch's key opens another epoch")
+	}
+	// Two messages of one epoch have unrelated tags.
+	third, _, err := makeProof(t, tr, s, i, 5, 3, 10, "another")
+	if err != nil || third.Tag == pub.Tag || third.Nullifier == pub.Nullifier {
+		t.Fatalf("tags of two messages: %v", err)
 	}
 
 	// msgID beyond limit or cap cannot be proven.
@@ -135,45 +165,4 @@ func (t *Tree) nodes() int {
 		return true
 	})
 	return n
-}
-
-// A like batch proves its tags: the same member and post always give the
-// same tag, and a tag for another post (or member) does not verify.
-func TestLikeBatchProof(t *testing.T) {
-	tr, s, i := setupMember(t)
-	a1 := A1(s, 9, 1, 3)
-	x := SignalX([]byte("likes"))
-	pub := LikePublic{Public: Public{Root: tr.Root(), X: x, Y: Share(s, a1, x), Nullifier: Nullifier(a1), Epoch: 9, Scope: 1, Cap: 10}}
-	pub.Posts[0], pub.Posts[1] = 1_000<<32|0xdeadbeef, 2_000<<32|7
-	for j := range pub.Posts {
-		pub.Tags[j] = LikeTag(s, 1, pub.Posts[j])
-	}
-	path, bits := tr.Path(i)
-	t0 := time.Now()
-	pr, err := ProveLikes(pub, Witness{Secret: s, Limit: 5, MsgID: 3, Path: path, Bits: bits})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("like batch: prove %v, %d bytes", time.Since(t0), len(pr))
-	if err := VerifyLikes(pr, pub); err != nil {
-		t.Fatal(err)
-	}
-	if !pub.Tags[2].IsZero() || pub.Tags[0] != LikeTag(s, 1, pub.Posts[0]) {
-		t.Fatal("tags")
-	}
-	bad := pub
-	bad.Posts[1]++
-	if VerifyLikes(pr, bad) == nil {
-		t.Fatal("tag accepted for another post")
-	}
-	bad = pub
-	var other fr.Element
-	other.SetUint64(5)
-	bad.Tags[0] = LikeTag(other, 1, pub.Posts[0])
-	if VerifyLikes(pr, bad) == nil {
-		t.Fatal("another member's tag accepted")
-	}
-	if Verify(pr, pub.Public) == nil {
-		t.Fatal("like proof accepted as a post proof")
-	}
 }

@@ -23,6 +23,7 @@ type Circuit struct {
 	X         frontend.Variable `gnark:",public"`
 	Y         frontend.Variable `gnark:",public"`
 	Nullifier frontend.Variable `gnark:",public"`
+	Tag       frontend.Variable `gnark:",public"`
 
 	Secret frontend.Variable
 	Limit  frontend.Variable
@@ -57,8 +58,10 @@ func (c *Circuit) Define(api frontend.API) error {
 	bc.AssertIsLess(c.MsgID, c.Limit)
 	bc.AssertIsLess(c.MsgID, c.Cap)
 
-	a1 := hash(api, tagShare, c.Secret, c.Epoch, c.Scope, c.MsgID)
-	api.AssertIsEqual(c.Y, api.Add(c.Secret, api.Mul(a1, c.X)))
+	key := hash(api, tagEpoch, c.Secret, c.Epoch, c.Scope)
+	a1 := hash(api, tagShare, key, c.MsgID)
+	api.AssertIsEqual(c.Y, api.Add(key, api.Mul(a1, c.X)))
 	api.AssertIsEqual(c.Nullifier, hash(api, tagNullifier, a1))
+	api.AssertIsEqual(c.Tag, api.Add(idc, hash(api, tagMask, a1)))
 	return nil
 }

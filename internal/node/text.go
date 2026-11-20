@@ -115,18 +115,38 @@ func (n *Node) Board(name string, minLikes uint64, limit int) []PostView {
 	tip := n.Chain.Tip()
 	vs := n.Index.Board(name, minLikes, limit)
 	for i := range vs {
-		n.fillText(&vs[i], tip)
-		n.fillFund(&vs[i], tip)
-		n.fillLiked(&vs[i])
+		n.fillView(&vs[i], tip)
 	}
 	return vs
 }
 
-// fillLiked marks the posts this node's wallet, or its anonymous member,
-// has liked (counted on chain).
+// fillView completes an indexed post for showing: body, funding, likes and
+// retention.
+func (n *Node) fillView(v *PostView, tip *state.State) {
+	n.fillText(v, tip)
+	n.fillFund(v, tip)
+	n.fillLiked(v)
+}
+
+// fillLiked marks the posts this node's wallet has liked (counted on chain)
+// and says how long their attachments are kept.
 func (n *Node) fillLiked(v *PostView) {
 	v.Liked = n.Index.Liked(v.id, n.Wallet.Address())
-	v.LikedAnon = v.Lane != "fund" && n.LikedAnon(v.id, v.Height)
+	tip := n.Chain.Tip()
+	for _, a := range v.Attach {
+		root, err := cryptox.ParseHash(a)
+		if err != nil {
+			continue
+		}
+		k := Retention{Root: a}
+		k.From, _ = n.Index.dataHeight(root)
+		if info, ok := tip.Data.Get(root); ok {
+			k.Tier, k.Until = info.Tier, tip.BucketExpiry(info.Bucket)
+		} else {
+			k.Gone = true
+		}
+		v.Kept = append(v.Kept, k)
+	}
 }
 
 // Thread returns a post and its comments with their bodies.
@@ -136,9 +156,7 @@ func (n *Node) Thread(id cryptox.Hash) (*PostView, []PostView) {
 	if p == nil {
 		return nil, nil
 	}
-	n.fillText(p, tip)
-	n.fillFund(p, tip)
-	n.fillLiked(p)
+	n.fillView(p, tip)
 	for i := range cs {
 		n.fillText(&cs[i], tip)
 		n.fillLiked(&cs[i])

@@ -60,7 +60,7 @@ func (f *fundRig) campaign() *state.Campaign {
 
 func (f *fundRig) prove(t *testing.T) *types.Tx {
 	c := f.campaign()
-	samples, err := FundSamples(f.st, c, f.req.ID())
+	samples, err := FundSamples(f.st, c.Seed, f.req.ID(), c.DataRoot, c.Size)
 	if err != nil {
 		t.Fatal(err)
 	}

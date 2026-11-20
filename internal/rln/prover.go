@@ -102,12 +102,12 @@ func loadPK() (*groth16.ProvingKey, *cs.R1CS, error) {
 
 // Public are the public inputs of one RLN proof.
 type Public struct {
-	Root, X, Y, Nullifier fr.Element
-	Epoch, Scope, Cap     uint64
+	Root, X, Y, Nullifier, Tag fr.Element
+	Epoch, Scope, Cap          uint64
 }
 
 func (p *Public) vector() fr.Vector {
-	return fr.Vector{p.Root, u64(p.Epoch), u64(p.Scope), u64(p.Cap), p.X, p.Y, p.Nullifier}
+	return fr.Vector{p.Root, u64(p.Epoch), u64(p.Scope), u64(p.Cap), p.X, p.Y, p.Nullifier, p.Tag}
 }
 
 // Witness is the private side of a proof.
@@ -127,7 +127,7 @@ func Prove(pub Public, w Witness) ([]byte, error) {
 	}
 	a := Circuit{
 		Root: pub.Root, Epoch: pub.Epoch, Scope: pub.Scope, Cap: pub.Cap,
-		X: pub.X, Y: pub.Y, Nullifier: pub.Nullifier,
+		X: pub.X, Y: pub.Y, Nullifier: pub.Nullifier, Tag: pub.Tag,
 		Secret: w.Secret, Limit: w.Limit, MsgID: w.MsgID,
 	}
 	for i := 0; i < Depth; i++ {

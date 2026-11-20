@@ -7,13 +7,14 @@ import (
 
 	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/cryptox"
+	"github.com/namsaeg/chainboard/internal/p2p"
 	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
 // The list of crowdfunding in progress: requests on chain that still take
 // pledges, and requests gossiped by peers before their first pledge.
-// Gossiped ones carry a proof of work (params.FundPoWBits) and the pool is
+// Gossiped ones carry a proof of work (params.GossipPoWBits) and the pool is
 // bounded: maxGossipFunds in all, maxCreatorFunds per creator key; when it
 // is full a new request must carry more work than the weakest one held,
 // which it then replaces.
@@ -43,9 +44,37 @@ func decodeFundWire(b []byte) (*types.FundRequest, uint64, error) {
 	return q, nonce, q.Check()
 }
 
-// FundIDs lists the requests this node gossips: with their work, not on
+// ItemIDs lists the items of a kind this node gossips.
+func (n *Node) ItemIDs(kind uint8) []cryptox.Hash {
+	if kind == p2p.ItemOffer {
+		return n.offerIDs()
+	}
+	return n.fundIDs()
+}
+
+// ItemWire is a gossiped item's wire form.
+func (n *Node) ItemWire(kind uint8, id cryptox.Hash) ([]byte, bool) {
+	if kind == p2p.ItemOffer {
+		return n.offerWire(id)
+	}
+	return n.fundWireOf(id)
+}
+
+// AddItem checks a gossiped item and keeps it within its pool's bounds.
+// Bad work or a bad signature is the sender's misbehaviour.
+func (n *Node) AddItem(kind uint8, wire []byte) (cryptox.Hash, bool, error) {
+	switch kind {
+	case p2p.ItemFund:
+		return n.addFund(wire)
+	case p2p.ItemOffer:
+		return n.addOffer(wire)
+	}
+	return cryptox.Hash{}, false, fmt.Errorf("%w: unknown item kind %d", p2p.ErrMisbehave, kind)
+}
+
+// fundIDs lists the requests this node gossips: with their work, not on
 // chain yet, deadline ahead.
-func (n *Node) FundIDs() []cryptox.Hash {
+func (n *Node) fundIDs() []cryptox.Hash {
 	tip := n.Chain.Tip()
 	n.fundMu.Lock()
 	defer n.fundMu.Unlock()
@@ -58,8 +87,8 @@ func (n *Node) FundIDs() []cryptox.Hash {
 	return ids
 }
 
-// FundWire is a gossiped request's wire form.
-func (n *Node) FundWire(id cryptox.Hash) ([]byte, bool) {
+// fundWireOf is a gossiped request's wire form.
+func (n *Node) fundWireOf(id cryptox.Hash) ([]byte, bool) {
 	n.fundMu.Lock()
 	defer n.fundMu.Unlock()
 	ft, ok := n.funds[id]
@@ -69,16 +98,19 @@ func (n *Node) FundWire(id cryptox.Hash) ([]byte, bool) {
 	return fundWire(ft.req, ft.pow), true
 }
 
-// FundAdd checks a gossiped request and keeps it within the pool's bounds.
-func (n *Node) FundAdd(wire []byte) (cryptox.Hash, bool, error) {
+// addFund checks a gossiped request and keeps it within the pool's bounds.
+func (n *Node) addFund(wire []byte) (cryptox.Hash, bool, error) {
 	q, nonce, err := decodeFundWire(wire)
 	if err != nil {
-		return cryptox.Hash{}, false, err
+		return cryptox.Hash{}, false, fmt.Errorf("%w: %v", p2p.ErrMisbehave, err)
 	}
 	id := q.ID()
+	if n.fundHeld(id) {
+		return id, false, nil // known with its work: no need to check it again
+	}
 	bits := types.PoWBits(id, nonce)
-	if bits < int(n.P.FundPoWBits) {
-		return id, false, fmt.Errorf("funding request with %d bits of work, %d needed", bits, n.P.FundPoWBits)
+	if bits < int(n.P.GossipPoWBits) {
+		return id, false, fmt.Errorf("%w: funding request with %d bits of work, %d needed", p2p.ErrMisbehave, bits, n.P.GossipPoWBits)
 	}
 	tip := n.Chain.Tip()
 	h := tip.Height + 1
@@ -126,6 +158,14 @@ func (n *Node) FundAdd(wire []byte) (cryptox.Hash, bool, error) {
 	return id, true, nil
 }
 
+// fundHeld reports whether a request is held with its work.
+func (n *Node) fundHeld(id cryptox.Hash) bool {
+	n.fundMu.Lock()
+	defer n.fundMu.Unlock()
+	ft, ok := n.funds[id]
+	return ok && ft.hasPoW
+}
+
 // pruneFunds forgets requests of others past their deadline, and gossiped
 // ones the chain now carries or whose data is stored (they no longer take
 // a slot of the pool).
@@ -153,7 +193,7 @@ func (n *Node) solveFund(q *types.FundRequest) {
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		nonce, ok := types.SolvePoW(id, int(n.P.FundPoWBits), n.ctx.Done())
+		nonce, ok := types.SolvePoW(id, int(n.P.GossipPoWBits), n.ctx.Done())
 		if !ok {
 			return
 		}
@@ -165,7 +205,7 @@ func (n *Node) solveFund(q *types.FundRequest) {
 		}
 		n.fundMu.Unlock()
 		if have {
-			n.Host.AnnounceFund(fundWire(q, nonce))
+			n.Host.SubmitItem(p2p.ItemFund, fundWire(q, nonce))
 		}
 	}()
 }

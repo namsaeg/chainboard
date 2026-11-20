@@ -25,6 +25,7 @@ import (
 	"github.com/namsaeg/chainboard/internal/nat"
 	"github.com/namsaeg/chainboard/internal/p2p"
 	"github.com/namsaeg/chainboard/internal/params"
+	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
@@ -134,6 +135,22 @@ func TestThreeNodes(t *testing.T) {
 		if v.Text != "세 노드 시험 글" || v.TextState != "ok" || v.Tier != 12 {
 			t.Fatalf("post as shown: %+v", v)
 		}
+		// The attachment shows its own retention, kept apart from the text's.
+		if len(v.Kept) != 1 || v.Kept[0].Root != root.String() || v.Kept[0].Tier != 24 || v.Kept[0].Until <= v.Until || v.Kept[0].Gone {
+			t.Fatalf("attachment retention: %+v (text until %d)", v.Kept, v.Until)
+		}
+	}
+	// A post may attach a file uploaded a moment before, still unmined:
+	// the fee quote counts the node's own queued transactions.
+	fresh, err := b.Upload(noisePNG(30, 20), 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Send(&types.Tx{Kind: types.TxPost, Lane: types.LaneFee, Board: "테스트2", Text: []byte("바로 붙인 첨부"), Attach: []types.Hash{fresh.Root}}); err != nil {
+		t.Fatalf("post right after its upload: %v", err)
+	}
+	if act := b.MyActivity(10); len(act.Posts) != 1 || act.Posts[0].ID != post.ID().String() || act.Posts[0].Text != "세 노드 시험 글" || len(act.Posts[0].Kept) != 1 {
+		t.Fatalf("writer's activity: %+v", act.Posts)
 	}
 	// A node that joins later gets the bodies along with the blocks.
 	d := start(t, p, false, a.Host.Addr())
@@ -203,14 +220,24 @@ func TestAnonymousPosts(t *testing.T) {
 	waitFor(t, "stake", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).StakePending > 0 })
 	start := b.Chain.Height()
 	waitFor(t, "stake aging", 60*time.Second, func() bool { return b.Chain.Height() > start+p.StakeAgingBlocks })
-	// The bond follows the storage price: offer what three messages need
-	// now, with room for the price to move before the join is mined.
-	liked := &types.Tx{Kind: types.TxPost, Board: "공개", Lane: types.LaneFee}
-	liked.SetText([]byte("익명 좋아요를 받을 글"))
-	if err := a.Send(liked); err != nil {
-		t.Fatal(err)
+	// The bond follows the storage price: the quote leaves room for the
+	// price to move before the join is mined, and counts both ways.
+	q := b.RLNQuote(0)
+	if q.Limit != 0 || q.NextBond != q.BondFor[0] || len(q.BondFor) != int(p.RLNMaxLimit) {
+		t.Fatalf("quote for nothing: %+v", q)
 	}
-	if err := b.JoinRLN(b.Chain.Tip().BondFor(4) * 13 / 10); err != nil {
+	for i := 1; i < len(q.BondFor); i++ {
+		if q.BondFor[i] <= q.BondFor[i-1] {
+			t.Fatalf("bonds not rising: %v", q.BondFor)
+		}
+	}
+	if q4 := b.RLNQuote(q.BondFor[3]); q4.Limit != 4 || q4.NextBond != q.BondFor[4] {
+		t.Fatalf("quote for four: %+v", q4)
+	}
+	if q3 := b.RLNQuote(q.BondFor[3] - 1); q3.Limit != 3 {
+		t.Fatalf("quote just under four: %+v", q3)
+	}
+	if err := b.JoinRLN(q.BondFor[3]); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "membership", 60*time.Second, func() bool { return b.RLNStatus().Status == "active" })
@@ -223,12 +250,7 @@ func TestAnonymousPosts(t *testing.T) {
 	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "가명으로 쓴 글", Pseudo: true}); err != nil {
 		t.Fatal(err)
 	}
-	// An anonymous like batch spends the third message.
-	waitFor(t, "liked post indexed", 60*time.Second, func() bool { _, ok := b.Index.post(liked.ID()); return ok })
-	if _, err := b.QueueLike(LikeRequest{ID: liked.ID(), Anon: true, Amount: 1}); err == nil {
-		t.Fatal("anonymous tip accepted")
-	}
-	if _, err := b.QueueLike(LikeRequest{ID: liked.ID(), Anon: true, Now: true}); err != nil {
+	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "세 번째 익명 글"}); err != nil {
 		t.Fatal(err)
 	}
 	// The fourth message is the last of the epoch: it needs a confirmation.
@@ -244,13 +266,44 @@ func TestAnonymousPosts(t *testing.T) {
 	if err := b.AnonPost(AnonRequest{Board: "익명", Text: "한도 초과", Confirm: true}); !errors.Is(err, errLimit) {
 		t.Fatalf("post beyond the limit: %v", err)
 	}
-	waitFor(t, "anonymous posts on another node", 90*time.Second, func() bool { return len(c.Board("익명", 0, 10)) == 3 })
-	waitFor(t, "anonymous like counted", 60*time.Second, func() bool { v, _ := c.Index.post(liked.ID()); return v.Likes == 1 })
-	if !b.LikedAnon(liked.ID(), func() uint64 { v, _ := b.Index.post(liked.ID()); return v.Height }()) {
-		t.Fatal("own anonymous like not recognised")
+	waitFor(t, "anonymous posts on another node", 90*time.Second, func() bool { return len(c.Board("익명", 0, 10)) == 4 })
+
+	// Anonymous posts take likes too: at a one-time address of their own,
+	// which only the writer's node can spend from.
+	var plain PostView
+	for _, v := range a.Board("익명", 0, 10) {
+		if !v.Pseudo && v.TipTo != "" {
+			plain = v
+		}
 	}
-	if _, err := b.QueueLike(LikeRequest{ID: liked.ID(), Anon: true}); err == nil {
-		t.Fatal("anonymous like queued twice")
+	if plain.TipTo == "" || plain.TipTo == b.Wallet.Address().String() {
+		t.Fatalf("anonymous post without its own tip address: %+v", plain)
+	}
+	tip := 2 * a.MinLikeAmount()
+	pid, _ := cryptox.ParseHash(plain.ID)
+	if _, err := a.QueueLike(LikeRequest{ID: pid, Amount: tip, Now: true, Confirm: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "tip to an anonymous post", 60*time.Second, func() bool {
+		accts, _ := b.TipAccounts()
+		for _, x := range accts {
+			if x.Address == plain.TipTo && x.Balance == tip {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "anonymous post's like counted", 30*time.Second, func() bool { v, _ := c.Index.post(pid); return v.Likes == 1 && v.Tips == tip })
+	// The writer's node lists its anonymous posts (by their tip addresses)
+	// among its own; the liker's lists the post as liked.
+	waitFor(t, "writer's activity", 30*time.Second, func() bool { return len(b.MyActivity(10).Posts) == 4 })
+	if act := a.MyActivity(10); len(act.Liked) != 1 || act.Liked[0].ID != plain.ID || len(act.Posts) != 0 {
+		t.Fatalf("liker's activity: %+v", act)
+	}
+	from, _ := cryptox.ParseAddress(plain.TipTo)
+	var link *WarningError
+	if err := b.SendFromTips(from, b.Wallet.Address(), tip/4, false); !errors.As(err, &link) {
+		t.Fatalf("moving anonymous tips to the wallet without a warning: %v", err)
 	}
 
 	// A second device with the same anonymous key notices the first one's
@@ -285,19 +338,19 @@ func TestAnonymousPosts(t *testing.T) {
 		t.Fatalf("second device after acknowledging: %v (its ledger should hold the first device's ids)", err)
 	}
 	wallet := b.Wallet.Address().String()
-	var pseudo, plain int
+	var pseudo, unnamed int
 	for _, v := range c.Board("익명", 0, 10) {
-		if v.Lane != "anon" || v.Author == wallet {
+		if v.Lane != "anon" || v.Author == wallet || v.TipTo == wallet {
 			t.Fatalf("post leaks its author: %+v", v)
 		}
 		if v.Pseudo && v.Author == b.RLNStatus().Pseudonym {
 			pseudo++
 		} else if v.Author == "" {
-			plain++
+			unnamed++
 		}
 	}
-	if pseudo != 1 || plain != 2 {
-		t.Fatalf("pseudonym %d, anonymous %d", pseudo, plain)
+	if pseudo != 1 || unnamed != 3 {
+		t.Fatalf("pseudonym %d, anonymous %d", pseudo, unnamed)
 	}
 	if s := b.RLNStatus(); s.Used != 2 && s.Epoch == b.Chain.Tip().RLNEpoch(b.Chain.Height()+1) {
 		t.Logf("used %d (epoch may have rolled over)", s.Used)
@@ -368,9 +421,10 @@ func TestBurstWarning(t *testing.T) {
 	}
 }
 
-// TestLikesAndTips: likes wait until the user (or the auto-send setting,
-// off by default) sends them; a tip moves coins to the post's author and is
-// counted with the like; a waiting like can be changed or taken back.
+// TestLikesAndTips: a like always carries coins; likes wait until the
+// user (or the auto-send setting, off by default) sends them; the coins
+// reach the post's author and the like is counted once per account; a
+// waiting like can be changed or taken back.
 func TestLikesAndTips(t *testing.T) {
 	p := fastParams()
 	a := start(t, p, true)
@@ -397,50 +451,51 @@ func TestLikesAndTips(t *testing.T) {
 		}
 		return true
 	})
+	min := a.MinLikeAmount()
+	if _, err := a.QueueLike(LikeRequest{ID: ids[0]}); err == nil {
+		t.Fatal("a like without coins queued")
+	}
+	if _, err := a.QueueLike(LikeRequest{ID: ids[0], Amount: min - 1}); err == nil {
+		t.Fatal("a like below the minimum queued")
+	}
 	tip := uint64(params.Coin)
 	for i, id := range ids {
-		req := LikeRequest{ID: id}
+		amt := min
 		if i == 1 {
-			req.Amount = tip
+			amt = tip
 		}
-		if _, err := a.QueueLike(req); err != nil {
+		if _, err := a.QueueLike(LikeRequest{ID: id, Amount: amt}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if !a.UnqueueLike(ids[2], false) {
+	if !a.UnqueueLike(ids[2]) {
 		t.Fatal("take-back failed")
 	}
 	if _, err := b.QueueLike(LikeRequest{ID: ids[0], Amount: tip}); err == nil {
-		t.Fatal("tipped own post")
-	}
-	if _, err := a.QueueLike(LikeRequest{ID: ids[0], Anon: true}); err == nil {
-		t.Fatal("anonymous like without a membership")
+		t.Fatal("liked own post")
 	}
 	// Auto-send is off: nothing leaves by itself.
 	h := a.Chain.Height()
 	waitFor(t, "a few blocks", 60*time.Second, func() bool { return a.Chain.Height() >= h+3 })
-	signed, _ := a.QueuedLikes()
-	if len(signed.Likes) != 2 || signed.Coins != tip || signed.Next != 2 || signed.Fee == 0 {
-		t.Fatalf("queue %+v", signed)
+	q := a.QueuedLikes()
+	if len(q.Likes) != 2 || q.Coins != tip+min || q.Next != 2 || q.Fee == 0 {
+		t.Fatalf("queue %+v", q)
 	}
 	before := a.Chain.Tip().Peek(b.Wallet.Address()).Balance
 	if err := a.SetLikeAutoSend(LikeAuto{Count: 2}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "auto-sent", 30*time.Second, func() bool { s, _ := a.QueuedLikes(); return len(s.Likes) == 0 })
-	waitFor(t, "likes and tip counted", 60*time.Second, func() bool {
+	waitFor(t, "auto-sent", 30*time.Second, func() bool { return len(a.QueuedLikes().Likes) == 0 })
+	waitFor(t, "likes counted", 60*time.Second, func() bool {
 		v0, _ := a.Index.post(ids[0])
 		v1, _ := a.Index.post(ids[1])
 		v2, _ := a.Index.post(ids[2])
-		return v0.Likes == 1 && v1.Likes == 1 && v1.Tips == tip && v2.Likes == 0 && v0.Tips == 0
+		return v0.Likes == 1 && v0.Tips == min && v1.Likes == 1 && v1.Tips == tip && v2.Likes == 0
 	})
-	if got := a.Chain.Tip().Peek(b.Wallet.Address()).Balance; got < before+tip {
-		t.Fatalf("author balance %d, want at least %d", got, before+tip)
+	if got := a.Chain.Tip().Peek(b.Wallet.Address()).Balance; got < before+tip+min {
+		t.Fatalf("author balance %d, want at least %d", got, before+tip+min)
 	}
-	if _, err := a.QueueLike(LikeRequest{ID: ids[0]}); err == nil {
-		t.Fatal("a counted like queued again")
-	}
-	// Coins sent to someone other than the author are not the post's tip.
+	// Coins sent to someone other than the author are not the post's like.
 	v2, _ := a.Index.post(ids[2])
 	stray := &types.Tx{Kind: types.TxLikes, Tips: []types.Tip{{Ref: types.RefOf(ids[2], v2.Height), To: types.Address{7}, Amount: 2 * a.Chain.Tip().MinPledge()}}}
 	if err := a.Send(stray); err != nil {
@@ -450,13 +505,13 @@ func TestLikesAndTips(t *testing.T) {
 	if v, _ := a.Index.post(ids[2]); v.Tips != 0 || v.Likes != 0 {
 		t.Fatalf("a tip to another address counted: %+v", v)
 	}
-	// A tip after the like: the coins count, the like does not again.
+	// Liking again sends more coins; the like counts once.
 	if _, err := a.QueueLike(LikeRequest{ID: ids[0], Amount: tip, Now: true, Confirm: true}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "second tip", 60*time.Second, func() bool { v, _ := a.Index.post(ids[0]); return v.Tips == tip })
-	if v, _ := a.Index.post(ids[0]); v.Likes != 1 || !v.Tippable {
-		t.Fatalf("after the second tip: %+v", v)
+	waitFor(t, "second like", 60*time.Second, func() bool { v, _ := a.Index.post(ids[0]); return v.Tips == tip+min })
+	if v, _ := a.Index.post(ids[0]); v.Likes != 1 || !a.Index.Liked(ids[0], a.Wallet.Address()) || v.TipTo != b.Wallet.Address().String() {
+		t.Fatalf("after the second like: %+v", v)
 	}
 }
 
@@ -573,16 +628,16 @@ func TestFundGossipBounds(t *testing.T) {
 	}
 	q := mk(0)
 	weak := uint64(0)
-	for types.PoWBits(q.ID(), weak) >= int(p.FundPoWBits) {
+	for types.PoWBits(q.ID(), weak) >= int(p.GossipPoWBits) {
 		weak++
 	}
-	if _, _, err := n.FundAdd(fundWire(q, weak)); err == nil {
-		t.Fatal("request without enough work accepted")
+	if _, _, err := n.AddItem(p2p.ItemFund, fundWire(q, weak)); !errors.Is(err, p2p.ErrMisbehave) {
+		t.Fatalf("request without enough work: %v", err)
 	}
 	for i := 0; i < maxCreatorFunds+1; i++ {
 		q := mk(i)
-		nonce, _ := types.SolvePoW(q.ID(), int(p.FundPoWBits), nil)
-		_, isNew, err := n.FundAdd(fundWire(q, nonce))
+		nonce, _ := types.SolvePoW(q.ID(), int(p.GossipPoWBits), nil)
+		_, isNew, err := n.AddItem(p2p.ItemFund, fundWire(q, nonce))
 		if i < maxCreatorFunds && (err != nil || !isNew) {
 			t.Fatalf("request %d: %v", i, err)
 		}
@@ -590,12 +645,12 @@ func TestFundGossipBounds(t *testing.T) {
 			t.Fatal("a creator went past its slots")
 		}
 		if i == 0 {
-			if _, isNew, _ := n.FundAdd(fundWire(q, nonce)); isNew {
+			if _, isNew, _ := n.AddItem(p2p.ItemFund, fundWire(q, nonce)); isNew {
 				t.Fatal("the same request counted as new twice")
 			}
 		}
 	}
-	if len(n.FundIDs()) != maxCreatorFunds || len(n.FundList(0)) != maxCreatorFunds {
+	if len(n.ItemIDs(p2p.ItemFund)) != maxCreatorFunds || len(n.FundList(0)) != maxCreatorFunds {
 		t.Fatal("pool contents")
 	}
 }
@@ -847,5 +902,109 @@ func TestOnionService(t *testing.T) {
 	}
 	if pi := n.Privacy(); pi.Onion != n.Host.Onion() {
 		t.Fatalf("privacy %+v", pi)
+	}
+}
+
+// noisePNG is a picture that does not compress: about w*h*3 bytes.
+func noisePNG(w, h int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	seed := uint32(7)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			seed = seed*1664525 + 1013904223
+			img.Set(x, y, color.RGBA{byte(seed >> 24), byte(seed >> 16), byte(seed >> 8), 255})
+		}
+	}
+	var b bytes.Buffer
+	png.Encode(&b, img)
+	return b.Bytes()
+}
+
+// TestBounty: a requester posts a bounty; a hunter without coins answers
+// with an offer that travels by gossip; the requester sees the previews but
+// cannot fetch the whole data; on acceptance the hunter's node shares the
+// data and proves it by itself, and after the dispute window the pot is
+// the hunter's.
+func TestBounty(t *testing.T) {
+	p := fastParams()
+	p.BountyMaxBlocks, p.BountyRevealBlocks, p.BountyDisputeBlocks = 400, 20, 6
+	p.FileCapDivisor = 10 // room for a picture of a few chunks
+	a := start(t, p, true)
+	b := start(t, p, false, a.Host.Addr())
+	waitFor(t, "funds", 60*time.Second, func() bool { return a.Chain.Tip().Peek(a.Wallet.Address()).Balance > 10*params.Coin })
+	id, err := a.CreateBounty("현상금", "비 오는 광화문 사진을 찾아요", nil, 3*params.Coin, 30, 12, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "bounty listed", 60*time.Second, func() bool {
+		l := b.BountyList(10)
+		return len(l) == 1 && l[0].Status == "open" && l[0].Note == "비 오는 광화문 사진을 찾아요"
+	})
+	if _, err := a.CreateOffer(id, pngBytes(), nil, "내 것"); err == nil {
+		t.Fatal("the requester answered its own bounty")
+	}
+	data := noisePNG(700, 700)
+	o, err := b.CreateOffer(id, data, pngBytes(), "광화문에서 찍었어요")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "offer gossiped", 30*time.Second, func() bool { return len(a.BountyOffers(id)) == 1 })
+	if bound := boundPreviewChunks(o.Size); bound == 0 || bound*4 > chunkCount(o.Size) {
+		t.Fatalf("bound preview of %d chunks for %d", bound, chunkCount(o.Size))
+	}
+	waitFor(t, "previews", 30*time.Second, func() bool {
+		pv, err := a.PreviewOffer(o.ID())
+		return err == nil && len(pv.Free) > 0 && pv.BoundGot == pv.BoundWant && pv.BoundWant > 0
+	})
+	// The rest of the data is not served before acceptance.
+	last := chunkCount(o.Size) - 1
+	a.Host.Probe(o.DataRoot, o.Size, []uint64{last})
+	time.Sleep(4 * time.Second)
+	if got := a.Host.ProbeResult(o.DataRoot); len(got) != 0 {
+		t.Fatal("the hunter served data beyond its preview before acceptance")
+	}
+	if err := a.AcceptOffer(o.ID(), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "revealed and proven", 90*time.Second, func() bool {
+		x, ok := a.Chain.Tip().Bounties.Get(id)
+		return ok && x.Status == state.BountyProven
+	})
+	if !a.Chain.Tip().Data.Has(o.DataRoot) {
+		t.Fatal("result not stored")
+	}
+	waitFor(t, "hunter paid", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).Balance > 2*params.Coin })
+	if _, ok := a.Chain.Tip().Bounties.Get(id); ok {
+		t.Fatal("bounty still open after payment")
+	}
+	if err := a.Chain.Tip().CheckSupply(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chunkCount(size uint64) uint64 { return (size + params.ChunkSize - 1) / params.ChunkSize }
+
+// TestBadWorkBans: a peer that relays a request without its proof of work
+// is dropped, and its key is refused when it dials again.
+func TestBadWorkBans(t *testing.T) {
+	p := fastParams()
+	b := start(t, p, false)
+	a := start(t, p, false, b.Host.Addr())
+	waitFor(t, "connection", 10*time.Second, func() bool { return b.Host.PeerCount() == 1 })
+	k, err := cryptox.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &types.FundRequest{DataRoot: types.Hash{9}, Size: 1000, MinTier: 12, Deadline: b.Chain.Height() + 50, Board: "후원", Note: "약한 작업"}
+	q.Sign(k)
+	weak := uint64(0)
+	for types.PoWBits(q.ID(), weak) >= int(p.GossipPoWBits) {
+		weak++
+	}
+	a.Host.SubmitItem(p2p.ItemFund, fundWire(q, weak))
+	waitFor(t, "the bad peer dropped", 10*time.Second, func() bool { return b.Host.PeerCount() == 0 })
+	time.Sleep(3 * time.Second) // a keeps dialing its seed
+	if b.Host.PeerCount() != 0 || len(b.ItemIDs(p2p.ItemFund)) != 0 {
+		t.Fatal("a banned peer got back in, or its item was kept")
 	}
 }

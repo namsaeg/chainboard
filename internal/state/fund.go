@@ -20,8 +20,8 @@ import (
 //	uploaded  someone holding the data sent the funded upload before the
 //	          deadline: the base fee is paid, the storage fee for the longest
 //	          tier the escrow affords is held, and the proof window starts
-//	done      a proof of FundSamples sub-chunks, drawn from the hash of the
-//	          block after the upload, came within the window: the data is
+//	done      a proof of FundSamples sub-chunks, drawn from the vdf output of
+//	          the block after the upload, came within the window: the data is
 //	          placed, the held fee goes to storage, and what is left returns
 //	          to the backers in proportion. From here nothing can be taken back.
 //
@@ -33,8 +33,9 @@ import (
 type FundStatus uint8
 
 const (
-	FundOpen     FundStatus = 1
-	FundUploaded FundStatus = 2
+	FundOpen      FundStatus = 1
+	FundUploaded  FundStatus = 2
+	FundRefunding FundStatus = 3 // being returned to the backers (see refund.go)
 )
 
 // PledgeRec is one pledge, kept for refunds.
@@ -60,7 +61,10 @@ type Campaign struct {
 	Tier   uint16
 	Bucket uint32
 	Held   uint64 // storage fee set aside in Escrow
-	Seed   Hash   // hash of the block after the upload: picks the proof's samples
+	Seed   Hash   // from the vdf output of the block after the upload: picks the proof's samples
+	// Refund in progress.
+	RefundPot uint64
+	RefundAt  int
 }
 
 func (s *State) campaign(id Hash) (*Campaign, bool) {
@@ -72,9 +76,9 @@ func (s *State) campaign(id Hash) (*Campaign, bool) {
 	return &cp, true
 }
 
-// MinPledge is the smallest pledge or tip: what 32 state bytes cost as
-// block bytes, so neither can fill the state (pledge records, receiving
-// accounts) for nothing.
+// MinPledge is the smallest like: a tip, a pledge or a bounty boost. It is
+// what 32 state bytes cost as block bytes, so pledge records cannot fill
+// the state for nothing (new accounts pay NewAccountFee on top).
 func (s *State) MinPledge() uint64 { return 32 * s.PermByteFee() }
 
 func (s *State) checkRequest(r *types.FundRequest, h uint64) error {
@@ -122,7 +126,12 @@ func (s *State) checkPledges(t *types.Tx, h uint64) (uint64, error) {
 			return 0, fmt.Errorf("pledge below the minimum %d", s.MinPledge())
 		}
 		c, ok := s.Funds.Get(p.Request)
+		b, isBounty := s.Bounties.Get(p.Request)
 		switch {
+		case isBounty:
+			if (b.Status != BountyOpen && b.Status != BountyAccepted) || h >= b.Deadline {
+				return 0, errors.New("that bounty no longer takes likes")
+			}
 		case ok && (c.Status != FundOpen || h >= c.Deadline):
 			return 0, errors.New("that funding request no longer takes pledges")
 		case !ok && carried[p.Request] == nil:
@@ -150,6 +159,13 @@ func (s *State) applyPledges(t *types.Tx, from Address, h uint64) {
 		s.Account(p.To).Balance += p.Amount
 	}
 	for _, p := range t.Pledges {
+		if b, ok := s.bounty(p.Request); ok {
+			b.Escrow += p.Amount
+			b.Raised += p.Amount
+			b.Pledges.Append(PledgeRec{From: from, Amount: p.Amount})
+			s.Bounties.Set(p.Request, b)
+			continue
+		}
 		c, _ := s.campaign(p.Request)
 		c.Escrow += p.Amount
 		c.Raised += p.Amount
@@ -229,14 +245,17 @@ func (s *State) fundCost(t *types.Tx, c *Campaign, h uint64, ctx *BlockCtx) (bas
 		if ctx.MediaUsed+c.Size > s.MediaCapPerBlock() {
 			return 0, 0, 0, errors.New("media cap for this block reached")
 		}
-		if err := s.checkFundSamples(t, c); err != nil {
-			return 0, 0, 0, err
+		if !s.replay {
+			if err := s.checkSamples(t, c.Seed, c.DataRoot, c.Size); err != nil {
+				return 0, 0, 0, err
+			}
 		}
 	}
 	return base, held, tier, nil
 }
 
-// FundSampleAt is the chunk and sub-chunk a funding proof's sample j shows.
+// FundSampleAt is the chunk and sub-chunk sample j of a data proof (funded
+// upload or bounty reveal) shows.
 func FundSampleAt(seed, id Hash, size uint64, j int) (ci uint64, sub int) {
 	x := cryptox.Tagged("cb/fund/sample", seed[:], id[:], []byte{byte(j)})
 	ci = (uint64(x[0])<<56 | uint64(x[1])<<48 | uint64(x[2])<<40 | uint64(x[3])<<32 |
@@ -244,14 +263,11 @@ func FundSampleAt(seed, id Hash, size uint64, j int) (ci uint64, sub int) {
 	return ci, int(x[8]) % chunk.SubCount(size, ci)
 }
 
-func (s *State) checkFundSamples(t *types.Tx, c *Campaign) error {
-	if s.replay {
-		return nil
-	}
+func (s *State) checkSamples(t *types.Tx, seed, root Hash, size uint64) error {
 	for j, x := range t.Samples {
-		ci, sub := FundSampleAt(c.Seed, t.Target, c.Size, j)
-		if len(x.Sub) != chunk.SubLen(c.Size, ci, sub) || !chunk.VerifySub(c.DataRoot, c.Size, ci, sub, x.Sub, x.Path) {
-			return fmt.Errorf("funding proof sample %d does not verify", j)
+		ci, sub := FundSampleAt(seed, t.Target, size, j)
+		if len(x.Sub) != chunk.SubLen(size, ci, sub) || !chunk.VerifySub(root, size, ci, sub, x.Sub, x.Path) {
+			return fmt.Errorf("data proof sample %d does not verify", j)
 		}
 	}
 	return nil
@@ -263,7 +279,7 @@ func (s *State) applyFundUpload(id Hash, c *Campaign, base, held uint64, tier ui
 	c.Held, c.Tier, c.Bucket = held, tier, s.BucketFor(h, months, perm)
 	c.Status, c.Upload = FundUploaded, h
 	s.Funds.Set(id, c)
-	s.due(h+2, id)                     // the seed: hash of block h+1
+	s.due(h+1, id)                     // the seed: vdf output of block h+1
 	s.due(h+s.P.FundProofBlocks+1, id) // end of the proof window
 }
 
@@ -274,51 +290,44 @@ func (s *State) applyFundProof(id Hash, c *Campaign, base uint64, ctx *BlockCtx)
 	s.fund(c.Bucket, c.Held)
 	c.Escrow -= c.Held
 	c.Held = 0
-	s.refund(c)
-	s.Funds.Delete(id)
+	s.Funds.Set(id, c)
+	s.startRefund(id) // what is left returns to the backers
 }
 
-// refund returns a campaign's escrow to its backers in proportion to their
-// pledges; the rounding remainder goes to the repair pool.
-func (s *State) refund(c *Campaign) {
-	left := c.Escrow
-	for i := 0; i < c.Pledges.Len(); i++ {
-		p := c.Pledges.At(i)
-		share := mulDiv(p.Amount, c.Escrow, c.Raised)
-		if share > 0 {
-			s.Account(p.From).Balance += share
-			left -= share
+// dueAll runs the campaign and bounty deadlines and windows that fall at
+// height h (the block whose header is hd), then the refund queue.
+func (s *State) dueAll(h uint64, hd *types.Header, ctx *BlockCtx) {
+	if ids, ok := s.FundDue.Get(h); ok {
+		s.FundDue.Delete(h)
+		seed := headerSeed(hd)
+		for _, id := range ids {
+			if s.Bounties.Has(id) {
+				s.bountyDue(id, h, seed, ctx)
+				continue
+			}
+			c, ok := s.campaign(id)
+			if !ok {
+				continue
+			}
+			switch {
+			case c.Status == FundOpen && h >= c.Deadline:
+				s.startRefund(id)
+			case c.Status == FundUploaded && h == c.Upload+1 && c.Seed.IsZero():
+				c.Seed = sampleSeed(seed, id)
+				s.Funds.Set(id, c)
+			case c.Status == FundUploaded && h > c.Upload+s.P.FundProofBlocks:
+				s.startRefund(id)
+			}
 		}
 	}
-	s.RepairPool += left
-	c.Escrow = 0
+	s.runRefunds()
 }
 
-// fundDue runs the campaign deadlines that fall at height h. prev is the
-// hash of block h-1.
-func (s *State) fundDue(h uint64, prev Hash) {
-	ids, ok := s.FundDue.Get(h)
-	if !ok {
-		return
-	}
-	s.FundDue.Delete(h)
-	for _, id := range ids {
-		c, ok := s.campaign(id)
-		if !ok {
-			continue
-		}
-		switch {
-		case c.Status == FundOpen && h >= c.Deadline:
-			s.refund(c)
-			s.Funds.Delete(id)
-		case c.Status == FundUploaded && h == c.Upload+2 && c.Seed.IsZero():
-			c.Seed = prev
-			s.Funds.Set(id, c)
-		case c.Status == FundUploaded && h > c.Upload+s.P.FundProofBlocks:
-			s.refund(c)
-			s.Funds.Delete(id)
-		}
-	}
+func pledgeSum(p PledgeRec) pmap.Sum {
+	var pw codec.Writer
+	pw.Fixed(p.From[:])
+	pw.Var(p.Amount)
+	return sumOf("pledge", &pw)
 }
 
 func campaignSum(id Hash, c *Campaign) pmap.Sum {
@@ -333,18 +342,15 @@ func campaignSum(id Hash, c *Campaign) pmap.Sum {
 	w.U8(uint8(c.Status))
 	w.Var(c.Escrow)
 	w.Var(c.Raised)
-	pr := c.Pledges.Root(func(p PledgeRec) pmap.Sum {
-		var pw codec.Writer
-		pw.Fixed(p.From[:])
-		pw.Var(p.Amount)
-		return sumOf("pledge", &pw)
-	})
+	pr := c.Pledges.Root(pledgeSum)
 	w.Fixed(pr[:])
 	w.Var(c.Upload)
 	w.U16(c.Tier)
 	w.U32(c.Bucket)
 	w.Var(c.Held)
 	w.Fixed(c.Seed[:])
+	w.Var(c.RefundPot)
+	w.Var(uint64(c.RefundAt))
 	return sumOf("campaign", &w)
 }
 

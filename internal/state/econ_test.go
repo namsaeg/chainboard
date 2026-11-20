@@ -54,7 +54,7 @@ func TestBlockBytesFloor(t *testing.T) {
 	if got := s.PermByteFee(); got != 400 {
 		t.Fatalf("permanent byte fee %d, want 400 units at 1 coin per GB-year", got)
 	}
-	tx := &types.Tx{Kind: types.TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), MaxFee: 1 << 20, Likes: []types.LikeRef{{Height: 7}}}
+	tx := &types.Tx{Kind: types.TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), MaxFee: 1 << 20, Tips: []types.Tip{{Ref: types.LikeRef{Height: 7}, To: types.Address{1}, Amount: 20_000}}}
 	if got, want := s.BytesFee(tx), 400*uint64(tx.EncodedSize()); got != want {
 		t.Fatalf("like pays %d, want %d", got, want)
 	}

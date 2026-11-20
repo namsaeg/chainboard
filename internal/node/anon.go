@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/bits"
 	mrand "math/rand"
 	"os"
 	"path/filepath"
@@ -29,15 +30,14 @@ import (
 //	pseudonym.key  optional Ed25519 key for signed pseudonymous posts, kept
 //	               apart from the wallet so posts cannot be linked to stake
 
-// AnonRequest is an anonymous post, or a batch of anonymous likes (Likes
-// set, nothing else), waiting to be proven and sent. Both spend one message
-// of the member's epoch.
+// AnonRequest is an anonymous post waiting to be proven and sent. TipTo is
+// the one-time address its tips go to (set when it is queued).
 type AnonRequest struct {
 	Board  string
 	Text   string
 	Parent cryptox.Hash
 	Pseudo bool
-	Likes  []types.LikeRef
+	TipTo  types.Address
 	// Confirm accepts the warning shown before the epoch's last post.
 	Confirm bool
 }
@@ -218,15 +218,48 @@ func (n *Node) RLNStatus() RLNInfo {
 
 // JoinRLN bonds mature stake for an anonymous-lane membership. The message
 // limit per epoch is what the bond buys.
+// BondQuote is what joining with a bond gives now. The bond follows the
+// storage price and the join may be mined a little later, so a quote
+// leaves room for two days of the largest price move; joining needs room
+// for a day and a half, so a bond quoted some hours before still buys the
+// count it was quoted for.
+type BondQuote struct {
+	Limit    uint64   // anonymous posts per epoch the bond gives
+	NextBond uint64   // bond for one more post per epoch (0 at the largest limit)
+	BondFor  []uint64 // BondFor[i]: the bond for i+1 posts per epoch
+}
+
+// RLNQuote quotes a bond (and the bond for every limit, for a calculator).
+func (n *Node) RLNQuote(bond uint64) BondQuote {
+	st := n.trialState()
+	headroom := 1_000_000 + 2*st.P.PriceMaxDayPPM
+	q := BondQuote{Limit: bondLimit(st, bond, headroom)}
+	for l := uint64(1); l <= st.P.RLNMaxLimit; l++ {
+		q.BondFor = append(q.BondFor, mulDivU(st.BondFor(l), headroom, 1_000_000)+1)
+	}
+	if q.Limit < st.P.RLNMaxLimit {
+		q.NextBond = q.BondFor[q.Limit]
+	}
+	return q
+}
+
+// bondLimit is the count a bond buys with the given room (ppm) for the
+// price to rise before the join is mined.
+func bondLimit(st *state.State, bond, headroom uint64) uint64 {
+	return st.RLNLimitFor(mulDivU(bond, 1_000_000, headroom))
+}
+
+func mulDivU(a, b, c uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, _ := bits.Div64(hi%c, lo, c)
+	return q
+}
+
 func (n *Node) JoinRLN(bond uint64) error {
 	st := n.trialState()
-	// The whole offered bond is used. The limit leaves room for two days
-	// of the largest price move, as the bond follows the storage price and
-	// the join may be mined a little later.
-	headroom := 1_000_000 + 2*st.P.PriceMaxDayPPM
-	limit := st.RLNLimitFor(bond / headroom * 1_000_000)
+	limit := bondLimit(st, bond, 1_000_000+3*st.P.PriceMaxDayPPM/2)
 	if limit == 0 {
-		need := st.BondFor(1)
+		need := n.RLNQuote(0).BondFor[0]
 		return fmt.Errorf("bond too small: one message per epoch needs %d.%08d coin now", need/params.Coin, need%params.Coin)
 	}
 	n.rlnMu.Lock()
@@ -306,13 +339,8 @@ func (n *Node) LeaveRLN() error {
 // AnonPost queues an anonymous post. It is proven when it leaves, after the
 // same random delay as other own transactions.
 func (n *Node) AnonPost(req AnonRequest) error {
-	if len(req.Text) == 0 && len(req.Likes) == 0 {
+	if len(req.Text) == 0 {
 		return errors.New("empty post")
-	}
-	what := "익명 글"
-	if len(req.Likes) > 0 {
-		req.Board, req.Text, req.Parent, req.Pseudo = "", "", cryptox.Hash{}, false
-		what = "익명 좋아요 묶음"
 	}
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
@@ -349,11 +377,17 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		draft.PseudoPub = append([]byte(nil), n.pseudo.Pub...)
 	}
 	draft.RLN = &types.RLNProof{Proof: []byte{0}}
-	for range draft.Likes {
-		draft.Tags = append(draft.Tags, types.Hash{31: 1}) // placeholders: the signal does not cover tags
-	}
 	if err := checkAnonContent(draft); err != nil {
 		return err
+	}
+	if !req.Pseudo && req.TipTo.IsZero() {
+		// A fresh address per post: tips reach the writer without linking
+		// its posts to each other or to the wallet.
+		to, err := n.newTipKey()
+		if err != nil {
+			return err
+		}
+		req.TipTo, draft.TipTo = to, to
 	}
 	if found {
 		// Reserve the message id now, so the count is exact however many
@@ -377,8 +411,8 @@ func (n *Node) AnonPost(req AnonRequest) error {
 			if used+1 == limit && !req.Confirm {
 				n.rlnMu.Unlock()
 				return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
-					"이번 에포크의 마지막 익명 메시지를 %s에 써요(%d/%d). 보내면 약 %d분(%d블록) 뒤 다음 에포크까지 익명 글도 익명 좋아요도 더 보낼 수 없어요.",
-					what, limit, limit, mins, left)}}}
+					"이번 에포크에 쓸 수 있는 마지막 익명 글이에요(%d/%d). 보내면 약 %d분(%d블록) 뒤 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
+					limit, limit, mins, left)}}}
 			}
 		}
 		_, err := n.allocMsgID(e, limit, sig)
@@ -397,8 +431,8 @@ func (n *Node) AnonPost(req AnonRequest) error {
 		}
 		if waiting+1 == limit && !req.Confirm {
 			return &WarningError{Warnings: []Warning{{Code: "anon_last", Message: fmt.Sprintf(
-				"가입이 처리되면 이 %s이(가) 이번 에포크의 마지막 익명 메시지가 돼요(%d/%d). 그 뒤로는 다음 에포크까지 익명으로 더 보낼 수 없어요.",
-				what, limit, limit)}}}
+				"가입이 처리되면 이 글이 이번 에포크의 마지막 익명 글이 돼요(%d/%d). 그 뒤로는 다음 에포크까지 익명 글을 더 쓸 수 없어요.",
+				limit, limit)}}}
 		}
 	}
 	n.enqueue(queued{anon: &req})
@@ -515,13 +549,9 @@ func checkAnonContent(t *types.Tx) error {
 	return t.CheckStateless()
 }
 
-// newAnonTx is an anonymous post's content (kept for one month) or a like
-// batch's references.
+// newAnonTx is an anonymous post's content: kept for one month.
 func newAnonTx(req AnonRequest) *types.Tx {
-	if len(req.Likes) > 0 {
-		return &types.Tx{Kind: types.TxAnonLikes, Likes: append([]types.LikeRef(nil), req.Likes...)}
-	}
-	t := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Parent: req.Parent, Tier: params.TierFree}
+	t := &types.Tx{Kind: types.TxAnonPost, Board: req.Board, Parent: req.Parent, Tier: params.TierFree, TipTo: req.TipTo}
 	t.SetText([]byte(req.Text))
 	return t
 }
@@ -641,13 +671,13 @@ func (n *Node) ownAnon(pooled bool) []AnonRequest {
 	return out
 }
 
-// onDoubleSignal slashes a member whose secret two posts revealed.
+// onDoubleSignal slashes a member whose epoch key two posts revealed.
 func (n *Node) onDoubleSignal(ds *state.DoubleSignal) {
-	sec, ok := ds.Secret()
+	key, ok := ds.EpochKey()
 	if !ok {
 		return
 	}
-	t := &types.Tx{Kind: types.TxRLNSlash, Secret: sec}
+	t := &types.Tx{Kind: types.TxRLNSlash, Epoch: ds.Epoch, Target: ds.Nullifier, Secret: key}
 	if err := n.Host.Publish(t); err != nil {
 		n.cfg.Logf("node: slash: %v", err)
 		return

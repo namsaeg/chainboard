@@ -157,7 +157,11 @@ type State struct {
 	Data     pmap.Map[Hash, *DataInfo]
 	Posts    pmap.Map[Hash, *PostInfo]
 	Funds    pmap.Map[Hash, *Campaign] // funding requests on chain, by request id
-	FundDue  pmap.Map[uint64, []Hash]  // height -> campaigns to look at then
+	FundDue  pmap.Map[uint64, []Hash]  // height -> campaigns and bounties to look at then
+	Bounties pmap.Map[Hash, *Bounty]   // bounties, by bounty transaction id
+	// Refunding lists campaigns and bounties paying back their backers, in
+	// order (see refund.go).
+	Refunding []Hash
 	// Repeat counts in two generations of DupWindowBlocks: an entry older
 	// than that can only read as zero, so older generations are dropped.
 	dupGen          uint64
@@ -216,6 +220,7 @@ func (s *State) Clone() *State {
 		c.RLNNulls[e] = m
 	}
 	c.RLNExits = append([]exit(nil), s.RLNExits...)
+	c.Refunding = append([]Hash(nil), s.Refunding...)
 	return &c
 }
 
@@ -399,6 +404,7 @@ func Genesis(p *params.Params) (*State, []byte) {
 		Posts:      pmap.Committed(pmap.Hash32[Hash], postSum),
 		Funds:      pmap.Committed(pmap.Hash32[Hash], campaignSum),
 		FundDue:    pmap.Committed(pmap.Uint64, dueSum),
+		Bounties:   pmap.Committed(pmap.Hash32[Hash], bountySum),
 		dupCur:     newDupMap(),
 		dupPrev:    newDupMap(),
 		Price:      p.InitialPrice,
@@ -467,6 +473,10 @@ func (s *State) CheckSupply() error {
 	})
 	s.Funds.Range(func(_ Hash, c *Campaign) bool {
 		total += c.Escrow
+		return true
+	})
+	s.Bounties.Range(func(_ Hash, b *Bounty) bool {
+		total += b.Escrow
 		return true
 	})
 	total += s.Endowment + s.RepairPool

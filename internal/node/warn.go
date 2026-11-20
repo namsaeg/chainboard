@@ -112,7 +112,7 @@ func (n *Node) checkForeign(st *state.State) {
 			continue
 		}
 		for id := uint64(0); id < uint64(m.Limit); id++ {
-			null := rln.ToBytes(rln.Nullifier(rln.A1(*n.secret, e, scope, id)))
+			null := rln.ToBytes(rln.Nullifier(rln.MessageA1(*n.secret, e, scope, id)))
 			share, used := nulls.Get(null)
 			if !used {
 				continue

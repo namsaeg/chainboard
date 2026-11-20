@@ -107,10 +107,17 @@ func TestIndexReorg(t *testing.T) {
 	}
 }
 
+// fakeLikes tips the posts the references name; fakePost's author is the
+// zero key's address.
 func fakeLikes(from byte, refs ...types.LikeRef) *types.Tx {
 	pub := make([]byte, 32)
 	pub[0] = from
-	return &types.Tx{Kind: types.TxLikes, From: pub, Likes: refs}
+	author := cryptox.AddressOf(make([]byte, 32))
+	t := &types.Tx{Kind: types.TxLikes, From: pub}
+	for _, r := range refs {
+		t.Tips = append(t.Tips, types.Tip{Ref: r, To: author, Amount: 1000})
+	}
+	return t
 }
 
 // Likes are resolved from short references, counted once per account and

@@ -447,10 +447,32 @@ func TestTips(t *testing.T) {
 	if r.pool.Add(self) == nil {
 		t.Fatal("tip to oneself accepted")
 	}
-	r.send(t, k, &types.Tx{Kind: types.TxLikes, Likes: []types.LikeRef{{Height: 2}}, Tips: []types.Tip{{Ref: ref, To: to, Amount: 5 * min}}, MaxFee: params.Coin})
+	r.send(t, k, &types.Tx{Kind: types.TxLikes, Tips: []types.Tip{{Ref: ref, To: to, Amount: 5 * min}}, MaxFee: params.Coin})
 	r.mineN(t, 1)
 	if got := r.c.Tip().Peek(to).Balance; got != 5*min {
 		t.Fatalf("receiver has %d, want %d", got, 5*min)
 	}
 	r.check(t)
+}
+
+// Sending to an address that has no account yet pays for creating it.
+func TestNewAccountFee(t *testing.T) {
+	r := newRig(t, FastParams(), 4)
+	r.mineTo(t, 5)
+	k := r.m.Key
+	st := r.c.Tip().Clone()
+	ctx := st.NewCtx()
+	spend := func(to types.Address) uint64 { // what the transfer burns
+		before := ctx.Burn
+		tx := &types.Tx{Kind: types.TxTransfer, To: to, Amount: 1000, MaxFee: params.Coin, Nonce: st.Peek(k.Address()).Nonce}
+		tx.Sign(k)
+		if err := st.ApplyTx(tx, ctx); err != nil {
+			t.Fatal(err)
+		}
+		return ctx.Burn - before
+	}
+	first, second := spend(types.Address{42}), spend(types.Address{42})
+	if first-second != st.NewAccountFee() {
+		t.Fatalf("new account paid %d, existing %d, fee %d", first, second, st.NewAccountFee())
+	}
 }

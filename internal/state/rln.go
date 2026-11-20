@@ -44,7 +44,9 @@ type Member struct {
 }
 
 // Share is the point an anonymous post revealed for its nullifier.
-type Share struct{ X, Y Hash }
+// Share is what the state keeps of an anonymous message for the slashing
+// window: its point on the share line and its masked identity tag.
+type Share struct{ X, Y, Tag Hash }
 
 // exit is a scheduled membership release.
 type exit struct {
@@ -53,7 +55,7 @@ type exit struct {
 }
 
 // DoubleSignal is returned when an anonymous post reuses a nullifier with a
-// different signal and a valid proof: the two shares reveal the secret.
+// different signal and a valid proof: the two shares reveal the epoch key.
 type DoubleSignal struct {
 	Epoch     uint64
 	Nullifier Hash
@@ -65,8 +67,8 @@ func (d *DoubleSignal) Error() string {
 	return "anonymous post exceeds its rate limit (double signal)"
 }
 
-// Secret recovers the member secret from the two shares.
-func (d *DoubleSignal) Secret() (Hash, bool) {
+// EpochKey recovers the epoch key from the two shares.
+func (d *DoubleSignal) EpochKey() (Hash, bool) {
 	x1, ok1 := rln.FromBytes(d.First.X)
 	y1, ok2 := rln.FromBytes(d.First.Y)
 	x2, ok3 := rln.FromBytes(d.Second.X)
@@ -334,10 +336,13 @@ func (s *State) anonPublic(t *types.Tx, h uint64) (rln.Public, Share, error) {
 	if pub.Y, err = field(p.Y); err != nil {
 		return pub, Share{}, err
 	}
+	if pub.Tag, err = field(p.Tag); err != nil {
+		return pub, Share{}, err
+	}
 	sig := t.Signal()
 	pub.X = rln.SignalX(sig[:])
 	pub.Epoch, pub.Scope, pub.Cap = p.Epoch, s.P.RLNScope(), cap
-	return pub, Share{X: rln.ToBytes(pub.X), Y: p.Y}, nil
+	return pub, Share{X: rln.ToBytes(pub.X), Y: p.Y, Tag: p.Tag}, nil
 }
 
 // checkNullifier: the nullifier comes first, so a double signal is caught
@@ -364,51 +369,6 @@ func (s *State) noteNullifier(t *types.Tx, share Share) {
 	}
 	nulls.Set(t.RLN.Nullifier, share)
 	s.RLNNulls[t.RLN.Epoch] = nulls
-}
-
-// likePublic is the public side of an anonymous like batch's proof.
-func likePublic(t *types.Tx, pub rln.Public) (rln.LikePublic, error) {
-	lp := rln.LikePublic{Public: pub}
-	for i, l := range t.Likes {
-		lp.Posts[i] = l.Post()
-		tag, err := field(t.Tags[i])
-		if err != nil {
-			return lp, err
-		}
-		lp.Tags[i] = tag
-	}
-	return lp, nil
-}
-
-// applyAnonLikes validates and applies an anonymous like batch: one message
-// of the member's epoch, no fee, no state but the nullifier (nodes count
-// the likes from the block, by tag).
-func (s *State) applyAnonLikes(t *types.Tx, ctx *BlockCtx) error {
-	pub, share, err := s.anonPublic(t, ctx.H)
-	if err != nil {
-		return err
-	}
-	lp, err := likePublic(t, pub)
-	if err != nil {
-		return err
-	}
-	key := proofKey(t, pub.Cap, pub.Scope)
-	verify := func() error { return rln.VerifyLikesCached(key, t.RLN.Proof, lp) }
-	if err := s.checkNullifier(t, share, verify); err != nil {
-		return err
-	}
-	size := uint64(t.LaneSize())
-	if ctx.FreeUsed+size > s.P.TextCapFree() {
-		return errors.New("anonymous lane full")
-	}
-	if !s.replay {
-		if err := verify(); err != nil {
-			return err
-		}
-	}
-	ctx.FreeUsed += size
-	s.noteNullifier(t, share)
-	return nil
 }
 
 // applyAnon validates and applies an anonymous post. Atomic like ApplyTx.
@@ -453,11 +413,26 @@ func (s *State) applyAnon(t *types.Tx, ctx *BlockCtx) error {
 
 // applySlash removes a member whose secret is public and takes its bond.
 func (s *State) applySlash(t *types.Tx, ctx *BlockCtx) error {
-	sec, err := field(t.Secret)
+	share, ok := s.NullShare(t.Epoch, t.Target)
+	if !ok {
+		return errors.New("no message with that nullifier in the slashing window")
+	}
+	key, err := field(t.Secret)
 	if err != nil {
 		return err
 	}
-	idc := rln.ToBytes(rln.IdentityCommitment(sec))
+	x, err1 := field(share.X)
+	y, err2 := field(share.Y)
+	tag, err3 := field(share.Tag)
+	null, err4 := field(t.Target)
+	if err := errors.Join(err1, err2, err3, err4); err != nil {
+		return err
+	}
+	a1, ok := rln.SlopeOf(key, x, y, null)
+	if !ok {
+		return errors.New("that key does not open the message")
+	}
+	idc := rln.ToBytes(rln.Unmask(tag, a1))
 	m, ok := s.Members.Get(idc)
 	if !ok || m.Status == MemberGone {
 		return errors.New("no slashable membership for that secret")
@@ -468,7 +443,7 @@ func (s *State) applySlash(t *types.Tx, ctx *BlockCtx) error {
 	ctx.Slashes++
 	m = s.cloneMember(idc)
 	s.RLNTree.Set(m.Index, fr.Element{})
-	// The secret is public now: proofs against older roots must stop working.
+	// Proofs against older roots (which still hold the member) stop now.
 	s.RLNRoots = []RootEntry{{Root: s.RLNRoot()}}
 	reward := mulDiv(m.Bond, s.P.RLNSlashPermille, 1000)
 	ctx.Tips += reward
@@ -511,9 +486,8 @@ func (s *State) AnonEpochCap() (epoch, cap uint64) {
 }
 
 // ProveAnon fills in the RLN proof of an anonymous post (content and any
-// pseudonym signature already set) or like batch (likes set; the tags are
-// filled in too) for the member holding secret, as message msgID of the
-// next block's epoch.
+// pseudonym signature already set) for the member holding secret, as
+// message msgID of the next block's epoch.
 func (s *State) ProveAnon(t *types.Tx, secret fr.Element, msgID uint64) error {
 	idc := rln.ToBytes(rln.IdentityCommitment(secret))
 	m, path, bits, ok := s.MemberPath(idc)
@@ -523,29 +497,16 @@ func (s *State) ProveAnon(t *types.Tx, secret fr.Element, msgID uint64) error {
 	epoch, cap := s.AnonEpochCap()
 	signal := t.Signal()
 	scope := s.P.RLNScope()
-	a1 := rln.A1(secret, epoch, scope, msgID)
+	key := rln.EpochKey(secret, epoch, scope)
+	a1 := rln.A1(key, msgID)
 	x := rln.SignalX(signal[:])
-	pub := rln.Public{Root: s.RLNTree.Root(), X: x, Y: rln.Share(secret, a1, x), Nullifier: rln.Nullifier(a1),
-		Epoch: epoch, Scope: scope, Cap: cap}
-	w := rln.Witness{Secret: secret, Limit: uint64(m.Limit), MsgID: msgID, Path: path, Bits: bits}
-	var proof []byte
-	var err error
-	if t.Kind == types.TxAnonLikes {
-		lp := rln.LikePublic{Public: pub}
-		t.Tags = make([]types.Hash, len(t.Likes))
-		for i, l := range t.Likes {
-			lp.Posts[i] = l.Post()
-			lp.Tags[i] = rln.LikeTag(secret, scope, lp.Posts[i])
-			t.Tags[i] = rln.ToBytes(lp.Tags[i])
-		}
-		proof, err = rln.ProveLikes(lp, w)
-	} else {
-		proof, err = rln.Prove(pub, w)
-	}
+	pub := rln.Public{Root: s.RLNTree.Root(), X: x, Y: rln.Share(key, a1, x), Nullifier: rln.Nullifier(a1),
+		Tag: rln.Tag(rln.IdentityCommitment(secret), a1), Epoch: epoch, Scope: scope, Cap: cap}
+	proof, err := rln.Prove(pub, rln.Witness{Secret: secret, Limit: uint64(m.Limit), MsgID: msgID, Path: path, Bits: bits})
 	if err != nil {
 		return fmt.Errorf("rln proof: %w", err)
 	}
 	t.RLN = &types.RLNProof{Root: rln.ToBytes(pub.Root), Epoch: epoch, Nullifier: rln.ToBytes(pub.Nullifier),
-		Y: rln.ToBytes(pub.Y), Proof: proof}
+		Y: rln.ToBytes(pub.Y), Tag: rln.ToBytes(pub.Tag), Proof: proof}
 	return nil
 }

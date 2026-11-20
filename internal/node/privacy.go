@@ -73,3 +73,18 @@ func (n *Node) Privacy() PrivacyInfo {
 	}
 	return pi
 }
+
+// Settings are the node's start-up settings that the settings page shows
+// (they are changed with command-line flags, then a restart).
+type Settings struct {
+	Mine         bool    `json:"mine"`
+	PledgeGB     float64 `json:"pledge_gb"`
+	SendDelaySec int     `json:"send_delay_seconds"`
+	Locked       bool    `json:"keys_locked"` // key files are password-protected
+}
+
+// Settings reports the start-up settings.
+func (n *Node) Settings() Settings {
+	return Settings{Mine: n.cfg.Mine, PledgeGB: float64(n.cfg.PledgeBytes) / 1e9, SendDelaySec: int(n.cfg.SendDelayMax / time.Second),
+		Locked: n.cfg.Password != ""}
+}

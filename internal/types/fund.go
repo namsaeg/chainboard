@@ -3,7 +3,6 @@ package types
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +10,8 @@ import (
 	"runtime"
 	"sync"
 	"unicode/utf8"
+
+	"golang.org/x/crypto/argon2"
 
 	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/codec"
@@ -154,16 +155,16 @@ func decodeSamples(r *codec.Reader) []FundSample {
 	return out
 }
 
-// PoWBits is the work of a funding request's gossip nonce: the leading
-// zero bits of SHA-256(tag || id || nonce). Requests are gossiped before
-// any pledge carries them on chain, so this work is what makes a flood of
-// them cost something.
+// PoWBits is the work of a gossip nonce (funding requests, bounty
+// offers): the leading zero bits of Argon2id(tag, id, nonce) with
+// PoWMemKiB of memory. Items gossiped before they are on chain carry this
+// work so that flooding them costs something; being memory-hard, it gives
+// GPUs and hashing hardware little edge over a common computer.
 func PoWBits(id Hash, nonce uint64) int {
-	var buf [32 + 32 + 8]byte
-	copy(buf[:32], powTag[:])
-	copy(buf[32:64], id[:])
-	binary.BigEndian.PutUint64(buf[64:], nonce)
-	h := sha256.Sum256(buf[:])
+	var buf [32 + 8]byte
+	copy(buf[:32], id[:])
+	binary.BigEndian.PutUint64(buf[32:], nonce)
+	h := argon2.IDKey(buf[:], powSalt, 1, PoWMemKiB, 1, 32)
 	n := 0
 	for _, b := range h {
 		if b != 0 {
@@ -174,7 +175,10 @@ func PoWBits(id Hash, nonce uint64) int {
 	return n
 }
 
-var powTag = sha256.Sum256([]byte("cb/fund/pow"))
+// PoWMemKiB is the memory one gossip work hash takes (about 3 ms to check).
+const PoWMemKiB = 4096
+
+var powSalt = []byte("cb/gossip/pow/v1")
 
 // SolvePoW finds a nonce of at least want bits, on all cores. It stops
 // early (returning false) when stop is closed.

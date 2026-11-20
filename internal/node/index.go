@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,15 +32,12 @@ type PostView struct {
 	Time     int64    `json:"time"`
 	Likes    uint64   `json:"likes"`
 	Comments uint64   `json:"comments"`
-	Tips     uint64   `json:"tips"`     // coins tipped to the author (base units)
-	Tippable bool     `json:"tippable"` // has an author address to tip
-	// Liked and LikedAnon: this node's like (signed, or anonymous by its
-	// member's tag) is counted.
-	Liked     bool   `json:"liked,omitempty"`
-	LikedAnon bool   `json:"liked_anon,omitempty"`
-	Lane      string `json:"lane"`                // "anon" or "fee"
-	Pseudo    bool   `json:"pseudonym,omitempty"` // author is a pseudonym key
-	Pending   bool   `json:"pending,omitempty"`
+	Tips     uint64   `json:"tips"`                // coins tipped to the author (base units)
+	TipTo    string   `json:"tip_to,omitempty"`    // where its likes (tips) go; empty: it takes none
+	Liked    bool     `json:"liked,omitempty"`     // this node's like is counted
+	Lane     string   `json:"lane"`                // "anon" or "fee"
+	Pseudo   bool     `json:"pseudonym,omitempty"` // author is a pseudonym key
+	Pending  bool     `json:"pending,omitempty"`
 	// Retention of the text: tier code, the height it is kept until (0 is
 	// permanent) and whether the body is here ("ok"), being fetched
 	// ("loading") or past its retention ("expired").
@@ -48,6 +46,8 @@ type PostView struct {
 	TextState string `json:"text_state"`
 	// Fund is set on a funding request (its note is the text).
 	Fund *FundView `json:"fund,omitempty"`
+	// Kept says, per attachment, how long it is stored (same order).
+	Kept []Retention `json:"kept,omitempty"`
 
 	id       cryptox.Hash
 	textHash cryptox.Hash
@@ -86,14 +86,16 @@ var (
 	ixData     = []byte("data")     // data root -> height first placed
 	ixUndo     = []byte("undo")     // height -> what that block added
 	ixAt       = []byte("at")       // height id -> nil (resolves like references)
-	ixLiked    = []byte("liked")    // post id, account (or anonymous like tag) -> 1
+	ixLiked    = []byte("liked")    // post id, account -> 1
+	ixByAuthor = []byte("byauthor") // owner, height, post id -> 1 (see postRec.owner)
+	ixByLiker  = []byte("byliker")  // account, post id -> 1 (counted likes)
 	ixStats    = []byte("stats")    // post id -> likes (u64) comments (u64)
 	ixMeta     = []byte("meta")     // "chain" -> format and genesis
 )
 
 // indexFormat changes whenever what the index stores changes; an index of
 // another format or chain is rebuilt.
-const indexFormat = "4"
+const indexFormat = "6"
 
 // OpenIndex opens (or creates) the index database of the chain with the
 // given genesis. The index is derived from the chain, so it skips fsync, and
@@ -127,7 +129,7 @@ func OpenIndex(path string, genesis cryptox.Hash) (*Index, error) {
 		}
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{ixPath, ixPosts, ixBoard, ixCount, ixComments, ixText, ixData, ixUndo, ixAt, ixLiked, ixStats, ixMeta} {
+		for _, b := range [][]byte{ixPath, ixPosts, ixBoard, ixCount, ixComments, ixText, ixData, ixUndo, ixAt, ixLiked, ixStats, ixMeta, ixByAuthor, ixByLiker} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -158,6 +160,16 @@ func commentKey(parent cryptox.Hash, height uint64, id cryptox.Hash) []byte {
 	return append(k, id[:]...)
 }
 
+// Retention is how long something is stored: the heights it was stored
+// at and is kept until (0: permanent; Gone: no longer stored).
+type Retention struct {
+	Root  string `json:"root,omitempty"`
+	Tier  uint16 `json:"tier"`
+	From  uint64 `json:"from"`
+	Until uint64 `json:"until"`
+	Gone  bool   `json:"gone,omitempty"`
+}
+
 // postRec is what the index stores per post.
 type postRec struct {
 	ID       cryptox.Hash
@@ -172,8 +184,10 @@ type postRec struct {
 	TextHash cryptox.Hash
 	TextLen  uint16
 	Tier     uint16
-	Fund     bool   // a funding request; Note is its text
-	Note     string // funding request
+	Fund     bool            // a funding request; Note is its text
+	Note     string          // funding request or bounty
+	Bounty   bool            // a bounty; Note is its text, Attach its references
+	TipTo    cryptox.Address // anonymous post: the one-time address its tips go to
 }
 
 func (r *postRec) encode() []byte {
@@ -194,6 +208,8 @@ func (r *postRec) encode() []byte {
 	w.U16(r.Tier)
 	w.Bool(r.Fund)
 	w.Bytes([]byte(r.Note))
+	w.Bool(r.Bounty)
+	w.Fixed(r.TipTo[:])
 	return w.B
 }
 
@@ -217,7 +233,9 @@ func decodeRec(id cryptox.Hash, b []byte) (*postRec, error) {
 	r.TextLen = rd.U16()
 	r.Tier = rd.U16()
 	r.Fund = rd.Bool()
-	r.Note = string(rd.Bytes(types.MaxFundNote))
+	r.Note = string(rd.Bytes(types.MaxBountyNote))
+	r.Bounty = rd.Bool()
+	rd.Fixed(r.TipTo[:])
 	return r, rd.Done()
 }
 
@@ -230,8 +248,36 @@ func fundRec(q *types.FundRequest, height uint64, tm int64) *postRec {
 func recOf(t *types.Tx, height uint64, tm int64) *postRec {
 	r := &postRec{ID: t.ID(), Board: t.Board, Author: t.Author(), Parent: t.Parent, Height: height, Time: tm,
 		Anon: t.Kind == types.TxAnonPost, Pseudo: len(t.PseudoPub) > 0, Attach: t.Attach,
-		TextHash: t.TextHash, TextLen: t.TextLen, Tier: t.Tier}
+		TextHash: t.TextHash, TextLen: t.TextLen, Tier: t.Tier, TipTo: t.TipTo}
 	return r
+}
+
+// bountyRec is how a bounty is listed: as a post of its board.
+func bountyRec(t *types.Tx, height uint64, tm int64) *postRec {
+	return &postRec{ID: t.ID(), Board: t.Board, Author: t.Sender(), Height: height, Time: tm,
+		Attach: t.Attach, Bounty: true, Note: t.Note}
+}
+
+// tipTo is where a post's tips count: its signer, its pseudonym, or the
+// one-time address an anonymous post names (zero: it cannot be tipped).
+func (r *postRec) tipTo() cryptox.Address {
+	switch {
+	case r.Fund || r.Bounty:
+		return cryptox.Address{}
+	case r.Anon && !r.Pseudo:
+		return r.TipTo
+	}
+	return r.Author
+}
+
+// owner is the address a post is listed under for its writer: the signer
+// or pseudonym, or for an anonymous post its one-time tip address (public
+// on chain, so listing by it tells nothing new).
+func (r *postRec) owner() cryptox.Address {
+	if !r.Author.IsZero() {
+		return r.Author
+	}
+	return r.TipTo
 }
 
 func (r *postRec) view() PostView {
@@ -240,11 +286,16 @@ func (r *postRec) view() PostView {
 	if r.Fund {
 		v.Text, v.Lane = r.Note, "fund"
 	}
-	v.Tippable = !r.Fund
+	if to := r.tipTo(); !to.IsZero() {
+		v.TipTo = to.String()
+	}
+	if r.Bounty {
+		v.Text, v.Lane = r.Note, "bounty"
+	}
 	if r.Anon {
-		v.Lane, v.Author, v.Tippable = "anon", "", false
+		v.Lane, v.Author = "anon", ""
 		if r.Pseudo {
-			v.Author, v.Pseudo, v.Tippable = r.Author.String(), true, true
+			v.Author, v.Pseudo = r.Author.String(), true
 		}
 	}
 	if !r.Parent.IsZero() {
@@ -349,7 +400,6 @@ const (
 	undoData = 1 // data root first placed
 	undoPost = 2 // post indexed
 	undoLike = 3 // like counted: post id, account
-	undoAnon = 4 // anonymous like counted: post id, tag
 	undoTip  = 5 // tip counted: post id, amount
 )
 
@@ -398,32 +448,20 @@ func indexBlock(tx *bolt.Tx, b *types.Block, h, likeWindow uint64) ([]cryptox.Ha
 					return nil, 0, err
 				}
 			}
-			for _, ref := range t.Likes {
-				id, ok := resolveRef(tx, ref)
-				if !ok || (likeWindow > 0 && h > ref.Height+likeWindow) {
-					continue
-				}
-				if err := countLike(tx, &undo, undoLike, id, from[:]); err != nil {
-					return nil, 0, err
-				}
-			}
 			for _, p := range t.Tips {
 				if err := countTip(tx, &undo, p, from, h, likeWindow); err != nil {
 					return nil, 0, err
 				}
 			}
-		case t.Kind == types.TxAnonLikes:
-			// Counted once per (post, tag): a member's tag for a post never
-			// changes, and says nothing about its other likes.
-			for i, ref := range t.Likes {
-				id, ok := resolveRef(tx, ref)
-				if !ok || (likeWindow > 0 && h > ref.Height+likeWindow) {
-					continue
-				}
-				if err := countLike(tx, &undo, undoAnon, id, t.Tags[i][:]); err != nil {
-					return nil, 0, err
-				}
+		case t.Kind == types.TxBounty:
+			r := bountyRec(t, h, b.Time)
+			if err := putPost(tx, r); err != nil {
+				return nil, 0, err
 			}
+			count++
+			boards[r.Board]++
+			undo.U8(undoPost)
+			undo.Fixed(r.ID[:])
 		case t.IsPost():
 			count++
 			r := recOf(t, h, b.Time)
@@ -452,6 +490,64 @@ func indexBlock(tx *bolt.Tx, b *types.Block, h, likeWindow uint64) ([]cryptox.Ha
 	return withText, count, tx.Bucket(ixPath).Put(u64(h), bh[:])
 }
 
+func authorKey(a cryptox.Address, height uint64, id cryptox.Hash) []byte {
+	return append(append(append(make([]byte, 0, 60), a[:]...), u64(height)...), id[:]...)
+}
+
+// ByAuthors lists the posts of some writers (signer, pseudonym or the tip
+// address of an anonymous post), newest first.
+func (ix *Index) ByAuthors(as []cryptox.Address, limit int) []PostView {
+	var out []PostView
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(ixByAuthor).Cursor()
+		for _, a := range as {
+			prefix := a[:]
+			k, _ := c.Seek(append(append([]byte(nil), prefix...), bytes.Repeat([]byte{0xff}, 40)...))
+			if k == nil {
+				k, _ = c.Last()
+			} else {
+				k, _ = c.Prev()
+			}
+			for n := 0; k != nil && bytes.HasPrefix(k, prefix) && n < limit; k, _ = c.Prev() {
+				var id cryptox.Hash
+				copy(id[:], k[28:])
+				if r, ok := ix.get(tx, id); ok {
+					v := r.view()
+					v.setStats(stats(tx, id))
+					out = append(out, v)
+					n++
+				}
+			}
+		}
+		return nil
+	})
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Height > out[j].Height })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// LikedPosts lists the posts an account's counted likes (tips and pledges)
+// went to.
+func (ix *Index) LikedPosts(a cryptox.Address, limit int) []PostView {
+	var out []PostView
+	_ = ix.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(ixByLiker).Cursor()
+		for k, _ := c.Seek(a[:]); k != nil && bytes.HasPrefix(k, a[:]) && len(out) < limit; k, _ = c.Next() {
+			var id cryptox.Hash
+			copy(id[:], k[20:])
+			if r, ok := ix.get(tx, id); ok {
+				v := r.view()
+				v.setStats(stats(tx, id))
+				out = append(out, v)
+			}
+		}
+		return nil
+	})
+	return out
+}
+
 func atKey(height uint64, id cryptox.Hash) []byte { return append(u64(height), id[:]...) }
 
 // resolveRef finds the post a like reference names. Two posts of one block
@@ -472,8 +568,7 @@ func resolveRef(tx *bolt.Tx, ref types.LikeRef) (cryptox.Hash, bool) {
 	return id, true
 }
 
-// likedKey names one like: the post and who liked it, an account (20
-// bytes) or an anonymous tag (32 bytes), so the two never collide.
+// likedKey names one like: the post and the account that liked it.
 func likedKey(id cryptox.Hash, who []byte) []byte {
 	return append(append(make([]byte, 0, 64), id[:]...), who...)
 }
@@ -486,6 +581,9 @@ func countLike(tx *bolt.Tx, undo *codec.Writer, kind uint8, id cryptox.Hash, who
 		return nil
 	}
 	if err := lb.Put(k, []byte{1}); err != nil { // a nil value reads back as absent
+		return err
+	}
+	if err := tx.Bucket(ixByLiker).Put(append(append([]byte(nil), who...), id[:]...), []byte{1}); err != nil {
 		return err
 	}
 	undo.U8(kind)
@@ -501,7 +599,7 @@ func countTip(tx *bolt.Tx, undo *codec.Writer, p types.Tip, from cryptox.Address
 		return nil
 	}
 	r, err := decodeRec(id, tx.Bucket(ixPosts).Get(id[:]))
-	if err != nil || r.Fund || r.Author != p.To || (r.Anon && !r.Pseudo) {
+	if err != nil || r.tipTo().IsZero() || r.tipTo() != p.To {
 		return nil
 	}
 	if err := addStat(tx, id, 0, 0, int64(p.Amount)); err != nil {
@@ -555,6 +653,11 @@ func putPost(tx *bolt.Tx, r *postRec) error {
 			return err
 		}
 	}
+	if o := r.owner(); !o.IsZero() {
+		if err := tx.Bucket(ixByAuthor).Put(authorKey(o, r.Height, r.ID), []byte{1}); err != nil {
+			return err
+		}
+	}
 	if !r.Parent.IsZero() {
 		if err := addStat(tx, r.Parent, 0, 1, 0); err != nil {
 			return err
@@ -593,8 +696,6 @@ func undoHeight(tx *bolt.Tx, h uint64) error {
 		switch c.kind {
 		case undoLike:
 			c.who = make([]byte, len(cryptox.Address{}))
-		case undoAnon:
-			c.who = make([]byte, len(cryptox.Hash{}))
 		case undoTip:
 			c.who = make([]byte, 8)
 		}
@@ -607,8 +708,9 @@ func undoHeight(tx *bolt.Tx, h uint64) error {
 		switch c.kind {
 		case undoData:
 			err = tx.Bucket(ixData).Delete(c.id[:])
-		case undoLike, undoAnon:
+		case undoLike:
 			if err = tx.Bucket(ixLiked).Delete(likedKey(c.id, c.who)); err == nil {
+				_ = tx.Bucket(ixByLiker).Delete(append(append([]byte(nil), c.who...), c.id[:]...))
 				err = addStat(tx, c.id, -1, 0, 0)
 			}
 		case undoTip:
@@ -639,6 +741,9 @@ func removePost(tx *bolt.Tx, x cryptox.Hash) error {
 		return err
 	}
 	_ = tx.Bucket(ixAt).Delete(atKey(r.Height, x))
+	if o := r.owner(); !o.IsZero() {
+		_ = tx.Bucket(ixByAuthor).Delete(authorKey(o, r.Height, x))
+	}
 	if r.TextLen > 0 {
 		_ = tx.Bucket(ixText).Delete(append(r.TextHash[:], x[:]...))
 	}
@@ -805,7 +910,10 @@ func (ix *Index) Thread(id cryptox.Hash) (*PostView, []PostView) {
 
 // PendingPosts lists posts not mined yet: ours still queued, travelling the
 // stem or waiting to be proven again, and everyone's in the pool.
-func (n *Node) PendingPosts() []PostView {
+func (n *Node) PendingPosts() []PostView { return n.pendingPosts(true) }
+
+// pendingPosts lists posts not mined yet; pool adds everyone's in the pool.
+func (n *Node) pendingPosts(pool bool) []PostView {
 	var out []PostView
 	seen := map[cryptox.Hash]bool{}
 	add := func(t *types.Tx) {
@@ -817,8 +925,10 @@ func (n *Node) PendingPosts() []PostView {
 		v.Pending = true
 		out = append(out, *v)
 	}
-	for _, t := range n.Pool.Pending() {
-		add(t)
+	if pool {
+		for _, t := range n.Pool.Pending() {
+			add(t)
+		}
 	}
 	n.mu.Lock()
 	var own []*types.Tx
@@ -835,9 +945,6 @@ func (n *Node) PendingPosts() []PostView {
 		add(t)
 	}
 	for _, a := range n.ownAnon(false) {
-		if len(a.Likes) > 0 {
-			continue
-		}
 		v := PostView{Board: a.Board, Text: a.Text, Lane: "anon", Pseudo: a.Pseudo, Pending: true}
 		if !a.Parent.IsZero() {
 			v.Parent = a.Parent.String()

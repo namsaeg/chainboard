@@ -46,14 +46,23 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/fund/new", s.fundNew)
 	mux.HandleFunc("/api/fund/check", s.fundCheck)
 	mux.HandleFunc("/api/funds", s.funds)
+	mux.HandleFunc("/api/bounties", s.bounties)
+	mux.HandleFunc("/api/bounty/new", s.bountyNew)
+	mux.HandleFunc("/api/bounty/offers", s.bountyOffers)
+	mux.HandleFunc("/api/bounty/offer", s.bountyOffer)
+	mux.HandleFunc("/api/bounty/preview", s.bountyPreview)
+	mux.HandleFunc("/api/bounty/accept", s.bountyAccept)
+	mux.HandleFunc("/api/bounty/dispute", s.bountyDispute)
 	mux.HandleFunc("/api/stake", s.stake)
 	mux.HandleFunc("/api/unstake", s.stake)
 	mux.HandleFunc("/api/transfer", s.transfer)
 	mux.HandleFunc("/api/rln", s.rlnStatus)
 	mux.HandleFunc("/api/rln/join", s.rlnJoin)
+	mux.HandleFunc("/api/rln/quote", s.rlnQuote)
 	mux.HandleFunc("/api/rln/leave", s.rlnLeave)
 	mux.HandleFunc("/api/rln/ack", s.rlnAck)
-	mux.HandleFunc("/api/pseudo/send", s.pseudoSend)
+	mux.HandleFunc("/api/tips", s.tips)
+	mux.HandleFunc("/api/activity", s.activity)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return guard(mux)
@@ -162,6 +171,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		"block_seconds":      int(n.P.BlockTime / time.Second),
 		"nat":                natView(n),
 		"privacy":            n.Privacy(),
+		"settings":           n.Settings(),
 	})
 }
 
@@ -405,15 +415,15 @@ func (s *server) extend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"queued": true})
 }
 
-// like queues a like: of a post (with an optional tip to its author), of a
-// funding request (a pledge) or anonymous; "now" sends its queue at once,
-// "undo" takes back a waiting like.
+// like queues a like: coins to a post's author, a pledge to a funding
+// request or a boost of a bounty; "now" sends the queue at once, "undo"
+// takes back a waiting like.
 func (s *server) like(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID      string `json:"id"`
-		Amount  string `json:"amount"` // coins; empty or 0: a plain like
+		Amount  string `json:"amount"` // coins
 		Fund    bool   `json:"fund"`
-		Anon    bool   `json:"anon"`
+		Bounty  bool   `json:"bounty"`
 		Now     bool   `json:"now"`
 		Confirm bool   `json:"confirm"`
 		Undo    bool   `json:"undo"`
@@ -428,17 +438,15 @@ func (s *server) like(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Undo {
-		writeJSON(w, map[string]bool{"removed": s.n.UnqueueLike(id, req.Anon)})
+		writeJSON(w, map[string]bool{"removed": s.n.UnqueueLike(id)})
 		return
 	}
-	var amt uint64
-	if strings.TrimSpace(req.Amount) != "" {
-		if amt, err = parseCoins(req.Amount); err != nil {
-			fail(w, 400, err)
-			return
-		}
+	amt, err := parseCoins(req.Amount)
+	if err != nil {
+		fail(w, 400, errors.New("a like carries coins: give an amount"))
+		return
 	}
-	waiting, err := s.n.QueueLike(node.LikeRequest{ID: id, Amount: amt, Fund: req.Fund, Anon: req.Anon, Now: req.Now, Confirm: req.Confirm})
+	waiting, err := s.n.QueueLike(node.LikeRequest{ID: id, Amount: amt, Fund: req.Fund, Bounty: req.Bounty, Now: req.Now, Confirm: req.Confirm})
 	if err != nil {
 		sendFail(w, err)
 		return
@@ -450,40 +458,32 @@ type likeView struct {
 	ID      string `json:"id"`
 	Height  uint64 `json:"height,omitempty"`
 	Added   int64  `json:"added"`
-	Amount  string `json:"amount,omitempty"`
+	Amount  string `json:"amount"`
 	To      string `json:"to,omitempty"`
 	Fund    bool   `json:"fund,omitempty"`
-	Anon    bool   `json:"anon,omitempty"`
-	Expires uint64 `json:"expires,omitempty"` // last height the like counts at (plain likes)
+	Bounty  bool   `json:"bounty,omitempty"`
+	Expires uint64 `json:"expires,omitempty"` // last height the like counts as a like (tips)
 }
 
-func (s *server) likeQueue(q node.LikeQueue, window uint64) map[string]any {
-	views := []likeView{}
-	for _, l := range q.Likes {
-		v := likeView{ID: l.ID, Height: l.Height, Added: l.Added, To: l.To, Fund: l.Fund, Anon: l.Anon}
-		if l.Amount > 0 {
-			v.Amount = coins(l.Amount)
-		}
-		if !l.Fund && l.Amount == 0 {
-			v.Expires = l.Height + window
-		}
-		views = append(views, v)
-	}
-	return map[string]any{"likes": views, "coins": coins(q.Coins), "fee": coins(q.Fee), "next": q.Next, "expiring_soon": q.Soon}
-}
-
-// likes shows the waiting likes and the auto-send setting (GET), sends a
-// queue now (POST {anon, confirm}) or changes auto-send (POST {auto}).
+// likes shows the waiting likes and the auto-send setting (GET), sends them
+// now (POST {confirm}) or changes auto-send (POST {auto}).
 func (s *server) likes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		signed, anon := s.n.QueuedLikes()
-		window := s.n.Index.LikeWindow
-		writeJSON(w, map[string]any{"signed": s.likeQueue(signed, window), "anon": s.likeQueue(anon, window),
-			"auto": s.n.LikeAutoSend(), "min_amount": coins(s.n.MinLikeAmount()), "window_days": node.LikeWindowDays})
+		q := s.n.QueuedLikes()
+		views := []likeView{}
+		for _, l := range q.Likes {
+			v := likeView{ID: l.ID, Height: l.Height, Added: l.Added, Amount: coins(l.Amount), To: l.To, Fund: l.Fund, Bounty: l.Bounty}
+			if l.Height > 0 {
+				v.Expires = l.Height + s.n.Index.LikeWindow
+			}
+			views = append(views, v)
+		}
+		writeJSON(w, map[string]any{"likes": views, "coins": coins(q.Coins), "fee": coins(q.Fee), "next": q.Next,
+			"expiring_soon": q.Soon, "auto": s.n.LikeAutoSend(), "min_amount": coins(s.n.MinLikeAmount()),
+			"window_days": node.LikeWindowDays})
 		return
 	}
 	var req struct {
-		Anon    bool           `json:"anon"`
 		Confirm bool           `json:"confirm"`
 		Auto    *node.LikeAuto `json:"auto"`
 	}
@@ -499,7 +499,7 @@ func (s *server) likes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, req.Auto)
 		return
 	}
-	n, err := s.n.FlushLikes(req.Anon, req.Confirm)
+	n, err := s.n.FlushLikes(req.Confirm)
 	if err != nil {
 		sendFail(w, err)
 		return
@@ -559,10 +559,26 @@ func (s *server) transfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"queued": true})
 }
 
-// pseudoSend moves coins tipped to the pseudonym out of its address.
-func (s *server) pseudoSend(w http.ResponseWriter, r *http.Request) {
+// tips lists the addresses of this node's anonymous writing that hold
+// coins (GET), or sends from one of them (POST {from, to, amount, confirm};
+// to empty: this node's wallet).
+func (s *server) tips(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		accts, err := s.n.TipAccounts()
+		if err != nil {
+			fail(w, 500, err)
+			return
+		}
+		out := []map[string]any{}
+		for _, a := range accts {
+			out = append(out, map[string]any{"address": a.Address, "balance": coins(a.Balance), "pseudonym": a.Pseudo})
+		}
+		writeJSON(w, out)
+		return
+	}
 	var req struct {
-		To      string `json:"to"` // empty: this node's wallet
+		From    string `json:"from"`
+		To      string `json:"to"`
 		Amount  string `json:"amount"`
 		Confirm bool   `json:"confirm"`
 	}
@@ -570,9 +586,13 @@ func (s *server) pseudoSend(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
+	from, err := cryptox.ParseAddress(strings.TrimSpace(req.From))
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
 	to := s.n.Wallet.Address()
 	if strings.TrimSpace(req.To) != "" {
-		var err error
 		if to, err = cryptox.ParseAddress(strings.TrimSpace(req.To)); err != nil {
 			fail(w, 400, err)
 			return
@@ -583,7 +603,7 @@ func (s *server) pseudoSend(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err)
 		return
 	}
-	if err := s.n.SendPseudo(to, amt, req.Confirm); err != nil {
+	if err := s.n.SendFromTips(from, to, amt, req.Confirm); err != nil {
 		sendFail(w, err)
 		return
 	}
@@ -592,20 +612,53 @@ func (s *server) pseudoSend(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) rlnStatus(w http.ResponseWriter, r *http.Request) {
 	info := s.n.RLNStatus()
-	pseudoBal := ""
-	if _, bal, ok := s.n.PseudoBalance(); ok {
-		pseudoBal = coins(bal)
-	}
 	writeJSON(w, map[string]any{
-		"pseudonym_balance": pseudoBal,
-		"member":            info.Member, "status": info.Status, "commitment": info.Commitment,
+		"member": info.Member, "status": info.Status, "commitment": info.Commitment,
 		"limit": info.Limit, "bond": coins(info.Bond), "release": info.Release,
 		"epoch": info.Epoch, "cap": info.Cap, "used": info.Used, "epoch_blocks_left": info.EpochLeft,
 		"members": info.Members, "pseudonym": info.Pseudonym,
 		"bond_per_message": coins(info.BondPerMsg), "bond_full": coins(info.BondFull), "max_limit": s.n.P.RLNMaxLimit,
 		"remaining": info.Remaining, "foreign_use": info.ForeignUse,
 		"epoch_minutes_left": (time.Duration(info.EpochLeft)*s.n.P.BlockTime + time.Minute - 1) / time.Minute,
+		"epoch_minutes":      int(time.Duration(s.n.P.RLNEpochBlocks) * s.n.P.BlockTime / time.Minute),
 	})
+}
+
+// rlnQuote says what a bond buys (?amount= coins): anonymous posts per
+// epoch, and the bond for each count up to the largest (the calculator's
+// other direction).
+func (s *server) rlnQuote(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"epoch_minutes": int(time.Duration(s.n.P.RLNEpochBlocks) * s.n.P.BlockTime / time.Minute),
+		"max_limit": s.n.P.RLNMaxLimit}
+	var amt uint64
+	if a := r.URL.Query().Get("amount"); a != "" {
+		var err error
+		if amt, err = parseCoins(a); err != nil {
+			fail(w, 400, err)
+			return
+		}
+	}
+	q := s.n.RLNQuote(amt)
+	out["limit"] = q.Limit
+	if q.NextBond > 0 {
+		out["next_bond"] = coins(q.NextBond)
+	}
+	table := make([]string, len(q.BondFor))
+	for i, b := range q.BondFor {
+		table[i] = coins(b)
+	}
+	out["bond_for"] = table // bond_for[i]: the bond for i+1 posts per epoch
+	writeJSON(w, out)
+}
+
+// activity lists this node's own posts, likes, crowdfunding, bounties and
+// offers.
+func (s *server) activity(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	writeJSON(w, s.n.MyActivity(limit))
 }
 
 func (s *server) rlnAck(w http.ResponseWriter, r *http.Request) {
@@ -691,8 +744,6 @@ func (s *server) fundNew(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"id": q.ID().String(), "code": code, "deadline": q.Deadline})
 }
 
-// fundCheck reads a request code and spot-checks its data (POST {code}),
-// or reports how far the check got (GET ?id=).
 // funds lists crowdfunding in progress, nearest deadline first.
 func (s *server) funds(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -701,6 +752,9 @@ func (s *server) funds(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, s.n.FundList(limit))
 }
+
+// fundCheck reads a request code and spot-checks its data (POST {code}),
+// or reports how far the check got (GET ?id=, &probe=1 to start one).
 
 func (s *server) fundCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {

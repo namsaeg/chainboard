@@ -96,8 +96,8 @@ func TestUnsignedKinds(t *testing.T) {
 	if a.CheckStateless() == nil {
 		t.Fatal("anonymous attachment accepted")
 	}
-	s := &Tx{Kind: TxRLNSlash, Secret: Hash{8}}
-	if got, err := DecodeTx(s.Encode()); err != nil || got.Secret != s.Secret || len(s.Encode()) != 33 {
+	s := &Tx{Kind: TxRLNSlash, Epoch: 77, Target: Hash{9}, Secret: Hash{8}}
+	if got, err := DecodeTx(s.Encode()); err != nil || got.Secret != s.Secret || got.Epoch != 77 || got.Target != s.Target || got.CheckStateless() != nil {
 		t.Fatalf("slash roundtrip: %v", err)
 	}
 	k := cryptox.KeyFromSeed(make([]byte, 32))
@@ -113,28 +113,59 @@ func TestUnsignedKinds(t *testing.T) {
 	}
 }
 
-// A batch costs about an eighth of its likes sent one by one: one header
-// and signature, and short references.
+// A batch of likes (tips) costs far less than its likes sent one by one:
+// one header and signature, and short references.
 func TestLikeBatchSize(t *testing.T) {
-	one := &Tx{Kind: TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), Nonce: 1000, MaxFee: 1 << 24,
-		Likes: []LikeRef{{Height: 1_500_000}}}
-	batch := *one
-	batch.Likes = nil
-	for i := 0; i < 100; i++ {
-		batch.Likes = append(batch.Likes, LikeRef{Height: 1_500_000 - uint64(i)*997, Prefix: [4]byte{byte(i)}})
+	tip := func(i int) Tip {
+		return Tip{Ref: LikeRef{Height: 1_500_000 - uint64(i)*997, Prefix: [4]byte{byte(i)}}, To: Address{byte(i), 1}, Amount: 20_000}
 	}
-	if b, o := batch.EncodedSize(), one.EncodedSize(); b*10 > o*100 {
+	one := &Tx{Kind: TxLikes, From: make([]byte, 32), Sig: make([]byte, 64), Nonce: 1000, MaxFee: 1 << 24, Tips: []Tip{tip(0)}}
+	batch := *one
+	batch.Tips = nil
+	for i := 0; i < 100; i++ {
+		batch.Tips = append(batch.Tips, tip(i))
+	}
+	if b, o := batch.EncodedSize(), one.EncodedSize(); b*10 > o*100*4 {
 		t.Fatalf("100 likes in a batch: %d bytes, one by one: %d", b, 100*o)
 	}
 	if err := checkLikes(&batch); err != nil {
 		t.Fatal(err)
 	}
-	batch.Likes = append(batch.Likes, batch.Likes[0])
-	if checkLikes(&batch) == nil {
+	dup := batch
+	dup.Tips = append(append([]Tip(nil), batch.Tips...), batch.Tips[0])
+	if checkLikes(&dup) == nil {
 		t.Fatal("duplicate like accepted")
 	}
+	free := batch
+	free.Tips = append([]Tip(nil), batch.Tips...)
+	free.Tips[3].Amount = 0
+	if checkLikes(&free) == nil {
+		t.Fatal("a like without coins accepted")
+	}
 	got, err := DecodeTx(batch.Encode())
-	if err != nil || len(got.Likes) != 101 || got.Likes[7] != batch.Likes[7] {
+	if err != nil || len(got.Tips) != 100 || got.Tips[7] != batch.Tips[7] {
 		t.Fatalf("round trip: %v", err)
+	}
+}
+
+// Bounties and offers survive encoding; an offer's signature covers it.
+func TestBountyRoundTrip(t *testing.T) {
+	k := cryptox.KeyFromSeed(make([]byte, 32))
+	b := &Tx{Kind: TxBounty, Board: "현상금", Note: "2002년 월드컵 길거리 응원 사진", Attach: []Hash{{1}}, Amount: 5, Deadline: 900, Tier: 12, MaxFee: 1 << 30}
+	b.Sign(k)
+	if got, err := DecodeTx(b.Encode()); err != nil || got.ID() != b.ID() || got.CheckStateless() != nil {
+		t.Fatalf("bounty roundtrip: %v", err)
+	}
+	o := &Offer{Bounty: b.ID(), DataRoot: Hash{2}, Size: 1000, Media: 1, PreviewRoot: Hash{3}, PreviewSize: 200, Note: "광화문"}
+	o.Sign(k)
+	a := &Tx{Kind: TxBountyAccept, Offer: o, MaxFee: 1 << 30}
+	a.Sign(k)
+	got, err := DecodeTx(a.Encode())
+	if err != nil || got.ID() != a.ID() || got.CheckStateless() != nil || got.Offer.ID() != o.ID() {
+		t.Fatalf("accept roundtrip: %v", err)
+	}
+	o.Size++
+	if o.Check() == nil {
+		t.Fatal("altered offer accepted")
 	}
 }

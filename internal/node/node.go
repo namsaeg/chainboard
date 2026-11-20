@@ -101,17 +101,24 @@ type Node struct {
 	fundMu sync.Mutex // guards funds
 	funds  map[cryptox.Hash]*fundTend
 
+	offerMu sync.Mutex // guards offers and shared
+	offers  map[cryptox.Hash]*offerTend
+	shared  map[cryptox.Hash]bool // own offered data whose offer was accepted
+
 	likesMu        sync.Mutex // guards likes
 	likes          []QueuedLike
 	likeAuto       LikeAuto
 	likesFlush     sync.Mutex // one batch at a time
 	likeWarnLogged time.Time
 
-	rlnMu  sync.Mutex // guards the fields below
-	secret *fr.Element
-	usage  rlnUsage
-	pseudo *cryptox.Key
-	outbox []*outboxItem
+	tipMu     sync.Mutex // one-time tip keys file, and the keys read from it
+	tipCache  []*cryptox.Key
+	tipLoaded bool
+	rlnMu     sync.Mutex // guards the fields below
+	secret    *fr.Element
+	usage     rlnUsage
+	pseudo    *cryptox.Key
+	outbox    []*outboxItem
 }
 
 // sentTx is an own transaction that left through the stem. It does not enter
@@ -183,7 +190,7 @@ func New(cfg Config) (*Node, error) {
 		cfg.Logf("node: the chain database belonged to another network; moved it to %s", ch.SetAside)
 		// What waited to be sent, queued likes, own funding requests and
 		// spent message ids all belong to that chain.
-		for _, name := range []string{"outbox.json", "likes.json", "fund.json", "rln_used.json"} {
+		for _, name := range []string{"outbox.json", "likes.json", "fund.json", "offers.json", "rln_used.json"} {
 			if err := os.Remove(filepath.Join(dir, name)); err == nil {
 				cfg.Logf("node: dropped %s of the other network", name)
 			}
@@ -200,7 +207,8 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, dir: dir,
-		sent: map[uint64]*sentTx{}, funds: map[cryptox.Hash]*fundTend{}}
+		sent: map[uint64]*sentTx{}, funds: map[cryptox.Hash]*fundTend{},
+		offers: map[cryptox.Hash]*offerTend{}, shared: map[cryptox.Hash]bool{}}
 	if err := n.loadRLN(); err != nil {
 		return nil, err
 	}
@@ -218,7 +226,7 @@ func New(cfg Config) (*Node, error) {
 	ch.Logf = cfg.Logf
 	host, err := p2p.New(p2p.Config{P: p, Chain: ch, Pool: n.Pool, Store: st,
 		NodeKey: ed25519.PrivateKey(nodeKey.Priv), Listen: cfg.Listen, Seeds: cfg.Seeds, Logf: cfg.Logf, Embargo: cfg.Embargo,
-		Text: n.textBody, Funds: n, NAT: cfg.NAT, Proxy: cfg.Proxy, ProxyOnly: cfg.ProxyOnly, Cover: cfg.Cover})
+		Text: n.textBody, Gossip: n, Serve: n.serves, NAT: cfg.NAT, Proxy: cfg.Proxy, ProxyOnly: cfg.ProxyOnly, Cover: cfg.Cover})
 	if err != nil {
 		return nil, err
 	}
@@ -239,6 +247,7 @@ func New(cfg Config) (*Node, error) {
 	n.loadOutbox()
 	n.loadLikes()
 	n.loadFunds()
+	n.loadOffers()
 	ok = true
 	return n, nil
 }
@@ -268,6 +277,7 @@ func (n *Node) Start() error {
 	n.cancel = cancel
 	n.ctx = ctx
 	n.solveOwnFunds()
+	n.solveOwnOffers()
 	if n.cfg.TorControl != "" && n.Host.Addr() != "" {
 		n.wg.Add(1)
 		go n.onionLoop(ctx)
@@ -319,6 +329,7 @@ func (n *Node) tipLoop(ctx context.Context, tips <-chan *state.State) {
 			n.tendOutbox(st)
 			n.tendFunds(st)
 			n.pruneFunds(st)
+			n.tendBounties(st)
 			n.storageDuties(st)
 		case <-t.C:
 			n.storageDuties(n.Chain.Tip())
@@ -524,8 +535,9 @@ func (n *Node) finish(t *types.Tx) error {
 func (n *Node) Quote(t *types.Tx) (uint64, error) { return n.quoteAs(t, n.Wallet) }
 
 func (n *Node) quoteAs(t *types.Tx, k *cryptox.Key) (uint64, error) {
-	n.syncPool()
-	st := n.Pool.PendingState()
+	// Own transactions still queued or travelling count: a post may attach
+	// the upload sent just before it.
+	st := n.trialState()
 	st.Settle(k.Address(), st.Height+1) // what settles is not spent
 	acc := st.Account(k.Address())
 	acc.Balance = ^uint64(0) >> 2 // quote even without funds

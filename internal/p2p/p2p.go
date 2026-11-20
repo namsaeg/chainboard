@@ -58,8 +58,12 @@ type Config struct {
 	// Text finds a post body to serve to a peer: from the text store, or
 	// cut out of a sealed bundle. Defaults to the text store.
 	Text func(Hash) ([]byte, bool)
-	// Funds holds the funding requests gossiped before they are on chain.
-	Funds FundGossip
+	// Gossip holds the items gossiped before they are on chain: funding
+	// requests and bounty offers.
+	Gossip Gossip
+	// Serve, if set, says whether a chunk this node holds may be given to
+	// peers (a hunter's data stays private until its offer is accepted).
+	Serve func(root Hash, idx uint64) bool
 	// NAT, if set, asks the router to forward the listening port.
 	NAT *nat.Config
 	// Proxy, if set, carries every outbound connection (Tor or Nym's
@@ -95,6 +99,8 @@ type Host struct {
 	nat      natState
 	onion    string // announced onion service address, if any
 	cover    coverState
+	banned   map[string]time.Time // peer keys and addresses that misbehaved, until when
+	itemEmb  map[Hash]*time.Timer // gossiped items in their stem phase
 
 	ln   net.Listener
 	quit chan struct{}
@@ -108,6 +114,7 @@ type peer struct {
 	addr    string // dialable address (outbound, or the peer's announced listen address)
 	id      []byte
 	height  uint64
+	limits  peerLimits
 	sendCh  chan frame    // never closed: a send may race a disconnect
 	quit    chan struct{} // closed when the peer is closed
 	closeMu sync.Once
@@ -133,7 +140,8 @@ func New(cfg Config) (*Host, error) {
 		peers: map[*peer]bool{}, known: map[string]bool{}, seen: map[Hash]bool{}, seenOld: map[Hash]bool{},
 		embargo: map[Hash]*time.Timer{}, fetching: map[string]time.Time{}, waiting: map[Hash]*types.Tx{},
 		parked: map[Hash]*parkedBlock{}, askedTxt: map[Hash]time.Time{}, probes: map[Hash]*probe{},
-		relays: map[relayKey]*relay{}, quit: make(chan struct{})}
+		relays: map[relayKey]*relay{}, banned: map[string]time.Time{}, itemEmb: map[Hash]*time.Timer{},
+		quit: make(chan struct{})}
 	if cfg.Pool != nil && cfg.Pool.OnPromote == nil {
 		// An orphan that entered the pool is relayed like any fluffed one.
 		cfg.Pool.OnPromote = func(t *types.Tx) { h.broadcast(msgTx, t.EncodeWire(), nil) }
@@ -258,7 +266,7 @@ func (h *Host) dialMore() {
 	}
 	var cand []string
 	for a := range h.known {
-		if !connected[a] && a != h.Addr() {
+		if !connected[a] && a != h.Addr() && !h.isBannedLocked(nil, a) {
 			if last, ok := h.fetching["dial:"+a]; ok && time.Since(last) < 10*time.Second {
 				continue
 			}
@@ -320,6 +328,11 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 	}
 	p := &peer{h: h, conn: c, out: out, addr: addr, id: peerKey(c.ConnectionState()), height: them.Height, sendCh: make(chan frame, 256), quit: make(chan struct{})}
 	h.mu.Lock()
+	if h.isBannedLocked(p.id, addr) {
+		h.mu.Unlock()
+		c.Close()
+		return
+	}
 	h.peers[p] = true
 	if addr != "" {
 		h.known[addr] = true
@@ -329,7 +342,7 @@ func (h *Host) handshake(c *tls.Conn, out bool, addr string) {
 	go p.writeLoop()
 	go p.readLoop()
 	p.send(msgGetPeers, nil)
-	h.sendFundInv(p)
+	h.sendItemInv(p)
 	if them.Height > tip.Height || (them.Height == tip.Height && them.Best != tip.Tip) {
 		h.requestSync(p)
 	}
@@ -540,9 +553,9 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		if err != nil {
 			return err
 		}
-		h.receiveStem(t, b)
-	case msgFundInv, msgGetFunds, msgFunds:
-		return h.handleFunds(p, typ, b)
+		h.receiveStem(p, t, b)
+	case msgItemInv, msgGetItems, msgItems, msgStemItem:
+		return h.handleItems(p, typ, b)
 	case msgPad:
 	case msgPadded:
 		return h.receivePadded(p, b)
@@ -603,6 +616,12 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 		ttl := r.U8()
 		if err := r.Done(); err != nil {
 			return err
+		}
+		if !p.limits.allow(&p.limits.chunks, chunkServeMin) {
+			return nil // this peer asked for enough this minute
+		}
+		if h.cfg.Serve != nil && !h.cfg.Serve(root, idx) {
+			return nil // not shared (yet)
 		}
 		c, path, err := h.cfg.Store.ChunkProof(root, idx)
 		if err != nil {

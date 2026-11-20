@@ -372,7 +372,7 @@ func (n *Node) tendFunds(st *state.State) {
 			if c.Seed.IsZero() {
 				continue
 			}
-			samples, err := miner.FundSamples(n.Store, c, id)
+			samples, err := miner.FundSamples(n.Store, c.Seed, id, c.DataRoot, c.Size)
 			if err != nil {
 				n.cfg.Logf("node: funding proof: %v", err)
 				continue

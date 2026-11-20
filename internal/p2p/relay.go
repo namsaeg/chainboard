@@ -16,8 +16,8 @@ import (
 // with one hop less, remembers who asked for relayLife, and forwards the
 // first verified chunk that comes back to them.
 const (
-	relayTTL    = 1 // hops a re-asked request may take beyond the first peer
-	relayFanout = 4
+	relayTTL    = 2 // hops a re-asked request may take beyond the first peer
+	relayFanout = 3
 	relayLife   = 30 * time.Second
 	maxRelays   = 4096
 )
@@ -80,6 +80,9 @@ func (h *Host) relayGet(from *peer, root Hash, idx uint64, ttl uint8) {
 // relayChunk hands a chunk to the peers we asked for it on behalf of, once
 // it verifies against its root.
 func (h *Host) relayChunk(root Hash, idx, size uint64, c []byte, path merkle.Proof, raw []byte) {
+	if !chunk.VerifyChunk(root, size, idx, c, path) {
+		return // a bad chunk must not cancel the relay for the good one
+	}
 	k := relayKey{root, idx}
 	h.mu.Lock()
 	r, ok := h.relays[k]
@@ -87,7 +90,7 @@ func (h *Host) relayChunk(root Hash, idx, size uint64, c []byte, path merkle.Pro
 		delete(h.relays, k)
 	}
 	h.mu.Unlock()
-	if !ok || time.Since(r.at) > relayLife || !chunk.VerifyChunk(root, size, idx, c, path) {
+	if !ok || time.Since(r.at) > relayLife {
 		return
 	}
 	for _, a := range r.askers {

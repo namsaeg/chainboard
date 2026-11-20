@@ -7,11 +7,16 @@ import (
 	"time"
 
 	"github.com/namsaeg/chainboard/internal/mempool"
+	"github.com/namsaeg/chainboard/internal/rln"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
 // receiveFluff handles a broadcast transaction.
 func (h *Host) receiveFluff(from *peer, t *types.Tx, raw []byte) {
+	if err := t.CheckStateless(); err != nil {
+		h.misbehave(from, err)
+		return
+	}
 	id := t.ID()
 	if !h.markSeen(id) {
 		h.cancelEmbargo(id)
@@ -22,6 +27,9 @@ func (h *Host) receiveFluff(from *peer, t *types.Tx, raw []byte) {
 		if errors.Is(err, mempool.ErrWaitingData) {
 			h.wait(t, from)
 		}
+		if errors.Is(err, rln.ErrProof) {
+			h.misbehave(from, err) // honest nodes check proofs before relaying
+		}
 		return // an orphan is relayed once it enters the pool (OnPromote)
 	}
 	h.broadcast(msgTx, raw, from)
@@ -30,8 +38,9 @@ func (h *Host) receiveFluff(from *peer, t *types.Tx, raw []byte) {
 // receiveStem forwards a stem-phase transaction to our stem peer, or with a
 // small probability starts the fluff phase. An embargo timer fluffs it anyway
 // if it does not come back as fluff in time, so a dropped stem cannot censor.
-func (h *Host) receiveStem(t *types.Tx, raw []byte) {
+func (h *Host) receiveStem(from *peer, t *types.Tx, raw []byte) {
 	if err := t.CheckStateless(); err != nil {
+		h.misbehave(from, err)
 		return
 	}
 	id := t.ID()

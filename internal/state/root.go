@@ -111,6 +111,7 @@ func shareSum(null Hash, s Share) pmap.Sum {
 	w.Fixed(null[:])
 	w.Fixed(s.X[:])
 	w.Fixed(s.Y[:])
+	w.Fixed(s.Tag[:])
 	return sumOf("share", &w)
 }
 
@@ -155,7 +156,7 @@ func (s *State) Root() Hash {
 		w.U32(e.Bucket)
 	}
 	for _, r := range []pmap.Sum{s.Accounts.Root(), s.Vesters.Root(), s.Data.Root(), s.Posts.Root(),
-		s.dupCur.Root(), s.dupPrev.Root(), s.Members.Root(), s.RLNRoot(), s.Funds.Root(), s.FundDue.Root()} {
+		s.dupCur.Root(), s.dupPrev.Root(), s.Members.Root(), s.RLNRoot(), s.Funds.Root(), s.FundDue.Root(), s.Bounties.Root()} {
 		w.Fixed(r[:])
 	}
 	ids := make([]uint32, 0, len(s.Buckets))
@@ -179,6 +180,10 @@ func (s *State) Root() Hash {
 	for _, e := range s.RLNRoots {
 		w.Fixed(e.Root[:])
 		w.Var(e.Replaced)
+	}
+	w.Var(uint64(len(s.Refunding)))
+	for _, id := range s.Refunding {
+		w.Fixed(id[:])
 	}
 	w.Var(uint64(len(s.RLNExits)))
 	for _, e := range s.RLNExits {

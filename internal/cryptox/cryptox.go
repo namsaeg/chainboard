@@ -104,13 +104,14 @@ func NewKey() (*Key, error) {
 	return &Key{Priv: priv, Pub: pub}, nil
 }
 
-// KeyFromSeed builds a key from a 32-byte seed (tests, deterministic devnets).
+// KeyFromSeed builds a key from a 32-byte seed.
 func KeyFromSeed(seed []byte) *Key {
 	priv := ed25519.NewKeyFromSeed(seed)
 	return &Key{Priv: priv, Pub: priv.Public().(ed25519.PublicKey)}
 }
 
 func (k *Key) Address() Address       { return AddressOf(k.Pub) }
+func (k *Key) Seed() []byte           { return k.Priv.Seed() }
 func (k *Key) Sign(msg []byte) []byte { return ed25519.Sign(k.Priv, msg) }
 
 // Verify checks an Ed25519 signature.

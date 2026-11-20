@@ -29,9 +29,10 @@ const (
 	msgPeers
 	msgGetTexts // post bodies by hash
 	msgTexts
-	msgFundInv  // ids of the funding requests a node gossips
-	msgGetFunds // funding requests by id
-	msgFunds    // funding requests (each with its proof of work)
+	msgItemInv  // ids of gossiped items (funding requests, bounty offers) a node holds
+	msgGetItems // gossiped items by id
+	msgItems    // gossiped items (each with its proof of work), fluff phase
+	msgStemItem // a gossiped item in its stem phase (one hop, to one peer)
 	msgPad      // cover traffic: a fixed-size frame carrying nothing
 	msgPadded   // cover traffic: a fixed-size frame carrying part of a stem transaction
 )
