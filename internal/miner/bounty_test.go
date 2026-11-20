@@ -2,6 +2,7 @@ package miner
 
 import (
 	"crypto/rand"
+	"fmt"
 	"testing"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
@@ -12,7 +13,7 @@ import (
 
 func bountyParams() *params.Params {
 	p := FastParams()
-	p.BountyMaxBlocks, p.BountyRevealBlocks, p.BountyDisputeBlocks = 60, 4, 3
+	p.BountyMaxBlocks, p.BountyRevealBlocks, p.BountyExtendMaxBlocks = 60, 4, 8
 	return p
 }
 
@@ -68,18 +69,16 @@ func (b *bountyRig) try(k *cryptox.Key, tx *types.Tx) error {
 	return b.pool.Add(tx)
 }
 
-func (b *bountyRig) reveal(t *testing.T) {
+func (b *bountyRig) revealTx() *types.Tx {
 	x := b.bounty()
-	samples, err := FundSamples(b.st, x.Seed, b.id, x.DataRoot, x.Size)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.send(t, b.hunter, &types.Tx{Kind: types.TxBountyProof, Target: b.id, Samples: samples, MaxFee: 1})
+	return &types.Tx{Kind: types.TxBountyReveal, Target: b.id, DataRoot: x.DataRoot, Size: x.Size, MaxFee: 1}
 }
 
+func (b *bountyRig) reveal(t *testing.T) { b.send(t, b.hunter, b.revealTx()) }
+
 // The whole way: likes raise the pot, only the requester accepts, the
-// hunter (without coins) reveals, and after the dispute window the pot,
-// less the result's storage, is the hunter's.
+// hunter (without coins) reveals, and the pot, less the result's storage,
+// the reveal's fee and the hunter's new account, is the hunter's at once.
 func TestBountyPaid(t *testing.T) {
 	b := newBountyRig(t, 40)
 	b.send(t, b.backer, &types.Tx{Kind: types.TxLikes, Pledges: []types.Pledge{{Request: b.id, Amount: params.Coin}}, MaxFee: params.Coin})
@@ -96,66 +95,58 @@ func TestBountyPaid(t *testing.T) {
 	if x.Status != state.BountyAccepted || x.Held == 0 || x.Hunter != b.hunter.Address() {
 		t.Fatalf("after acceptance: %+v", x)
 	}
+	b.pool.Reset(b.c.Tip())
 	if b.try(b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer("another")}) == nil {
 		t.Fatal("a second offer accepted while one is pending")
 	}
-	b.mineN(t, 1) // the seed: vdf output of the block after the acceptance
-	b.pool.Reset(b.c.Tip())
+	wrong := b.revealTx()
+	wrong.Size++
+	if b.try(b.hunter, wrong) == nil {
+		t.Fatal("a reveal of other data accepted")
+	}
 	b.reveal(t)
+	prev := b.c.Tip()
 	b.mineN(t, 1)
 	tip := b.c.Tip()
-	if x := b.bounty(); x.Status != state.BountyProven || !tip.Data.Has(b.root) {
-		t.Fatalf("after the reveal: %+v", x)
+	var base uint64
+	for _, tx := range b.c.BlockAt(tip.Height).Txs {
+		if tx.Kind == types.TxBountyReveal {
+			base = prev.BytesFee(tx)
+		}
 	}
-	pot := b.bounty().Escrow
-	b.mineN(t, b.c.Tip().P.BountyDisputeBlocks+1)
-	tip = b.c.Tip()
-	if b.bounty() != nil {
-		t.Fatal("bounty still open after the dispute window")
+	burned := prev.Burned
+	if b.bounty() != nil || !tip.Data.Has(b.root) {
+		t.Fatal("reveal did not store the data and settle the bounty")
 	}
-	// The hunter's account exists (it sent the reveal), so no account fee.
-	if got := tip.Peek(b.hunter.Address()).Balance; got != pot {
-		t.Fatalf("hunter got %d of a %d pot", got, pot)
+	// The reveal's own fee (its block bytes, at the base fee of its block)
+	// is the only other cost.
+	got := tip.Peek(b.hunter.Address()).Balance
+	if fee := x.Escrow - x.Held - tip.NewAccountFee() - got; got > x.Escrow || fee == 0 || fee > 2*base {
+		t.Fatalf("hunter got %d of a %d pot (held %d): fee %d, about %d expected", got, x.Escrow, x.Held, fee, base)
 	}
-	b.check(t)
-}
-
-// A dispute burns the pot; it does not come back to the requester.
-func TestBountyDispute(t *testing.T) {
-	b := newBountyRig(t, 40)
-	b.send(t, b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer(""), MaxFee: params.Coin})
-	b.mineN(t, 2)
-	b.pool.Reset(b.c.Tip())
-	b.reveal(t)
-	b.mineN(t, 1)
-	b.pool.Reset(b.c.Tip())
-	if b.try(b.hunter, &types.Tx{Kind: types.TxBountyDispute, Target: b.id}) == nil {
-		t.Fatal("someone else than the requester disputed")
-	}
-	burned, mine := b.c.Tip().Burned, b.c.Tip().Peek(b.requester.Address()).Balance
-	pot := b.bounty().Escrow
-	b.send(t, b.requester, &types.Tx{Kind: types.TxBountyDispute, Target: b.id, MaxFee: params.Coin})
-	b.mineN(t, 1)
-	tip := b.c.Tip()
-	if b.bounty() != nil || tip.Burned < burned+pot || tip.Peek(b.hunter.Address()).Balance != 0 {
-		t.Fatalf("dispute: burned %d -> %d (pot %d)", burned, tip.Burned, pot)
-	}
-	if tip.Peek(b.requester.Address()).Balance > mine+tip.BlockReward(tip.Height)*2 {
-		t.Fatal("the requester got the pot back")
+	if tip.Burned < burned+tip.NewAccountFee() {
+		t.Fatal("the hunter's new account was not paid for")
 	}
 	b.check(t)
 }
 
 // A hunter that does not reveal fails its offer (it cannot be accepted
-// again); the bounty reopens, and past the deadline it refunds.
+// again); the bounty reopens with the locked blocks added to its deadline,
+// and refunds at that later deadline.
 func TestBountyNoReveal(t *testing.T) {
 	b := newBountyRig(t, 12)
+	deadline := b.bounty().Deadline
 	o := b.offer("")
 	b.send(t, b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: o, MaxFee: params.Coin})
-	b.mineN(t, b.c.Tip().P.BountyRevealBlocks+2)
+	b.mineN(t, 1)
+	accepted := b.c.Height()
+	b.mineTo(t, accepted+b.p.BountyRevealBlocks+1)
 	x := b.bounty()
 	if x.Status != state.BountyOpen || len(x.Failed) != 1 || x.Failed[0] != o.ID() {
 		t.Fatalf("after a missed reveal: %+v", x)
+	}
+	if locked := b.p.BountyRevealBlocks + 1; x.Deadline != deadline+locked || x.Extended != locked {
+		t.Fatalf("deadline %d (was %d), extended %d", x.Deadline, deadline, x.Extended)
 	}
 	b.pool.Reset(b.c.Tip())
 	if err := b.try(b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: o}); err == nil {
@@ -163,17 +154,39 @@ func TestBountyNoReveal(t *testing.T) {
 	}
 	before := b.c.Tip().Peek(b.backer.Address()).Balance
 	b.send(t, b.backer, &types.Tx{Kind: types.TxLikes, Pledges: []types.Pledge{{Request: b.id, Amount: params.Coin}}, MaxFee: params.Coin})
-	b.mineTo(t, x.Deadline+1)
+	b.mineTo(t, deadline+1)
+	if b.bounty() == nil {
+		t.Fatal("refunded at the old deadline, not the extended one")
+	}
+	b.mineTo(t, x.Deadline)
 	if b.bounty() != nil {
-		t.Fatal("bounty not refunded at its deadline")
+		t.Fatal("bounty not refunded at its extended deadline")
 	}
 	if got := b.c.Tip().Peek(b.backer.Address()).Balance; got+params.Coin/100 < before {
 		t.Fatalf("backer's refund: %d -> %d", before, got)
 	}
 	b.pool.Reset(b.c.Tip())
-	err := b.try(b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer("late")})
-	if err == nil {
+	if b.try(b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer("late")}) == nil {
 		t.Fatal("accepted after the deadline")
+	}
+	b.check(t)
+}
+
+// Failed reveals give back at most BountyExtendMaxBlocks in all, so a
+// requester and a hunter of its own cannot keep the backers' coins locked
+// for long.
+func TestBountyExtensionCapped(t *testing.T) {
+	b := newBountyRig(t, 30)
+	deadline := b.bounty().Deadline
+	for i := 0; i < 3; i++ {
+		b.pool.Reset(b.c.Tip())
+		b.send(t, b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer(fmt.Sprint("제안 ", i)), MaxFee: params.Coin})
+		b.mineN(t, 1)
+		b.mineN(t, b.p.BountyRevealBlocks+1)
+	}
+	x := b.bounty()
+	if len(x.Failed) != 3 || x.Extended != b.p.BountyExtendMaxBlocks || x.Deadline != deadline+b.p.BountyExtendMaxBlocks {
+		t.Fatalf("after three failures: failed %d, extended %d, deadline %d (was %d)", len(x.Failed), x.Extended, x.Deadline, deadline)
 	}
 	b.check(t)
 }
@@ -202,14 +215,10 @@ func TestRefundsSpread(t *testing.T) {
 }
 
 // An offer accepted in the last block before the deadline keeps its full
-// reveal and dispute windows past the deadline; the requester cannot take
-// the pot back in the meantime, nor dispute before a reveal.
+// reveal window past the deadline, and is paid when it reveals then.
 func TestBountyLastMinute(t *testing.T) {
 	b := newBountyRig(t, 8)
 	deadline := b.bounty().Deadline
-	if b.try(b.requester, &types.Tx{Kind: types.TxBountyDispute, Target: b.id}) == nil {
-		t.Fatal("disputed an open bounty (an early withdrawal)")
-	}
 	b.mineTo(t, deadline-2)
 	b.pool.Reset(b.c.Tip())
 	b.send(t, b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer("마감 직전"), MaxFee: params.Coin})
@@ -222,15 +231,35 @@ func TestBountyLastMinute(t *testing.T) {
 		t.Fatalf("an accepted bounty refunded at its deadline: %+v", x)
 	}
 	b.pool.Reset(b.c.Tip())
-	if b.try(b.requester, &types.Tx{Kind: types.TxBountyDispute, Target: b.id}) == nil {
-		t.Fatal("disputed before the reveal")
-	}
 	b.reveal(t)
 	b.mineN(t, 1)
-	pot := b.bounty().Escrow
-	b.mineN(t, b.c.Tip().P.BountyDisputeBlocks+1)
-	if got := b.c.Tip().Peek(b.hunter.Address()).Balance; b.bounty() != nil || got != pot {
-		t.Fatalf("late reveal paid %d of %d", got, pot)
+	if got := b.c.Tip().Peek(b.hunter.Address()).Balance; b.bounty() != nil || got == 0 {
+		t.Fatalf("late reveal not paid (%d)", got)
+	}
+	b.check(t)
+}
+
+// Data stored by someone else before the reveal (the requester, from the
+// data the hunter shares) does not stop the hunter's payment.
+func TestBountyFrontRunStore(t *testing.T) {
+	b := newBountyRig(t, 40)
+	b.send(t, b.requester, &types.Tx{Kind: types.TxBountyAccept, Offer: b.offer(""), MaxFee: params.Coin})
+	b.mineN(t, 1)
+	b.pool.Reset(b.c.Tip())
+	b.send(t, b.requester, &types.Tx{Kind: types.TxUpload, DataRoot: b.root, Size: uint64(len(b.data)), Media: types.MediaImage,
+		Tier: 1, MaxFee: params.Coin})
+	b.mineN(t, 1)
+	if !b.c.Tip().Data.Has(b.root) {
+		t.Fatal("front-running upload not stored")
+	}
+	b.pool.Reset(b.c.Tip())
+	b.reveal(t)
+	b.mineN(t, 1)
+	if got := b.c.Tip().Peek(b.hunter.Address()).Balance; b.bounty() != nil || got == 0 {
+		t.Fatalf("hunter not paid after a front-running store (%d)", got)
+	}
+	if info, _ := b.c.Tip().Data.Get(b.root); info.Tier != 12 {
+		t.Fatalf("data not moved to the bounty's tier: %+v", info)
 	}
 	b.check(t)
 }

@@ -51,13 +51,14 @@
             <option value="1m" selected>글 1개월</option><option value="1y">글 1년</option>
             <option value="5y">글 5년</option><option value="20y">글 20년</option><option value="perm">글 영구</option>
           </select>
-          <input type="file" name="file" accept="image/png,image/jpeg,image/gif">
+          <input type="file" name="file" accept="image/png,image/jpeg,image/gif" multiple title="첨부 4개까지">
           <select name="tier" title="첨부 보관 기간">
             <option value="1m">첨부 1개월</option><option value="1y" selected>첨부 1년</option>
             <option value="5y">첨부 5년</option><option value="20y">첨부 20년</option><option value="perm">첨부 영구</option>
           </select>
           <button>글쓰기</button>
         </div>
+        <div class="row small" id="markChips"></div>
         <p class="small muted" id="laneNote"></p>
       </form>
     </div>
@@ -100,8 +101,7 @@
 <main class="page" id="page-bounties" hidden>
   <div class="card">
     <h2>현상금</h2>
-    <p class="small muted">찾는 자료에 코인을 걸면, 누구나(코인 없이도) 결과를 제안할 수 있어요. 요청자만 마감 전에 제안 하나를 고를 수 있고, 고르는 순간 현상금은 잠겨요. 제안자는 하루 안에 데이터를 공개·증명해야 하고, 그 뒤 하루 동안 이의가 없으면 현상금(결과 저장 비용 제외)이 지급돼요. 요청자가 이의를 제기하면 현상금은 아무도 갖지 못하게 소각돼요. 실패하면 다시 모집하거나, 마감이 지났으면 후원한 비율대로 돌아가요.</p>
-    <p class="small warn">현상금 결과는 체인에 올라가 모두에게 공개돼요. 공개를 원하지 않으면 참여자끼리 미리 정한 방식으로 암호화해서 주고받으세요.</p>
+    <p class="small muted">찾는 자료에 코인을 걸면, 누구나(코인 없이도) 결과를 제안할 수 있어요. 요청자만 마감 전에 제안 하나를 고를 수 있고, 고르는 순간 현상금은 잠겨요. 제안자가 하루 안에 데이터 전체를 공개하면 현상금(결과 저장 비용 제외)이 바로 지급되고, 되돌릴 수 없어요. 공개하지 못하면 그 제안은 다시 고를 수 없고, 잠겨 있던 시간만큼 마감이 늘어난 채(합계 7일까지) 다시 모집해요. 마감이 지나면 후원한 비율대로 돌아가요.</p>
     <div id="bountyList" class="small">불러오는 중…</div>
   </div>
   <div class="card">
@@ -207,7 +207,13 @@
     <div class="card">
       <h2>비밀번호</h2>
       <div id="pwInfo" class="small"></div>
-      <p class="small muted">키 파일(지갑, 익명 키, 가명, 익명 글 받는 주소들)을 비밀번호로 잠가요. 노드를 끄고 <code>chainboard -change-password</code>를 실행하면 잠그기, 바꾸기, 풀기를 할 수 있어요. 비밀번호를 잊으면 키를 되찾을 방법이 없어요.</p>
+      <form id="pwForm" autocomplete="off">
+        <div class="row" id="pwCurrentRow"><input type="password" name="current" placeholder="지금 비밀번호" autocomplete="current-password"></div>
+        <div class="row"><input type="password" name="next" placeholder="새 비밀번호" autocomplete="new-password">
+          <input type="password" name="again" placeholder="새 비밀번호 한 번 더" autocomplete="new-password"></div>
+        <div class="row"><button data-op="set" id="pwSet">잠그기</button><button data-op="clear" class="plain" id="pwClear">잠금 풀기</button></div>
+      </form>
+      <p class="small muted">지갑 키, 익명 키, 가명, 익명 글 받는 주소들, onion 키를 잠가요. 켜져 있는 노드에서 바로 바뀌고, 다음에 켤 때 이 비밀번호를 물어요. 비밀번호를 잊으면 키를 되찾을 방법이 없으니 따로 적어 두세요. (노드를 끈 상태에서는 <code>chainboard -change-password</code>로도 바꿀 수 있어요.)</p>
     </div>
   </div>
 </main>

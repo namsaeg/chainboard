@@ -61,6 +61,24 @@ func (e *MissingTextsError) Error() string {
 	return fmt.Sprintf("chain: waiting for %d post bodies", len(e.Hashes))
 }
 
+// DataSource tells whether all chunks of a data root are here, each
+// verified against the root.
+type DataSource interface {
+	Complete(root Hash) bool
+}
+
+// MissingDataError: a recent block stores paid data (a fund store or a
+// bounty reveal) whose chunks are not all here. Like MissingTextsError, the
+// block is not invalid; it waits until the data arrives.
+type MissingDataError struct {
+	Root Hash
+	Size uint64
+}
+
+func (e *MissingDataError) Error() string {
+	return fmt.Sprintf("chain: waiting for the data %x", e.Root[:8])
+}
+
 // TextWindow is how recent (by block time) a block must be for this node to
 // demand its post bodies. Bodies of older blocks may have expired; they are
 // fetched for display when wanted, not for validation.
@@ -76,6 +94,10 @@ type Chain struct {
 	// node accepts a recent block only with all of its bodies, and a seal
 	// block only if its bundles match them.
 	Texts TextSource
+	// Data, if set, holds data chunks: a node accepts a recent block that
+	// stores paid data (fund stores, bounty reveals) only once all of that
+	// data is here. A payout so never happens for data that is not there.
+	Data DataSource
 	// MemoryDepth overrides memoryDepth (tests).
 	MemoryDepth uint64
 	// TextWindowSec overrides TextWindow (tests).
@@ -482,14 +504,22 @@ func (c *Chain) addLocked(b *types.Block, now int64, mode addMode) error {
 			return &MissingTextsError{Hashes: missing}
 		}
 		st.SetTextCheck(c.checkBundle)
+		if c.Data != nil {
+			st.SetDataCheck(c.checkData)
+		}
 	}
 	began := time.Now()
 	err = apply()
 	took := time.Since(began)
 	st.SetTextCheck(nil)
+	st.SetDataCheck(nil)
 	var mt *MissingTextsError
 	if errors.As(err, &mt) {
 		return mt
+	}
+	var md *MissingDataError
+	if errors.As(err, &md) {
+		return md
 	}
 	if err != nil {
 		c.bad[h] = err
@@ -657,6 +687,15 @@ func (c *Chain) textWindow() int64 {
 		return c.TextWindowSec
 	}
 	return TextWindow
+}
+
+// checkData reports a fund store's or bounty reveal's data missing until
+// every chunk is here.
+func (c *Chain) checkData(root Hash, size uint64) error {
+	if c.Data.Complete(root) {
+		return nil
+	}
+	return &MissingDataError{Root: root, Size: size}
 }
 
 // checkBundle rebuilds a seal block's text bundle from our bodies and

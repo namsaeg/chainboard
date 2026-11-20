@@ -238,7 +238,7 @@ func decayBurst(score, dh, tau uint64) uint64 {
 // Storage duties do not.
 func countsForBurst(k types.TxKind) bool {
 	switch k {
-	case types.TxProof, types.TxRegister, types.TxFundUpload, types.TxFundProof:
+	case types.TxProof, types.TxRegister, types.TxFundStore, types.TxBountyReveal:
 		return false
 	}
 	return true

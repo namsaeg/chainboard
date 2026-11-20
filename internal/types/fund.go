@@ -13,7 +13,6 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
-	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
@@ -42,14 +41,7 @@ type FundRequest struct {
 const (
 	MaxFundNote      = 300 // bytes
 	MaxRequestsPerTx = 4
-	FundSamples      = 8 // sub-chunks a funded upload must prove
 )
-
-// FundSample is one sub-chunk of funded data with its path to the root.
-type FundSample struct {
-	Sub  []byte
-	Path chunk.Proof
-}
 
 func (r *FundRequest) encodeBody(w *codec.Writer) {
 	w.Fixed(r.Creator)
@@ -133,26 +125,6 @@ func DecodeFundRequest(b []byte) (*FundRequest, error) {
 		return nil, err
 	}
 	return r, nil
-}
-
-func encodeSamples(w *codec.Writer, ss []FundSample) {
-	w.Var(uint64(len(ss)))
-	for _, s := range ss {
-		w.Bytes(s.Sub)
-		chunk.EncodeProof(w, s.Path)
-	}
-}
-
-func decodeSamples(r *codec.Reader) []FundSample {
-	n := r.Count(FundSamples)
-	out := make([]FundSample, 0, n)
-	for i := 0; i < n && r.Err == nil; i++ {
-		var s FundSample
-		s.Sub = r.Bytes(params.SubChunkSize)
-		s.Path = chunk.DecodeProof(r)
-		out = append(out, s)
-	}
-	return out
 }
 
 // PoWBits is the work of a gossip nonce (funding requests, bounty

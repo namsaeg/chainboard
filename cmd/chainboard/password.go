@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/namsaeg/chainboard/internal/keystore"
 )
@@ -51,7 +54,7 @@ func newPassword(prompt string) (string, error) {
 
 // plainMarker records that the user chose to keep keys unlocked, so the
 // node does not ask at every start (-change-password locks them later).
-const plainMarker = "keys-unlocked"
+const plainMarker = keystore.PlainMarker
 
 // password works out the password of a node directory: from a file or
 // CHAINBOARD_PASSWORD, else by asking on the console. Locked keys need it;
@@ -107,10 +110,20 @@ func password(dir, file string) (string, error) {
 }
 
 // changePassword locks, relocks or unlocks the keys of a node directory.
+// It refuses while a node runs on that directory: the running node would
+// keep using the old password and write new key files with it. (The
+// settings page changes the password on a running node.)
 func changePassword(dir string) error {
+	if nodeRunning(dir) {
+		return fmt.Errorf("a node is running on %s: change the password in its settings page, or stop it first", dir)
+	}
 	if !interactive() {
 		return errors.New("-change-password needs a console")
 	}
+	if _, err := os.Stat(dir); err != nil {
+		return fmt.Errorf("no node directory at %s (choose it with -datadir and -network)", dir)
+	}
+	fmt.Printf("이 폴더의 키를 바꿔요: %s\n", dir)
 	old := ""
 	if _, locked := keystore.State(dir); len(locked) > 0 {
 		var err error
@@ -136,4 +149,19 @@ func changePassword(dir string) error {
 		fmt.Println("키 잠금을 풀었어요.")
 	}
 	return nil
+}
+
+// nodeRunning reports whether a node holds the chain database of dir: bbolt
+// locks the file for as long as a node has it open.
+func nodeRunning(dir string) bool {
+	path := filepath.Join(dir, "chain.db")
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 300 * time.Millisecond, ReadOnly: true})
+	if err != nil {
+		return true
+	}
+	db.Close()
+	return false
 }

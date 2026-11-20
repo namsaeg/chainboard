@@ -168,6 +168,11 @@ func State(dir string) (plain, locked []string) {
 	return plain, locked
 }
 
+// PlainMarker is a file in a node directory recording that the user chose to
+// keep the keys unlocked, so the node does not offer to lock them at every
+// start.
+const PlainMarker = "keys-unlocked"
+
 // Check reports whether password opens every locked file of dir.
 func Check(dir, password string) error {
 	_, locked := State(dir)

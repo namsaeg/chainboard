@@ -31,7 +31,8 @@ const (
 // ErrOrphan: kept until the sender's earlier transaction arrives.
 var ErrOrphan = errors.New("mempool: waiting for an earlier transaction of the sender")
 
-// DataCheck tells whether an upload's data is fully stored and acceptable.
+// DataCheck tells whether the data a transaction stores (an upload, a fund
+// store, a bounty reveal) is fully here and acceptable.
 type DataCheck func(t *types.Tx) error
 
 // Pool is safe for concurrent use.
@@ -78,7 +79,8 @@ func New(tip *state.State, check DataCheck) *Pool {
 	return p
 }
 
-// ErrWaitingData means the upload is valid but its chunks are not all here.
+// ErrWaitingData means a transaction storing data is valid but its chunks
+// are not all here.
 var ErrWaitingData = errors.New("mempool: waiting for data chunks")
 
 // Add validates a transaction against the pending state and keeps it.
@@ -118,7 +120,7 @@ func (p *Pool) add(t *types.Tx) error {
 			return fmt.Errorf("mempool: %w", err)
 		}
 	}
-	if t.Kind == types.TxUpload && p.check != nil {
+	if t.CarriesData() && p.check != nil {
 		if err := p.check(t); err != nil {
 			return err
 		}

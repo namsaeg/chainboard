@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/namsaeg/chainboard/internal/anonnet"
-	"github.com/namsaeg/chainboard/internal/keystore"
 )
 
 // onionLoop publishes the listener as a Tor onion service (retrying while
@@ -20,10 +19,9 @@ func (n *Node) onionLoop(ctx context.Context) {
 	target := n.Host.Addr()
 	_, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
-	keyPath := n.rlnPath("onion.key")
 	for {
 		key := ""
-		if b, err := keystore.Read(keyPath, n.cfg.Password); err == nil {
+		if b, err := n.readKey("onion.key"); err == nil {
 			key = string(b)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			n.cfg.Logf("node: onion.key: %v", err)
@@ -32,7 +30,7 @@ func (n *Node) onionLoop(ctx context.Context) {
 		o, err := anonnet.PublishOnion(n.cfg.TorControl, n.cfg.TorPassword, key, port, target)
 		if err == nil {
 			if o.Key != "" {
-				if err := keystore.Write(keyPath, []byte(o.Key), n.cfg.Password); err != nil {
+				if err := n.writeKey("onion.key", []byte(o.Key)); err != nil {
 					n.cfg.Logf("node: saving onion.key: %v", err)
 				}
 			}
@@ -80,11 +78,11 @@ type Settings struct {
 	Mine         bool    `json:"mine"`
 	PledgeGB     float64 `json:"pledge_gb"`
 	SendDelaySec int     `json:"send_delay_seconds"`
-	Locked       bool    `json:"keys_locked"` // key files are password-protected
+	Keys         string  `json:"keys"` // locked, partial or plain (see KeyState)
 }
 
 // Settings reports the start-up settings.
 func (n *Node) Settings() Settings {
 	return Settings{Mine: n.cfg.Mine, PledgeGB: float64(n.cfg.PledgeBytes) / 1e9, SendDelaySec: int(n.cfg.SendDelayMax / time.Second),
-		Locked: n.cfg.Password != ""}
+		Keys: n.KeyState()}
 }

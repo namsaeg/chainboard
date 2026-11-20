@@ -140,6 +140,9 @@ type State struct {
 	vdfCheck int
 	// textCheck, while set, verifies each text bundle a seal places.
 	textCheck func(BundleSpec, Hash) error
+	// dataCheck, while set, tells whether a fund store's or bounty reveal's
+	// data is all here.
+	dataCheck func(root Hash, size uint64) error
 
 	P         *params.Params
 	Height    uint64
@@ -206,6 +209,7 @@ func (s *State) Clone() *State {
 	c := *s
 	c.replay, c.noRoot, c.vdfCheck = false, false, 0
 	c.textCheck = nil
+	c.dataCheck = nil
 	c.TextQueue = append([]TextEntry(nil), s.TextQueue...)
 	c.Buckets = make(map[uint32]*Bucket, len(s.Buckets))
 	for k, v := range s.Buckets {

@@ -12,23 +12,24 @@ import (
 )
 
 // Bounties (see types.Offer). A bounty's pot can only go to the hunter of
-// an accepted offer whose data is proven, be burned by a dispute, or
-// return to its backers:
+// an accepted offer whose data is stored in full, or return to its
+// backers:
 //
 //	open      likes add to the pot until the deadline; only the requester
 //	          may accept an offer, and only before the deadline
-//	accepted  the offer is carried on chain; the storage of its data (at
-//	          the bounty's tier) is held from the pot; the vdf output of the
-//	          next block picks FundSamples sub-chunks the reveal must show
-//	          within BountyRevealBlocks, deadline or not
-//	proven    the data is placed and its storage paid; after
-//	          BountyDisputeBlocks the pot goes to the hunter, unless the
-//	          requester disputed, which burns it
+//	accepted  the offer is carried on chain and the pot is locked to it;
+//	          the storage of its data (at the bounty's tier) is held from the
+//	          pot. Within BountyRevealBlocks, deadline or not, anyone may send
+//	          the reveal: valid only with the whole data at hand (see
+//	          SetDataCheck), it stores the data and pays the rest of the pot
+//	          to the hunter at once.
 //
 // A reveal that does not come in time fails the offer (it cannot be
-// accepted again) and reopens the bounty, or refunds it past the deadline.
-// Nothing the requester can do takes the pot back once an offer is
-// accepted, and nothing can be withdrawn before the deadline.
+// accepted again), reopens the bounty and gives it back the blocks it was
+// locked for (up to BountyExtendMaxBlocks in all), or refunds it if the
+// deadline has passed even so. No step depends on anyone's judgement: once
+// an offer is accepted nothing can take the pot from its hunter, and
+// nothing can be withdrawn before the deadline.
 
 // BountyStatus is where a bounty stands.
 type BountyStatus uint8
@@ -36,7 +37,6 @@ type BountyStatus uint8
 const (
 	BountyOpen      BountyStatus = 1
 	BountyAccepted  BountyStatus = 2
-	BountyProven    BountyStatus = 3
 	BountyRefunding BountyStatus = 4
 )
 
@@ -59,11 +59,10 @@ type Bounty struct {
 	Size     uint64
 	Media    uint8
 	Accepted uint64 // height of the acceptance
-	Seed     Hash
 	Bucket   uint32
 	Held     uint64 // storage fee set aside in Escrow
-	Proven   uint64 // height of the proof (the dispute window starts)
 	Failed   []Hash // offers accepted whose reveal never came
+	Extended uint64 // blocks added to the deadline for failed reveals
 	// Refund in progress.
 	RefundPot uint64
 	RefundAt  int
@@ -140,67 +139,59 @@ func (s *State) applyAccept(t *types.Tx, b *Bounty, held uint64, h uint64) {
 	months, perm, _ := params.TierMonths(b.Tier)
 	b.Status, b.Accepted = BountyAccepted, h
 	b.Offer, b.Hunter, b.DataRoot, b.Size, b.Media = o.ID(), o.HunterAddr(), o.DataRoot, o.Size, o.Media
-	b.Held, b.Bucket, b.Seed = held, s.BucketFor(h, months, perm), Hash{}
+	b.Held, b.Bucket = held, s.BucketFor(h, months, perm)
 	s.Bounties.Set(o.Bounty, b)
-	s.due(h+1, o.Bounty)                        // the seed: vdf output of block h+1
 	s.due(h+s.P.BountyRevealBlocks+1, o.Bounty) // end of the reveal window
 }
 
-func (s *State) checkBountyProof(t *types.Tx, h uint64, ctx *BlockCtx) (*Bounty, uint64, error) {
-	b, ok := s.bounty(t.Target)
-	if !ok || b.Status != BountyAccepted || b.Seed.IsZero() || h > b.Accepted+s.P.BountyRevealBlocks {
-		return nil, 0, errors.New("the bounty is not waiting for a reveal")
-	}
-	base := s.BytesFee(t)
-	if base > b.Escrow-b.Held {
-		return nil, 0, errors.New("the pot cannot pay for the proof")
-	}
-	if ctx.MediaUsed+b.Size > s.MediaCapPerBlock() {
-		return nil, 0, errors.New("media cap for this block reached")
-	}
-	if !s.replay {
-		if err := s.checkSamples(t, b.Seed, b.DataRoot, b.Size); err != nil {
-			return nil, 0, err
-		}
-	}
-	return b, base, nil
-}
-
-func (s *State) applyBountyProof(t *types.Tx, b *Bounty, base uint64, h uint64, ctx *BlockCtx) {
-	b.Escrow -= base
-	ctx.MediaUsed += b.Size
-	s.place(b.DataRoot, b.Size, b.Media, b.Tier, b.Bucket)
-	s.fund(b.Bucket, b.Held)
-	b.Escrow -= b.Held
-	b.Held = 0
-	b.Status, b.Proven = BountyProven, h
-	s.Bounties.Set(t.Target, b)
-	s.due(h+s.P.BountyDisputeBlocks+1, t.Target)
-}
-
-func (s *State) checkDispute(t *types.Tx, from Address, h uint64) (*Bounty, error) {
+// checkBountyReveal checks a reveal and returns its bounty, its base fee
+// (paid from the pot) and the account fee owed if the hunter has no account
+// yet.
+func (s *State) checkBountyReveal(t *types.Tx, h uint64, ctx *BlockCtx) (*Bounty, uint64, uint64, error) {
 	b, ok := s.bounty(t.Target)
 	switch {
-	case !ok || b.Status != BountyProven:
-		return nil, errors.New("no proven result to dispute")
-	case from != b.Requester:
-		return nil, errors.New("only the requester disputes")
-	case h > b.Proven+s.P.BountyDisputeBlocks:
-		return nil, errors.New("the dispute window has closed")
+	case !ok || b.Status != BountyAccepted || h > b.Accepted+s.P.BountyRevealBlocks:
+		return nil, 0, 0, errors.New("the bounty is not waiting for a reveal")
+	case t.DataRoot != b.DataRoot || t.Size != b.Size:
+		return nil, 0, 0, errors.New("the reveal names other data than the accepted offer")
+	case ctx.MediaUsed+b.Size > s.MediaCapPerBlock():
+		return nil, 0, 0, errors.New("media cap for this block reached")
 	}
-	return b, nil
+	base := s.BytesFee(t)
+	var account uint64
+	if !s.Accounts.Has(b.Hunter) {
+		account = s.NewAccountFee()
+	}
+	if base+account > b.Escrow-b.Held {
+		return nil, 0, 0, errors.New("the pot cannot pay for the reveal")
+	}
+	if err := s.checkData(b.DataRoot, b.Size); err != nil {
+		return nil, 0, 0, err
+	}
+	return b, base, account, nil
 }
 
-// applyDispute burns the pot: the requester gains nothing by disputing
-// (the data is public and the coins do not come back), and a hunter whose
-// data was not what its preview showed is not paid.
-func (s *State) applyDispute(id Hash, b *Bounty, ctx *BlockCtx) {
-	ctx.Burn += b.Escrow
+// applyBountyReveal stores the data and pays the hunter. Data already
+// stored by someone else (say, the requester, from the shared data) is
+// moved to the bounty's bucket: the hunter is paid all the same.
+// The sender's account (acc, written back after this) is credited directly
+// when the hunter sends its own reveal.
+func (s *State) applyBountyReveal(id Hash, b *Bounty, base, account uint64, from Address, acc *Account, ctx *BlockCtx) {
+	ctx.MediaUsed += b.Size
+	ctx.Burn += account
+	s.place(b.DataRoot, b.Size, b.Media, b.Tier, b.Bucket)
+	s.fund(b.Bucket, b.Held)
+	pay := b.Escrow - b.Held - base - account
+	if b.Hunter == from {
+		acc.Balance += pay
+	} else {
+		s.Account(b.Hunter).Balance += pay
+	}
 	s.Bounties.Delete(id)
 }
 
 // bountyDue runs what falls due at height h for one bounty.
-func (s *State) bountyDue(id Hash, h uint64, seed Hash, ctx *BlockCtx) {
+func (s *State) bountyDue(id Hash, h uint64) {
 	b, ok := s.bounty(id)
 	if !ok {
 		return
@@ -208,26 +199,22 @@ func (s *State) bountyDue(id Hash, h uint64, seed Hash, ctx *BlockCtx) {
 	switch {
 	case b.Status == BountyOpen && h >= b.Deadline:
 		s.startRefund(id)
-	case b.Status == BountyAccepted && h == b.Accepted+1 && b.Seed.IsZero():
-		b.Seed = sampleSeed(seed, id)
-		s.Bounties.Set(id, b)
 	case b.Status == BountyAccepted && h > b.Accepted+s.P.BountyRevealBlocks:
+		// The bounty was locked from the acceptance to now for nothing: it
+		// gets that time back, so a hunter that never reveals cannot run
+		// out the clock on it.
+		locked := min(h-b.Accepted, s.P.BountyExtendMaxBlocks-b.Extended)
 		b.Failed = append(b.Failed, b.Offer)
-		b.Status, b.Held, b.Offer, b.Hunter, b.DataRoot, b.Size, b.Media, b.Accepted, b.Seed, b.Bucket =
-			BountyOpen, 0, Hash{}, Address{}, Hash{}, 0, 0, 0, Hash{}, 0
+		b.Deadline += locked
+		b.Extended += locked
+		b.Status, b.Held, b.Offer, b.Hunter, b.DataRoot, b.Size, b.Media, b.Accepted, b.Bucket =
+			BountyOpen, 0, Hash{}, Address{}, Hash{}, 0, 0, 0, 0
 		s.Bounties.Set(id, b)
 		if h >= b.Deadline {
 			s.startRefund(id)
+		} else if locked > 0 {
+			s.due(b.Deadline, id)
 		}
-	case b.Status == BountyProven && h > b.Proven+s.P.BountyDisputeBlocks:
-		pay := b.Escrow
-		if !s.Accounts.Has(b.Hunter) {
-			fee := min(pay, s.NewAccountFee())
-			ctx.Burn += fee
-			pay -= fee
-		}
-		s.Account(b.Hunter).Balance += pay
-		s.Bounties.Delete(id)
 	}
 }
 
@@ -248,10 +235,9 @@ func bountySum(id Hash, b *Bounty) pmap.Sum {
 	w.Var(b.Size)
 	w.U8(b.Media)
 	w.Var(b.Accepted)
-	w.Fixed(b.Seed[:])
 	w.U32(b.Bucket)
 	w.Var(b.Held)
-	w.Var(b.Proven)
+	w.Var(b.Extended)
 	w.Var(uint64(len(b.Failed)))
 	for _, f := range b.Failed {
 		w.Fixed(f[:])

@@ -35,6 +35,7 @@ type PostView struct {
 	Tips     uint64   `json:"tips"`                // coins tipped to the author (base units)
 	TipTo    string   `json:"tip_to,omitempty"`    // where its likes (tips) go; empty: it takes none
 	Liked    bool     `json:"liked,omitempty"`     // this node's like is counted
+	Mine     bool     `json:"mine,omitempty"`      // written here (wallet, pseudonym or anonymously)
 	Lane     string   `json:"lane"`                // "anon" or "fee"
 	Pseudo   bool     `json:"pseudonym,omitempty"` // author is a pseudonym key
 	Pending  bool     `json:"pending,omitempty"`

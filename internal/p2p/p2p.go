@@ -484,11 +484,14 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 			return nil
 		}
 		var mt *chain.MissingTextsError
+		var md *chain.MissingDataError
 		switch err := h.cfg.Chain.Add(blk); {
 		case err == nil:
 			h.broadcast(msgBlock, b, p)
 		case errors.As(err, &mt):
 			h.park(blk, b, mt.Hashes, p)
+		case errors.As(err, &md):
+			h.parkForData(blk, b, md, p)
 		case errors.Is(err, chain.ErrOrphan):
 			h.requestSync(p)
 		case errors.Is(err, chain.ErrInvalid):
@@ -531,9 +534,12 @@ func (h *Host) handle(p *peer, typ uint8, b []byte) error {
 				return err
 			}
 			var mt *chain.MissingTextsError
+			var md *chain.MissingDataError
 			if errors.As(err, &mt) {
 				// Later blocks of the batch wait as orphans behind this one.
 				h.park(blk, raw, mt.Hashes, p)
+			} else if errors.As(err, &md) {
+				h.parkForData(blk, raw, md, p)
 			}
 			if err == nil {
 				added++
@@ -722,7 +728,7 @@ func (h *Host) wanted(root Hash, size uint64) bool {
 // maxTextsPerMsg bounds the bodies asked for or sent in one message.
 const maxTextsPerMsg = 512
 
-// parkedBlock is a recent block waiting for post bodies.
+// parkedBlock is a recent block waiting for post bodies or paid data.
 type parkedBlock struct {
 	blk  *types.Block
 	raw  []byte
@@ -747,6 +753,26 @@ func (h *Host) park(blk *types.Block, raw []byte, missing []Hash, from *peer) {
 	h.FetchTexts(missing, from)
 }
 
+// parkForData keeps a block until the paid data it stores is all here and
+// asks for that data (its sender first: it took the block, so it has it).
+func (h *Host) parkForData(blk *types.Block, raw []byte, md *chain.MissingDataError, from *peer) {
+	h.mu.Lock()
+	if len(h.parked) < maxOrphanBlocks {
+		h.parked[blk.Hash()] = &parkedBlock{blk: blk, raw: raw, from: from, at: time.Now()}
+	}
+	h.mu.Unlock()
+	h.fetchBlockData(md, from)
+}
+
+func (h *Host) fetchBlockData(md *chain.MissingDataError, from *peer) {
+	if _, ok := h.cfg.Store.Size(md.Root); !ok {
+		if err := h.cfg.Store.Begin(md.Root, md.Size); err != nil {
+			return
+		}
+	}
+	h.FetchData(md.Root, from)
+}
+
 // retryParked offers parked blocks to the chain again; ones still missing
 // bodies ask again, and ones parked too long are dropped (sync refetches).
 func (h *Host) retryParked() {
@@ -766,6 +792,11 @@ func (h *Host) retryParked() {
 		var mt *chain.MissingTextsError
 		if errors.As(err, &mt) {
 			h.FetchTexts(mt.Hashes, nil)
+			continue
+		}
+		var md *chain.MissingDataError
+		if errors.As(err, &md) {
+			h.fetchBlockData(md, nil)
 			continue
 		}
 		h.mu.Lock()

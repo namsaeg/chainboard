@@ -395,24 +395,3 @@ func (m *Miner) EpochProof(st *state.State, nonce uint64) (*types.Tx, bool) {
 	t.Sign(m.Key)
 	return t, true
 }
-
-// FundSamples builds the samples a data proof (funded upload or bounty
-// reveal) must show, from data this node holds.
-func FundSamples(st *store.Store, seed, id, root cryptox.Hash, size uint64) ([]types.FundSample, error) {
-	out := make([]types.FundSample, 0, types.FundSamples)
-	for j := 0; j < types.FundSamples; j++ {
-		ci, sub := state.FundSampleAt(seed, id, size, j)
-		raw, err := st.Chunk(root, ci)
-		if err != nil {
-			return nil, err
-		}
-		path, err := st.SubProof(root, ci, sub)
-		if err != nil {
-			return nil, err
-		}
-		lo := sub * params.SubChunkSize
-		hi := min(lo+params.SubChunkSize, len(raw))
-		out = append(out, types.FundSample{Sub: append([]byte(nil), raw[lo:hi]...), Path: path})
-	}
-	return out, nil
-}

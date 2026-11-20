@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
-	"github.com/namsaeg/chainboard/internal/keystore"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
@@ -28,16 +27,32 @@ func (n *Node) pseudoKey() (*cryptox.Key, bool) {
 	if n.pseudo != nil {
 		return n.pseudo, true
 	}
-	path := n.rlnPath("pseudonym.key")
-	if _, err := os.Stat(path); err != nil {
+	if _, err := os.Stat(n.rlnPath("pseudonym.key")); err != nil {
 		return nil, false
 	}
-	k, err := loadKey(path, n.cfg.Password)
+	k, err := n.loadKeyFile("pseudonym.key")
 	if err != nil {
 		return nil, false
 	}
 	n.pseudo = k
 	return k, true
+}
+
+// ownAddress reports whether an address is this node's own: the wallet,
+// the pseudonym or the one-time address of one of its anonymous posts.
+func (n *Node) ownAddress(a types.Address) bool {
+	if a == n.Wallet.Address() {
+		return true
+	}
+	if k, ok := n.pseudoKey(); ok && k.Address() == a {
+		return true
+	}
+	n.tipMu.Lock()
+	defer n.tipMu.Unlock()
+	if _, err := n.tipKeysLocked(); err != nil {
+		return false
+	}
+	return n.tipAddrs[a]
 }
 
 type tipKeysFile struct {
@@ -56,7 +71,7 @@ func (n *Node) tipKeysLocked() ([]*cryptox.Key, error) {
 	if n.tipLoaded {
 		return n.tipCache, nil
 	}
-	b, err := keystore.Read(n.rlnPath("tipkeys.key"), n.cfg.Password)
+	b, err := n.readKey("tipkeys.key")
 	if errors.Is(err, os.ErrNotExist) {
 		n.tipLoaded = true
 		return nil, nil
@@ -77,6 +92,10 @@ func (n *Node) tipKeysLocked() ([]*cryptox.Key, error) {
 		out = append(out, cryptox.KeyFromSeed(seed))
 	}
 	n.tipCache, n.tipLoaded = out, true
+	n.tipAddrs = map[types.Address]bool{}
+	for _, k := range out {
+		n.tipAddrs[k.Address()] = true
+	}
 	return out, nil
 }
 
@@ -98,11 +117,15 @@ func (n *Node) newTipKey() (types.Address, error) {
 	}
 	f.Seeds = append(f.Seeds, hex.EncodeToString(seed))
 	b, _ := json.Marshal(f)
-	if err := keystore.Write(n.rlnPath("tipkeys.key"), b, n.cfg.Password); err != nil {
+	if err := n.writeKey("tipkeys.key", b); err != nil {
 		return types.Address{}, err
 	}
 	k := cryptox.KeyFromSeed(seed)
 	n.tipCache = append(keys[:len(keys):len(keys)], k)
+	if n.tipAddrs == nil {
+		n.tipAddrs = map[types.Address]bool{}
+	}
+	n.tipAddrs[k.Address()] = true
 	return k.Address(), nil
 }
 

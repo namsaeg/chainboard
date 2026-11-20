@@ -111,8 +111,11 @@ type Node struct {
 	likesFlush     sync.Mutex // one batch at a time
 	likeWarnLogged time.Time
 
+	keyMu     sync.Mutex // secret key files (see keys.go)
+	password  string     // what they are locked with now ("" plain)
 	tipMu     sync.Mutex // one-time tip keys file, and the keys read from it
 	tipCache  []*cryptox.Key
+	tipAddrs  map[cryptox.Address]bool
 	tipLoaded bool
 	rlnMu     sync.Mutex // guards the fields below
 	secret    *fr.Element
@@ -206,7 +209,7 @@ func New(cfg Config) (*Node, error) {
 			return nil, err
 		}
 	}
-	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, dir: dir,
+	n := &Node{cfg: cfg, P: p, Chain: ch, Store: st, Wallet: wallet, dir: dir, password: cfg.Password,
 		sent: map[uint64]*sentTx{}, funds: map[cryptox.Hash]*fundTend{},
 		offers: map[cryptox.Hash]*offerTend{}, shared: map[cryptox.Hash]bool{}}
 	if err := n.loadRLN(); err != nil {
@@ -221,6 +224,7 @@ func New(cfg Config) (*Node, error) {
 	n.Pool.OnDoubleSignal = n.onDoubleSignal
 	n.Pool.Bodies = st
 	ch.Texts = st
+	ch.Data = st
 	ch.TextWindowSec = cfg.TextWindowSec
 	ch.KeepBundle = func(data []byte) { _, _ = st.PutData(data) }
 	ch.Logf = cfg.Logf
@@ -576,7 +580,7 @@ func (n *Node) Send(t *types.Tx) error {
 	// Dry-run against the pending state so the user hears about errors now.
 	trial := n.trialState()
 	if err := trial.ApplyTx(t, trial.NewCtx()); err != nil {
-		if !(t.Kind == types.TxUpload && errors.Is(n.checkUpload(t), mempool.ErrWaitingData)) {
+		if !(t.CarriesData() && errors.Is(n.checkUpload(t), mempool.ErrWaitingData)) {
 			return err
 		}
 	}

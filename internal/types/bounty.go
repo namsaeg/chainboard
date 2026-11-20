@@ -16,12 +16,11 @@ import (
 // answer with signed offers that travel off chain: the data's root and
 // size, and a preview the requester judges by. The full data stays with
 // the hunter. Accepting an offer (only the requester, before the deadline)
-// carries it on chain and locks the pot to it; the hunter then reveals the
-// data and anyone proves sampled sub-chunks within a window, after which
-// the pot (less the result's storage) goes to the hunter unless the
-// requester disputes within a further window, which burns it instead. The
-// requester never sees the full data before the pot is locked, and the
-// lock releases without the requester's help.
+// carries it on chain and locks the pot to it; within a window the hunter
+// then reveals the data, a transaction valid only once nodes hold every
+// chunk of it, and the pot (less the result's storage) is the hunter's at
+// once. The requester never sees the full data before the pot is locked,
+// and the lock releases without the requester's help.
 
 const (
 	MaxBountyNote = 1000 // bytes, in the bounty transaction

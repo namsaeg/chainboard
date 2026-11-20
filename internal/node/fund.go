@@ -11,7 +11,6 @@ import (
 	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/media"
-	"github.com/namsaeg/chainboard/internal/miner"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
@@ -27,8 +26,8 @@ type FundView struct {
 	Root     string `json:"root"`
 	Size     uint64 `json:"size"`
 	MinTier  uint16 `json:"min_tier"`
-	// Tier the escrow would buy if uploaded now (0: not yet the minimum),
-	// or the tier bought once uploaded.
+	// Tier the escrow would buy if stored now (0: not yet the minimum), or
+	// the tier bought once stored.
 	Tier uint16 `json:"tier"`
 	// NeedForMin is what the minimum tier costs now, in coins.
 	NeedForMin string `json:"need_for_min"`
@@ -37,9 +36,10 @@ type FundView struct {
 
 func coins(u uint64) string { return fmt.Sprintf("%d.%08d", u/params.Coin, u%params.Coin) }
 
-// uploadBase estimates the base fee of a funded upload (its block bytes).
-func uploadBase(st *state.State) uint64 {
-	probe := &types.Tx{Kind: types.TxFundUpload, From: make([]byte, 32), Sig: make([]byte, 64), Target: cryptox.Hash{1}, Nonce: 1 << 20, MaxFee: 1 << 40}
+// storeBase estimates the base fee of a fund store (its block bytes).
+func storeBase(st *state.State) uint64 {
+	probe := &types.Tx{Kind: types.TxFundStore, From: make([]byte, 32), Sig: make([]byte, 64), Target: cryptox.Hash{1},
+		DataRoot: cryptox.Hash{1}, Size: 1 << 40, Nonce: 1 << 20, MaxFee: 1 << 40}
 	return st.BytesFee(probe)
 }
 
@@ -47,19 +47,22 @@ func uploadBase(st *state.State) uint64 {
 func (n *Node) fundView(st *state.State, id cryptox.Hash, root cryptox.Hash, size uint64, minTier uint16, creator cryptox.Address) *FundView {
 	v := &FundView{Root: root.String(), Size: size, MinTier: minTier, Mine: creator == n.Wallet.Address()}
 	if months, perm, ok := params.TierMonths(minTier); ok {
-		v.NeedForMin = coins(state.StorageFee(st.P, st.Price, size, st.P.MediaReplicas, months, perm) + uploadBase(st))
+		v.NeedForMin = coins(state.StorageFee(st.P, st.Price, size, st.P.MediaReplicas, months, perm) + storeBase(st))
 	}
 	c, ok := st.Funds.Get(id)
 	switch {
 	case ok:
 		v.Raised, v.Escrow, v.Backers, v.Deadline = coins(c.Raised), coins(c.Escrow), c.Pledges.Len(), c.Deadline
-		if c.Status == state.FundUploaded {
-			v.Status, v.Tier = "uploaded", c.Tier
-		} else {
+		switch {
+		case c.Status == state.FundOpen:
 			v.Status = "open"
-			if t, _, ok := st.FundTier(c, st.Height+1, uploadBase(st)); ok {
+			if t, _, ok := st.FundTier(c, st.Height+1, storeBase(st)); ok {
 				v.Tier = t
 			}
+		case c.Tier != 0: // stored; the rest is being returned
+			v.Status, v.Tier = "stored", c.Tier
+		default:
+			v.Status = "closed"
 		}
 	case st.Data.Has(root):
 		v.Status = "stored"
@@ -334,13 +337,15 @@ func (n *Node) openRequest(id cryptox.Hash, st *state.State, h uint64) (*types.F
 	return ft.req, nil
 }
 
-// fundLead is how long before the deadline an own request is uploaded on
-// the minimum tier (earlier only once it affords permanent storage).
+// fundLead is how long before the deadline an own request is stored on
+// the longest tier it affords (earlier only once it affords permanent
+// storage).
 func (n *Node) fundLead() uint64 { return max(3, n.P.BlocksPerDay/4) }
 
-// tendFunds uploads and proves this node's own requests: as soon as the
-// escrow affords permanent storage, or near the deadline at the longest
-// tier it affords; then the proof once its seed is known.
+// tendFunds stores this node's own requests: as soon as the escrow affords
+// permanent storage, or near the deadline at the longest tier it affords.
+// The store is valid only with all of the data at hand, so this node keeps
+// sharing the data until it is in a block.
 func (n *Node) tendFunds(st *state.State) {
 	n.fundMu.Lock()
 	var own []*fundTend
@@ -360,25 +365,14 @@ func (n *Node) tendFunds(st *state.State) {
 		if ft.sentFor == c.Status && h < ft.sentAt+5 {
 			continue // sent; give it a few blocks
 		}
-		var tx *types.Tx
-		switch c.Status {
-		case state.FundOpen:
-			tier, _, ok := st.FundTier(c, h, uploadBase(st)*2)
-			if !ok || (tier != params.TierPermanent && h+n.fundLead() < c.Deadline) {
-				continue
-			}
-			tx = &types.Tx{Kind: types.TxFundUpload, Target: id}
-		case state.FundUploaded:
-			if c.Seed.IsZero() {
-				continue
-			}
-			samples, err := miner.FundSamples(n.Store, c.Seed, id, c.DataRoot, c.Size)
-			if err != nil {
-				n.cfg.Logf("node: funding proof: %v", err)
-				continue
-			}
-			tx = &types.Tx{Kind: types.TxFundProof, Target: id, Samples: samples}
+		if c.Status != state.FundOpen {
+			continue
 		}
+		tier, _, ok := st.FundTier(c, h, storeBase(st)*2)
+		if !ok || (tier != params.TierPermanent && h+n.fundLead() < c.Deadline) {
+			continue
+		}
+		tx := &types.Tx{Kind: types.TxFundStore, Target: id, DataRoot: c.DataRoot, Size: c.Size}
 		if pc, ok := n.trialState().Funds.Get(id); !ok || pc.Status != c.Status {
 			continue // what we would send is already in the pool
 		}

@@ -24,32 +24,37 @@ type (
 type TxKind uint8
 
 const (
-	TxTransfer      TxKind = iota + 1
-	TxPost                 // a post or a comment (Parent set)
-	TxUpload               // registers a data root (media) with a retention tier
-	TxExtend               // anyone extends a data root to a longer tier
-	TxStake                // locks coins for the free lane
-	TxUnstake              // starts unbonding
-	TxRegister             // declares the partitions a storage node keeps
-	TxProof                // epoch storage proof
-	TxLikes                // a batch of likes (and pledges to funding requests)
-	TxAnonPost             // unsigned post of the anonymous lane, carrying an RLN proof
-	TxRLNJoin              // moves mature stake into an RLN membership bond
-	TxRLNLeave             // starts the exit of a membership (bond returns after unbonding)
-	TxRLNSlash             // unsigned: reveals a member's secret recovered from a double signal
-	TxFundUpload           // stores funded data, paid from its request's escrow (anyone may send)
-	TxFundProof            // proves the funded data's sampled sub-chunks, paid from the escrow
-	TxBounty               // locks coins for data the sender wants (a bounty)
-	TxBountyAccept         // the requester accepts an offer, carried in it; the pot locks to it
-	TxBountyProof          // proves the accepted data's sampled sub-chunks, paid from the pot
-	TxBountyDispute        // the requester disputes a proven result: the pot is burned
+	TxTransfer     TxKind = iota + 1
+	TxPost                // a post or a comment (Parent set)
+	TxUpload              // registers a data root (media) with a retention tier
+	TxExtend              // anyone extends a data root to a longer tier
+	TxStake               // locks coins for the free lane
+	TxUnstake             // starts unbonding
+	TxRegister            // declares the partitions a storage node keeps
+	TxProof               // epoch storage proof
+	TxLikes               // a batch of likes (and pledges to funding requests)
+	TxAnonPost            // unsigned post of the anonymous lane, carrying an RLN proof
+	TxRLNJoin             // moves mature stake into an RLN membership bond
+	TxRLNLeave            // starts the exit of a membership (bond returns after unbonding)
+	TxRLNSlash            // unsigned: reveals a member's secret recovered from a double signal
+	TxFundStore           // the creator stores funded data, paid from its request's escrow
+	TxBounty              // locks coins for data the sender wants (a bounty)
+	TxBountyAccept        // the requester accepts an offer, carried in it; the pot locks to it
+	TxBountyReveal        // stores the accepted data and pays the pot to its hunter
 )
 
 var kindNames = [...]string{"?", "transfer", "post", "upload", "extend", "stake", "unstake", "register", "proof", "likes",
-	"anonpost", "rlnjoin", "rlnleave", "rlnslash", "fundupload", "fundproof",
-	"bounty", "bountyaccept", "bountyproof", "bountydispute"}
+	"anonpost", "rlnjoin", "rlnleave", "rlnslash", "fundstore", "bounty", "bountyaccept", "bountyreveal"}
 
 func (k TxKind) String() string { return kindNames[min(int(k), len(kindNames)-1)] }
+
+// CarriesData reports whether a transaction stores a data root whose chunks
+// must be fully here before it is pooled, and (in a recent block) before
+// the block is accepted: an upload, or the paid storing of funded or bounty
+// data.
+func (t *Tx) CarriesData() bool {
+	return t.Kind == TxUpload || t.Kind == TxFundStore || t.Kind == TxBountyReveal
+}
 
 // Signed reports whether a kind is signed by an account. Anonymous posts and
 // slashes have no sender, nonce, fee or signature.
@@ -163,7 +168,7 @@ type Tx struct {
 	Parent   Hash   // post: zero for a top-level post, else the post commented on
 	Attach   []Hash // post: data roots
 
-	DataRoot Hash // upload, extend of data
+	DataRoot Hash // upload, extend of data; the data a fundstore or bountyreveal stores
 	Size     uint64
 	Tier     uint16 // upload, extend, post (retention of the body)
 	Media    uint8
@@ -173,7 +178,6 @@ type Tx struct {
 	Pledges  []Pledge       // likes
 	Tips     []Tip          // likes
 	Requests []*FundRequest // likes: funding requests carried on chain with their first pledge
-	Samples  []FundSample   // fundproof
 
 	// Text is the body of a post. It is not part of the encoding, ID or
 	// signature, which commit to TextHash: it travels next to the
@@ -256,11 +260,10 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 			r.encodeBody(w)
 			w.Fixed(r.Sig)
 		}
-	case TxFundUpload:
+	case TxFundStore, TxBountyReveal:
 		w.Fixed(t.Target[:])
-	case TxFundProof, TxBountyProof:
-		w.Fixed(t.Target[:])
-		encodeSamples(w, t.Samples)
+		w.Fixed(t.DataRoot[:])
+		w.Var(t.Size)
 	case TxBounty:
 		w.Bytes([]byte(t.Board))
 		w.Bytes([]byte(t.Note))
@@ -274,8 +277,6 @@ func (t *Tx) encodeBody(w *codec.Writer) {
 	case TxBountyAccept:
 		t.Offer.encodeBody(w)
 		w.Fixed(t.Offer.Sig)
-	case TxBountyDispute:
-		w.Fixed(t.Target[:])
 	case TxRegister:
 		w.Var(uint64(len(t.Partitions)))
 		for _, p := range t.Partitions {
@@ -470,11 +471,10 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		for i := 0; i < n && r.Err == nil; i++ {
 			t.Requests = append(t.Requests, decodeRequest(r))
 		}
-	case TxFundUpload:
+	case TxFundStore, TxBountyReveal:
 		r.Fixed(t.Target[:])
-	case TxFundProof, TxBountyProof:
-		r.Fixed(t.Target[:])
-		t.Samples = decodeSamples(r)
+		r.Fixed(t.DataRoot[:])
+		t.Size = r.Var()
 	case TxBounty:
 		t.Board = string(r.Bytes(params.MaxBoardBytes))
 		t.Note = string(r.Bytes(MaxBountyNote))
@@ -489,8 +489,6 @@ func decodeTx(r *codec.Reader) (*Tx, error) {
 		t.Tier = r.U16()
 	case TxBountyAccept:
 		t.Offer = decodeOffer(r)
-	case TxBountyDispute:
-		r.Fixed(t.Target[:])
 	case TxRegister:
 		n := r.Count(maxPartitions)
 		for i := 0; i < n; i++ {
@@ -756,9 +754,9 @@ func (t *Tx) CheckStateless() error {
 		if t.Limit == 0 || t.Amount == 0 {
 			return errors.New("membership needs a limit and a bond")
 		}
-	case TxFundUpload:
-		if t.Target.IsZero() {
-			return errors.New("funded upload names no request")
+	case TxFundStore, TxBountyReveal:
+		if t.Target.IsZero() || t.DataRoot.IsZero() || t.Size == 0 {
+			return errors.New("storing paid data needs its request, data root and size")
 		}
 	case TxBounty:
 		if err := checkBounty(t); err != nil {
@@ -770,19 +768,6 @@ func (t *Tx) CheckStateless() error {
 		}
 		if err := t.Offer.Check(); err != nil {
 			return err
-		}
-	case TxBountyDispute:
-		if t.Target.IsZero() {
-			return errors.New("dispute names no bounty")
-		}
-	case TxFundProof, TxBountyProof:
-		if t.Target.IsZero() || len(t.Samples) != FundSamples {
-			return fmt.Errorf("a data proof needs %d samples", FundSamples)
-		}
-		for _, x := range t.Samples {
-			if len(x.Sub) == 0 || len(x.Sub) > params.SubChunkSize {
-				return errors.New("funding proof: bad sample")
-			}
 		}
 	case TxTransfer, TxStake, TxUnstake, TxRegister, TxRLNLeave:
 	case TxProof:

@@ -144,24 +144,3 @@ func (s *server) bountyAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]bool{"queued": true})
 }
-
-func (s *server) bountyDispute(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID      string `json:"id"`
-		Confirm bool   `json:"confirm"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-		fail(w, 400, err)
-		return
-	}
-	id, err := cryptox.ParseHash(req.ID)
-	if err != nil {
-		fail(w, 400, err)
-		return
-	}
-	if err := s.n.DisputeBounty(id, req.Confirm); err != nil {
-		sendFail(w, err)
-		return
-	}
-	writeJSON(w, map[string]bool{"queued": true})
-}

@@ -229,11 +229,11 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 	}
 	cost := TxCost{Tip: t.Tip}
 	var pledged uint64 // moved into funding escrows or tipped
-	var fund *Campaign // funded upload or proof: its fees come from the escrow
-	var fundBase, fundHeld uint64
+	var fund *Campaign // fund store: its fees come from the escrow
+	var fundBase, fundFee uint64
 	var fundTier uint16
-	var bty *Bounty // bounty acceptance, proof or dispute
-	var btyBase, btyHeld uint64
+	var bty *Bounty // bounty acceptance or reveal
+	var btyBase, btyHeld, btyAccount uint64
 	if t.Kind == types.TxProof {
 		if next.Proofs >= MaxProofTxs {
 			return errors.New("too many proofs in block")
@@ -288,36 +288,17 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		if bty, btyHeld, err = s.checkAccept(t, from, h); err != nil {
 			return err
 		}
-	case types.TxBountyProof:
+	case types.TxBountyReveal:
 		var err error
-		if bty, btyBase, err = s.checkBountyProof(t, h, &next); err != nil {
+		if bty, btyBase, btyAccount, err = s.checkBountyReveal(t, h, &next); err != nil {
 			return err
 		}
 		cost.Base = 0 // paid from the pot, below
-	case types.TxBountyDispute:
+	case types.TxFundStore:
 		var err error
-		if bty, err = s.checkDispute(t, from, h); err != nil {
+		if fund, fundBase, fundFee, fundTier, err = s.checkFundStore(t, from, h, &next); err != nil {
 			return err
 		}
-	case types.TxFundUpload, types.TxFundProof:
-		c, ok := s.campaign(t.Target)
-		if !ok {
-			return errors.New("unknown funding request")
-		}
-		if t.Kind == types.TxFundProof && s.Data.Has(c.DataRoot) {
-			return errors.New("that data is already stored")
-		}
-		// Only the creator chooses when to upload (and so the tier), so no
-		// one can force an early, short-tier upload; anyone holding the
-		// data may send the proof.
-		if t.Kind == types.TxFundUpload && from != c.Creator {
-			return errors.New("only the request's creator sends its upload")
-		}
-		base, held, tier, err := s.fundCost(t, c, h, &next)
-		if err != nil {
-			return err
-		}
-		fund, fundBase, fundHeld, fundTier = c, base, held, tier
 		cost.Base = 0 // paid from the escrow, below
 	case types.TxExtend:
 		var fee uint64
@@ -442,14 +423,10 @@ func (s *State) ApplyTx(t *types.Tx, ctx *BlockCtx) error {
 		s.applyNewBounty(t, from, h)
 	case types.TxBountyAccept:
 		s.applyAccept(t, bty, btyHeld, h)
-	case types.TxBountyProof:
-		s.applyBountyProof(t, bty, btyBase, h, &next)
-	case types.TxBountyDispute:
-		s.applyDispute(t.Target, bty, &next)
-	case types.TxFundUpload:
-		s.applyFundUpload(t.Target, fund, fundBase, fundHeld, fundTier, h)
-	case types.TxFundProof:
-		s.applyFundProof(t.Target, fund, fundBase, &next)
+	case types.TxBountyReveal:
+		s.applyBountyReveal(t.Target, bty, btyBase, btyAccount, from, acc, &next)
+	case types.TxFundStore:
+		s.applyFundStore(t.Target, fund, fundBase, fundFee, fundTier, h, &next)
 	case types.TxRegister:
 		if e := s.Epoch(h); acc.PartsEpoch != e+1 {
 			acc.ProveParts = acc.Partitions
@@ -910,7 +887,7 @@ func (s *State) finish(b *types.Block, ctx *BlockCtx, target *big.Int) error {
 	hd := &b.Header
 
 	s.releaseExits(h)
-	s.dueAll(h, hd, ctx)
+	s.dueAll(h, ctx)
 
 	// Expire term buckets.
 	var ids []uint32

@@ -1,10 +1,5 @@
 package state
 
-import (
-	"github.com/namsaeg/chainboard/internal/cryptox"
-	"github.com/namsaeg/chainboard/internal/types"
-)
-
 // Refunds. A campaign or bounty that ends returns its coins to the backers
 // in proportion to what each put in. Many backers, or many endings at the
 // same height, would make one block heavy, so refunds wait in a queue and
@@ -68,20 +63,6 @@ func (s *State) runRefunds() {
 		drop()
 		s.Refunding = s.Refunding[1:]
 	}
-}
-
-// sampleSeed picks a data proof's samples from the vdf output of the block
-// after the upload or acceptance: no one knows it at that time, and the
-// miner of that block cannot grind it (unlike a block hash, which the
-// miner can vary freely).
-func sampleSeed(vdf, id Hash) Hash { return cryptox.Tagged("cb/sample/seed", vdf[:], id[:]) }
-
-// headerSeed is the vdf output a block ends with.
-func headerSeed(hd *types.Header) Hash {
-	if n := len(hd.VDFOutputs); n > 0 {
-		return hd.VDFOutputs[n-1]
-	}
-	return hd.Prev
 }
 
 // NewAccountFee is what creating an account costs: its state bytes at the

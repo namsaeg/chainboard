@@ -18,7 +18,8 @@ async function api(path, opts = {}) {
 const post = (path, body) => api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 // The node refuses a surcharged send, the last anonymous post of an epoch,
-// a dispute and the like with 409 and the warnings; they must be accepted.
+// accepting a bounty offer and the like with 409 and the warnings; they
+// must be accepted.
 function accepted(e) {
   if (e.status !== 409 || !e.body || !e.body.warnings) throw e;
   const lines = e.body.warnings.map((w) => '· ' + w.message);
@@ -150,25 +151,47 @@ function likeLabel(p) {
   return `좋아요 ${p.likes}${p.liked ? ' ✓' : ''}` + (Number(p.tips) > 0 ? ` · 후원 ${coin(p.tips)} 코인` : '');
 }
 
+// A line holding only [[n]] shows attachment n there; attachments no line
+// names follow the text. (The marker is plain text on chain: a few bytes.)
+const MARK = /^\s*\[\[([1-4])\]\]\s*$/;
+function attachment(p, i) {
+  const a = p.attach[i];
+  const box = el('div');
+  const img = el('img'); img.src = '/api/data/' + a; img.alt = `첨부 ${i + 1}`; img.loading = 'lazy';
+  img.onerror = () => img.replaceWith(el('div', 'small muted', '첨부를 이 노드가 아직 갖고 있지 않아요 · ' + short(a)));
+  box.append(img);
+  const k = (p.kept || [])[i];
+  if (k) {
+    const r = retention(`첨부 ${i + 1}`, k.tier, k.from, k.until, k.gone);
+    if (!k.gone && k.tier !== PERM) r.append(act('첨부 연장', () => extend({ root: a }, '5y')));
+    box.append(r);
+  }
+  return box;
+}
+function renderBody(d, p) {
+  const atts = p.attach || [];
+  const shown = new Set();
+  if (p.text_state === 'expired') d.append(el('div', 'text muted', '보관 기간이 끝나 본문이 지워진 글이에요.'));
+  else if (p.text_state === 'loading') d.append(el('div', 'text muted', '본문을 불러오는 중…'));
+  else {
+    let lines = [];
+    const flush = () => { const t = lines.join('\n'); if (t.trim()) d.append(el('div', 'text', t.replace(/^\n+|\n+$/g, ''))); lines = []; };
+    for (const line of (p.text || '').split('\n')) {
+      const m = line.match(MARK);
+      const i = m ? Number(m[1]) - 1 : -1;
+      if (i >= 0 && i < atts.length) { flush(); d.append(attachment(p, i)); shown.add(i); } else lines.push(line);
+    }
+    flush();
+  }
+  if (p.tier && !p.pending) d.append(retention('글', p.tier, p.height, p.until, p.text_state === 'expired'));
+  atts.forEach((_, i) => { if (!shown.has(i)) d.append(attachment(p, i)); });
+}
+
 function renderPost(p, isComment) {
   const d = el('div', 'post' + (p.pending ? ' pending' : ''));
   if (p.lane === 'bounty') d.append(el('span', 'badge live', '현상금'), ' ');
   if (p.lane === 'fund') d.append(el('span', 'badge live', '크라우드 펀딩'), ' ');
-  if (p.text_state === 'expired') d.append(el('div', 'text muted', '보관 기간이 끝나 본문이 지워진 글이에요.'));
-  else if (p.text_state === 'loading') d.append(el('div', 'text muted', '본문을 불러오는 중…'));
-  else d.append(el('div', 'text', p.text));
-  if (p.tier && !p.pending) d.append(retention('글', p.tier, p.height, p.until, p.text_state === 'expired'));
-  (p.attach || []).forEach((a, i) => {
-    const img = el('img'); img.src = '/api/data/' + a; img.alt = '첨부'; img.loading = 'lazy';
-    img.onerror = () => img.replaceWith(el('div', 'small muted', '첨부를 이 노드가 아직 갖고 있지 않아요 · ' + short(a)));
-    d.append(img);
-    const k = (p.kept || [])[i];
-    if (k) {
-      const r = retention('첨부', k.tier, k.from, k.until, k.gone);
-      if (!k.gone && k.tier !== PERM) r.append(act('첨부 연장', () => extend({ root: a }, '5y')));
-      d.append(r);
-    }
-  });
+  renderBody(d, p);
   if (p.fund) d.append(renderFund(p.id, p.fund));
   const m = el('div', 'meta');
   const who = p.lane === 'anon' ? (p.pseudonym ? '가명 ' + short(p.author) : '익명') : short(p.author);
@@ -176,7 +199,9 @@ function renderPost(p, isComment) {
   if (p.board && S.page !== 'board') m.append(act('게시판 ' + p.board, () => { selectBoard(p.board); showPage('board'); }));
   if (p.pending) m.append(el('span', '', '보내는 중 · 미확정'));
   else {
-    if (p.tip_to && p.tip_to === S.me) m.append(el('span', '', `좋아요 ${p.likes}` + (Number(p.tips) > 0 ? ` · 후원 ${coin(p.tips)} 코인` : '')));
+    // Liking one's own post (signed, pseudonymous or anonymous) would only
+    // move coins between one's own addresses, so it is not offered.
+    if (p.mine) m.append(el('span', '', `좋아요 ${p.likes}` + (Number(p.tips) > 0 ? ` · 후원 ${coin(p.tips)} 코인` : '') + ' · 내 글'));
     else if (p.tip_to) {
       const q = S.queued.get(p.id);
       m.append(act(likeLabel(p), () => openLike({ kind: 'post', id: p.id, post: p })));
@@ -239,15 +264,19 @@ $('#postForm').onsubmit = async (e) => {
   try {
     const attach = [];
     let note = '';
-    if (f.file.files.length) {
+    const files = [...f.file.files];
+    if (files.length) {
       if (f.lane.value === 'anon') return toast('첨부는 수수료 차선에서만 올릴 수 있어요', true);
-      const r = await upload(f.file.files[0], f.tier.value);
-      attach.push(r.root);
-      if (r.action === 'reuse') note = ' 같은 파일이 이미 저장돼 있어 다시 올리지 않았어요.';
-      if (r.action === 'extend') note = ' 같은 파일이 이미 저장돼 있어 보관 기간만 늘렸어요.';
+      if (files.length > 4) return toast('첨부는 글 하나에 4개까지예요', true);
+      for (const file of files) {
+        const r = await upload(file, f.tier.value);
+        attach.push(r.root);
+        if (r.action === 'reuse') note = ' 이미 저장된 파일은 다시 올리지 않았어요.';
+        if (r.action === 'extend') note = ' 이미 저장된 파일은 보관 기간만 늘렸어요.';
+      }
     }
     await send('/api/post', { board, text: f.text.value, lane: f.lane.value, pseudonym: f.pseudonym.checked && f.lane.value === 'anon', attach, tier: f.textTier.value });
-    f.reset(); syncLane(); toast('글을 보냈어요. 잠시 뒤 미확정 글로 보여요.' + note); refreshPosts();
+    f.reset(); syncLane(); markChips(); toast('글을 보냈어요. 잠시 뒤 미확정 글로 보여요.' + note); refreshPosts();
   } catch (err) { fail(err); }
 };
 function syncLane() {
@@ -259,6 +288,23 @@ function syncLane() {
     : '수수료 글은 지갑 주소가 공개되고, 고른 기간만큼 보관돼요. 첨부 이미지는 다시 인코딩되어 메타데이터가 지워져요.';
 }
 $('#postForm').lane.onchange = syncLane; syncLane();
+// One button per chosen picture puts its [[n]] where the cursor is.
+function markChips() {
+  const f = $('#postForm'); const box = $('#markChips'); box.replaceChildren();
+  [...f.file.files].slice(0, 4).forEach((file, i) => {
+    const b = el('button', 'plain small', `그림 ${i + 1} 넣기`); b.type = 'button'; b.title = file.name;
+    b.onclick = () => {
+      const ta = f.text; const at = ta.selectionStart ?? ta.value.length;
+      const mark = `${at && ta.value[at - 1] !== '\n' ? '\n' : ''}[[${i + 1}]]\n`;
+      ta.value = ta.value.slice(0, at) + mark + ta.value.slice(ta.selectionEnd ?? at);
+      ta.focus(); ta.selectionStart = ta.selectionEnd = at + mark.length;
+    };
+    box.append(b);
+  });
+  if (f.file.files.length > 4) box.append(el('span', 'err', '4개까지만 올릴 수 있어요'));
+  else if (f.file.files.length) box.append(el('span', 'muted', '넣지 않은 그림은 글 아래에 붙어요'));
+}
+$('#postForm').file.onchange = markChips;
 
 // ---------- likes ----------
 // A like always carries coins: a tip to a post's writer, a pledge to a
@@ -280,7 +326,7 @@ function openLike(ctx) {
     if (p.liked) notes.push('이미 좋아요가 세어진 글이에요. 더 보내도 좋아요 수는 그대로예요.');
   }
   if (ctx.kind === 'fund') notes.push('마감까지 저장되지 않으면 돌아와요.');
-  if (ctx.kind === 'bounty') notes.push('현상금이 지급되지 않고 마감되면 낸 비율대로 돌아와요. 요청자가 이의를 제기하면 소각돼요.');
+  if (ctx.kind === 'bounty') notes.push('현상금은 요청자가 고른 제안자에게 가요. 요청자를 믿을 수 있을 때 올리세요. 지급되지 않고 마감되면 낸 비율대로 돌아와요.');
   if (q) notes.push('이미 대기 중인 좋아요가 있어요. 담으면 금액이 바뀌어요.');
   $('#likeNote').textContent = notes.join(' ');
   $('#likeDlg').showModal();
@@ -297,7 +343,7 @@ $('#likeDlg').onclose = async () => {
 };
 
 // ---------- crowdfunding ----------
-const fundStates = { new: '새 요청 (첫 후원과 함께 체인에 올라가요)', open: '모금 중', uploaded: '업로드됨 · 증명 대기', stored: '저장 완료', closed: '마감 (환불됨)' };
+const fundStates = { new: '새 요청 (첫 후원과 함께 체인에 올라가요)', open: '모금 중', stored: '저장 완료', closed: '마감 (환불됨)' };
 const mediaNames = { 1: '이미지', 2: '이미지', 3: '영상', 4: '파일' };
 function renderFund(id, f, note) {
   const box = el('div', 'small');
@@ -371,7 +417,7 @@ $('#fundCheckForm').onsubmit = async (e) => {
 };
 
 // ---------- bounties ----------
-const bountyStates = { open: '모집 중', accepted: '제안 수락됨 · 공개 대기', proven: '공개됨 · 이의 기간', refunding: '돌려주는 중' };
+const bountyStates = { open: '모집 중', accepted: '제안 수락됨 · 공개 대기', refunding: '돌려주는 중' };
 const openOffers = new Set();
 const openPreviews = new Set();
 async function refreshBounties() {
@@ -389,6 +435,7 @@ function renderBounty(b) {
     img.onerror = () => img.replaceWith(el('div', 'small muted', '참고 이미지를 아직 받지 못했어요')); d.append(img); });
   const m = el('div', 'meta');
   if (b.status === 'open') m.append(el('span', '', `마감 ${timeLeft(b.blocks_left)} 뒤`));
+  if (b.failed) m.append(el('span', '', `공개하지 않은 수락 ${b.failed}번 · 마감 ${timeLeft(b.extended)} 늘어남`));
   m.append(el('span', '', `결과 ${tierName(b.tier)} 보관 (지금 1MB에 ${num(b.storage_per_mb)} 코인)`), el('span', '', `게시판 ${b.board || '-'}`),
     el('span', '', b.mine ? '내 현상금' : '요청자 ' + short(b.requester)));
   if (b.status === 'open') {
@@ -403,16 +450,8 @@ function renderBounty(b) {
   }
   if (b.status === 'accepted') {
     m.append(el('span', '', `공개 마감 ${timeLeft(b.window_left)} 뒤`));
-    if (b.my_offer) sub.append(el('div', 'ok', '내 제안이 수락됐어요. 이 노드가 데이터를 올리고 증명해요. 공개가 끝날 때까지 노드를 켜 두세요.'));
-    if (b.mine) sub.append(el('div', 'muted', `제안자가 ${timeLeft(b.window_left)} 안에 데이터를 공개해야 해요. 못 하면 다시 모집해요.`));
-  }
-  if (b.status === 'proven') {
-    m.append(el('span', '', `이의 기간 ${timeLeft(b.window_left)} 남음`));
-    sub.append(el('div', '', `결과 ${Math.ceil(b.size / 1024)}KB · 데이터 ${short(b.root)}`));
-    const img = el('img'); img.src = '/api/data/' + b.root; img.alt = '결과'; img.loading = 'lazy';
-    img.onerror = () => img.replaceWith(el('div', 'small muted', '결과를 이 노드가 아직 갖고 있지 않거나 이미지가 아니에요.'));
-    sub.append(img);
-    if (b.mine) sub.append(act('이의 제기 (현상금 소각)', () => send('/api/bounty/dispute', { id: b.id }).then(() => toast('이의 제기를 보냈어요')).catch(fail)));
+    if (b.my_offer) sub.append(el('div', 'ok', '내 제안이 수락됐어요. 이 노드가 데이터를 나눠 주고 공개해요. 블록에 담겨 현상금을 받을 때까지 노드를 켜 두세요.'));
+    if (b.mine) sub.append(el('div', 'muted', `제안자가 ${timeLeft(b.window_left)} 안에 데이터 전체를 공개해야 해요. 공개되면 현상금은 바로 제안자에게 가요. 못 하면 잠긴 시간만큼 마감을 늘려 다시 모집해요.`));
   }
   d.append(m, sub);
   return d;
@@ -618,11 +657,30 @@ async function refreshSettings() {
   const m = s.mining;
   kv($('#mining'), [['채굴', cfg.mine ? `켜짐 · 디스크 ${cfg.pledge_gb.toFixed(0)} GB` : '꺼짐'], ['파티션', m.assigned_partitions], ['패킹한 조각', m.packed_chunks],
     ['VDF 단계', m.vdf_steps], ['찾은 블록', m.blocks_found], ['최근', m.last_result || '-']]);
-  $('#pwInfo').replaceChildren(el('div', cfg.keys_locked ? 'ok' : 'warn', cfg.keys_locked ? '키 파일이 비밀번호로 잠겨 있어요.' : '키 파일이 잠겨 있지 않아요. 이 컴퓨터를 쓰는 사람은 누구나 지갑을 쓸 수 있어요.'));
+  const keyText = { locked: ['ok', '키 파일이 모두 비밀번호로 잠겨 있어요.'],
+    partial: ['warn', '일부 키 파일만 잠겨 있어요. 비밀번호를 다시 정하면 모두 잠가요.'],
+    plain: ['warn', '키 파일이 잠겨 있지 않아요. 이 컴퓨터를 쓰는 사람은 누구나 지갑을 쓸 수 있어요.'] }[cfg.keys] || ['muted', ''];
+  $('#pwInfo').replaceChildren(el('div', keyText[0], keyText[1]));
+  const locked = cfg.keys !== 'plain';
+  $('#pwCurrentRow').hidden = !locked;
+  $('#pwSet').textContent = locked ? '비밀번호 바꾸기' : '잠그기';
+  $('#pwClear').hidden = !locked;
   $('#autoSummary').textContent = '지금: ' + autoText((S.likes || {}).auto);
   const af = $('#autoForm'); const a = (S.likes || {}).auto || {};
   if (!af.contains(document.activeElement)) { af.minutes.value = String(a.minutes || 0); af.count.value = a.count || 0; }
 }
+$('#pwForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target; const op = e.submitter && e.submitter.dataset.op;
+  const next = op === 'clear' ? '' : f.next.value;
+  if (op === 'set' && (!next || next !== f.again.value)) return toast('새 비밀번호를 두 번 똑같이 입력하세요', true);
+  if (op === 'clear' && !confirm('잠금을 풀까요? 이 컴퓨터를 쓰는 사람은 누구나 지갑을 쓸 수 있게 돼요.')) return;
+  try {
+    await post('/api/password', { current: f.current.value, new: next });
+    f.reset(); toast(next ? '키를 새 비밀번호로 잠갔어요' : '키 잠금을 풀었어요');
+    await tick();
+  } catch (err) { fail(err.status === 403 ? new Error('지금 비밀번호가 맞지 않아요') : err); }
+};
 $('#autoForm').onsubmit = (e) => { e.preventDefault();
   post('/api/likes', { auto: { minutes: Number(e.target.minutes.value), count: Number(e.target.count.value) } })
     .then(() => { toast('자동 보내기 설정을 바꿨어요'); tick(); }).catch(fail); };

@@ -126,7 +126,10 @@ func (n *Node) likeEntry(req LikeRequest, st *state.State) (QueuedLike, error) {
 	if err != nil {
 		return q, err
 	}
-	if to == n.Wallet.Address() {
+	if n.ownAddress(to) {
+		// Liking one's own post (signed, pseudonymous or anonymous) would
+		// only move coins between one's own addresses: a transfer by
+		// another way.
 		return q, errors.New("you cannot like your own post")
 	}
 	q.Height, q.To = v.Height, to.String()

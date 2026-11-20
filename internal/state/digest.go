@@ -62,9 +62,8 @@ func (s *State) Digest() Hash {
 		for i := 0; i < c.Pledges.Len(); i++ {
 			fmt.Fprintf(&ps, "%+v;", c.Pledges.At(i))
 		}
-		lines = append(lines, fmt.Sprintf("%x %x %x %d %d %d %d %d %d %d %d %d %d %d %x %d %d %s\n", k, c.Creator, c.DataRoot, c.Size,
-			c.Media, c.MinTier, c.Deadline, c.Status, c.Escrow, c.Raised, c.Upload, c.Tier, c.Bucket, c.Held, c.Seed,
-			c.RefundPot, c.RefundAt, ps.String()))
+		lines = append(lines, fmt.Sprintf("%x %x %x %d %d %d %d %d %d %d %d %d %d %s\n", k, c.Creator, c.DataRoot, c.Size,
+			c.Media, c.MinTier, c.Deadline, c.Status, c.Escrow, c.Raised, c.Tier, c.RefundPot, c.RefundAt, ps.String()))
 		return true
 	})
 	s.Bounties.Range(func(k Hash, b *Bounty) bool {
@@ -72,9 +71,9 @@ func (s *State) Digest() Hash {
 		for i := 0; i < b.Pledges.Len(); i++ {
 			fmt.Fprintf(&ps, "%+v;", b.Pledges.At(i))
 		}
-		lines = append(lines, fmt.Sprintf("bounty %x %x %d %d %d %d %d %x %x %x %d %d %d %x %d %d %d %x %d %d %s\n", k, b.Requester, b.Deadline,
-			b.Tier, b.Status, b.Escrow, b.Raised, b.Offer, b.Hunter, b.DataRoot, b.Size, b.Media, b.Accepted, b.Seed, b.Bucket,
-			b.Held, b.Proven, b.Failed, b.RefundPot, b.RefundAt, ps.String()))
+		lines = append(lines, fmt.Sprintf("bounty %x %x %d %d %d %d %d %x %x %x %d %d %d %d %d %d %x %d %d %s\n", k, b.Requester, b.Deadline,
+			b.Tier, b.Status, b.Escrow, b.Raised, b.Offer, b.Hunter, b.DataRoot, b.Size, b.Media, b.Accepted, b.Bucket,
+			b.Held, b.Extended, b.Failed, b.RefundPot, b.RefundAt, ps.String()))
 		return true
 	})
 	lines = append(lines, fmt.Sprintf("refunding %x\n", s.Refunding))

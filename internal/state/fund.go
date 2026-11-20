@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/namsaeg/chainboard/internal/chunk"
 	"github.com/namsaeg/chainboard/internal/codec"
-	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/pmap"
 	"github.com/namsaeg/chainboard/internal/types"
@@ -16,17 +14,18 @@ import (
 // Crowdfunding (see types.FundRequest). A campaign's escrow can only pay
 // for storing its data:
 //
-//	open      pledges come in until the deadline
-//	uploaded  someone holding the data sent the funded upload before the
-//	          deadline: the base fee is paid, the storage fee for the longest
-//	          tier the escrow affords is held, and the proof window starts
-//	done      a proof of FundSamples sub-chunks, drawn from the vdf output of
-//	          the block after the upload, came within the window: the data is
-//	          placed, the held fee goes to storage, and what is left returns
-//	          to the backers in proportion. From here nothing can be taken back.
+//	open    pledges come in until the deadline
+//	stored  the creator sent the fund store before the deadline: its data
+//	        is placed at the longest tier the escrow affords (not shorter
+//	        than the request asks), the storage fee goes to the bucket, and
+//	        what is left returns to the backers in proportion
 //
-// If the deadline passes without an upload, or the window without a proof,
-// the escrow (minus fees spent) returns to the backers by itself. Backers
+// A fund store is valid only with all of its data at hand: a node takes it
+// into its pool, and a recent block holding it, only once every chunk is
+// here and matches the data root (see SetDataCheck). So a store either
+// happens with the whole data or does not happen at all, and a failed
+// attempt costs the backers nothing. If the deadline passes without a
+// store, the escrow returns to the backers in full by itself. Backers
 // cannot withdraw a pledge, so a creator who delivers is always paid.
 
 // FundStatus is where a campaign stands.
@@ -34,7 +33,6 @@ type FundStatus uint8
 
 const (
 	FundOpen      FundStatus = 1
-	FundUploaded  FundStatus = 2
 	FundRefunding FundStatus = 3 // being returned to the backers (see refund.go)
 )
 
@@ -56,12 +54,7 @@ type Campaign struct {
 	Escrow   uint64 // coins held: pledges minus the fees paid from them
 	Raised   uint64 // pledged in total (the refund shares)
 	Pledges  pmap.Vec[PledgeRec]
-	// Set by the funded upload.
-	Upload uint64 // its height
-	Tier   uint16
-	Bucket uint32
-	Held   uint64 // storage fee set aside in Escrow
-	Seed   Hash   // from the vdf output of the block after the upload: picks the proof's samples
+	Tier     uint16 // the tier its data was stored at (0 until stored)
 	// Refund in progress.
 	RefundPot uint64
 	RefundAt  int
@@ -216,106 +209,78 @@ func (s *State) FundTier(c *Campaign, h, base uint64) (tier uint16, fee uint64, 
 	return 0, 0, false
 }
 
-// FundCost is what a funded upload or proof pays from the escrow: its base
-// fee (block bytes) and, for the upload, the storage fee it holds.
-func (s *State) fundCost(t *types.Tx, c *Campaign, h uint64, ctx *BlockCtx) (base, held uint64, tier uint16, err error) {
+// checkFundStore checks a fund store against its campaign and returns its
+// base fee (paid from the escrow), the tier the escrow affords and that
+// tier's storage fee.
+func (s *State) checkFundStore(t *types.Tx, from Address, h uint64, ctx *BlockCtx) (c *Campaign, base, fee uint64, tier uint16, err error) {
+	c, ok := s.campaign(t.Target)
+	switch {
+	case !ok:
+		return nil, 0, 0, 0, errors.New("unknown funding request")
+	case from != c.Creator:
+		// Only the creator chooses when to store (and so the tier), so no
+		// one can force an early, short-tier store.
+		return nil, 0, 0, 0, errors.New("only the request's creator stores its data")
+	case c.Status != FundOpen || h >= c.Deadline:
+		return nil, 0, 0, 0, errors.New("funding request is not open for its store")
+	case t.DataRoot != c.DataRoot || t.Size != c.Size:
+		return nil, 0, 0, 0, errors.New("fund store names other data than its request")
+	case s.Data.Has(c.DataRoot):
+		return nil, 0, 0, 0, errors.New("that data is already stored")
+	case c.Size > s.FileCap():
+		return nil, 0, 0, 0, fmt.Errorf("funded data larger than the file cap %d", s.FileCap())
+	case ctx.MediaUsed+c.Size > s.MediaCapPerBlock():
+		return nil, 0, 0, 0, errors.New("media cap for this block reached")
+	}
 	base = s.BytesFee(t)
-	switch t.Kind {
-	case types.TxFundUpload:
-		if c.Status != FundOpen || h >= c.Deadline {
-			return 0, 0, 0, errors.New("funding request is not open for its upload")
-		}
-		if s.Data.Has(c.DataRoot) {
-			return 0, 0, 0, errors.New("that data is already stored")
-		}
-		if c.Size > s.FileCap() {
-			return 0, 0, 0, fmt.Errorf("funded data larger than the file cap %d", s.FileCap())
-		}
-		var ok bool
-		if tier, held, ok = s.FundTier(c, h, base); !ok {
-			return 0, 0, 0, errors.New("the escrow does not yet afford the minimum tier")
-		}
-	case types.TxFundProof:
-		if c.Status != FundUploaded || c.Seed.IsZero() || h > c.Upload+s.P.FundProofBlocks {
-			return 0, 0, 0, errors.New("funding request is not waiting for its proof")
-		}
-		if base > c.Escrow-c.Held {
-			return 0, 0, 0, errors.New("the escrow cannot pay for the proof")
-		}
-		if ctx.MediaUsed+c.Size > s.MediaCapPerBlock() {
-			return 0, 0, 0, errors.New("media cap for this block reached")
-		}
-		if !s.replay {
-			if err := s.checkSamples(t, c.Seed, c.DataRoot, c.Size); err != nil {
-				return 0, 0, 0, err
-			}
-		}
+	if tier, fee, ok = s.FundTier(c, h, base); !ok {
+		return nil, 0, 0, 0, errors.New("the escrow does not yet afford the minimum tier")
 	}
-	return base, held, tier, nil
-}
-
-// FundSampleAt is the chunk and sub-chunk sample j of a data proof (funded
-// upload or bounty reveal) shows.
-func FundSampleAt(seed, id Hash, size uint64, j int) (ci uint64, sub int) {
-	x := cryptox.Tagged("cb/fund/sample", seed[:], id[:], []byte{byte(j)})
-	ci = (uint64(x[0])<<56 | uint64(x[1])<<48 | uint64(x[2])<<40 | uint64(x[3])<<32 |
-		uint64(x[4])<<24 | uint64(x[5])<<16 | uint64(x[6])<<8 | uint64(x[7])) % chunk.Count(size)
-	return ci, int(x[8]) % chunk.SubCount(size, ci)
-}
-
-func (s *State) checkSamples(t *types.Tx, seed, root Hash, size uint64) error {
-	for j, x := range t.Samples {
-		ci, sub := FundSampleAt(seed, t.Target, size, j)
-		if len(x.Sub) != chunk.SubLen(size, ci, sub) || !chunk.VerifySub(root, size, ci, sub, x.Sub, x.Path) {
-			return fmt.Errorf("data proof sample %d does not verify", j)
-		}
+	if err := s.checkData(c.DataRoot, c.Size); err != nil {
+		return nil, 0, 0, 0, err
 	}
-	return nil
+	return c, base, fee, tier, nil
 }
 
-func (s *State) applyFundUpload(id Hash, c *Campaign, base, held uint64, tier uint16, h uint64) {
+// applyFundStore places the funded data and returns the rest of the escrow.
+func (s *State) applyFundStore(id Hash, c *Campaign, base, fee uint64, tier uint16, h uint64, ctx *BlockCtx) {
 	months, perm, _ := params.TierMonths(tier)
-	c.Escrow -= base
-	c.Held, c.Tier, c.Bucket = held, tier, s.BucketFor(h, months, perm)
-	c.Status, c.Upload = FundUploaded, h
-	s.Funds.Set(id, c)
-	s.due(h+1, id)                     // the seed: vdf output of block h+1
-	s.due(h+s.P.FundProofBlocks+1, id) // end of the proof window
-}
-
-func (s *State) applyFundProof(id Hash, c *Campaign, base uint64, ctx *BlockCtx) {
-	c.Escrow -= base
+	bucket := s.BucketFor(h, months, perm)
 	ctx.MediaUsed += c.Size
-	s.place(c.DataRoot, c.Size, c.Media, c.Tier, c.Bucket)
-	s.fund(c.Bucket, c.Held)
-	c.Escrow -= c.Held
-	c.Held = 0
+	s.place(c.DataRoot, c.Size, c.Media, tier, bucket)
+	s.fund(bucket, fee)
+	c.Escrow -= base + fee
+	c.Tier = tier
 	s.Funds.Set(id, c)
 	s.startRefund(id) // what is left returns to the backers
 }
 
+// checkData asks the installed data check (see SetDataCheck) whether all of
+// a data root's chunks are here. Replays (blocks read back from our own
+// database) were checked when they came.
+func (s *State) checkData(root Hash, size uint64) error {
+	if s.dataCheck == nil || s.replay {
+		return nil
+	}
+	return s.dataCheck(root, size)
+}
+
+// SetDataCheck installs (or with nil removes) the check that a fund store
+// or bounty reveal comes with all of its data: it returns an error (the
+// chain's MissingDataError) while chunks are missing.
+func (s *State) SetDataCheck(f func(root Hash, size uint64) error) { s.dataCheck = f }
+
 // dueAll runs the campaign and bounty deadlines and windows that fall at
 // height h (the block whose header is hd), then the refund queue.
-func (s *State) dueAll(h uint64, hd *types.Header, ctx *BlockCtx) {
+func (s *State) dueAll(h uint64, ctx *BlockCtx) {
 	if ids, ok := s.FundDue.Get(h); ok {
 		s.FundDue.Delete(h)
-		seed := headerSeed(hd)
 		for _, id := range ids {
 			if s.Bounties.Has(id) {
-				s.bountyDue(id, h, seed, ctx)
+				s.bountyDue(id, h)
 				continue
 			}
-			c, ok := s.campaign(id)
-			if !ok {
-				continue
-			}
-			switch {
-			case c.Status == FundOpen && h >= c.Deadline:
-				s.startRefund(id)
-			case c.Status == FundUploaded && h == c.Upload+1 && c.Seed.IsZero():
-				c.Seed = sampleSeed(seed, id)
-				s.Funds.Set(id, c)
-			case c.Status == FundUploaded && h > c.Upload+s.P.FundProofBlocks:
+			if c, ok := s.campaign(id); ok && c.Status == FundOpen && h >= c.Deadline {
 				s.startRefund(id)
 			}
 		}
@@ -344,11 +309,7 @@ func campaignSum(id Hash, c *Campaign) pmap.Sum {
 	w.Var(c.Raised)
 	pr := c.Pledges.Root(pledgeSum)
 	w.Fixed(pr[:])
-	w.Var(c.Upload)
 	w.U16(c.Tier)
-	w.U32(c.Bucket)
-	w.Var(c.Held)
-	w.Fixed(c.Seed[:])
 	w.Var(c.RefundPot)
 	w.Var(uint64(c.RefundAt))
 	return sumOf("campaign", &w)

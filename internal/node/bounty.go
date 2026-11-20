@@ -12,7 +12,6 @@ import (
 	"github.com/namsaeg/chainboard/internal/codec"
 	"github.com/namsaeg/chainboard/internal/cryptox"
 	"github.com/namsaeg/chainboard/internal/media"
-	"github.com/namsaeg/chainboard/internal/miner"
 	"github.com/namsaeg/chainboard/internal/p2p"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -320,21 +319,21 @@ func (n *Node) AcceptOffer(offer cryptox.Hash, confirm bool) error {
 	if !ok {
 		return errors.New("unknown offer")
 	}
-	return n.SendChecked(&types.Tx{Kind: types.TxBountyAccept, Offer: ot.o}, confirm)
-}
-
-// DisputeBounty burns the pot of a proven result of one of this node's
-// bounties (within the dispute window).
-func (n *Node) DisputeBounty(id cryptox.Hash, confirm bool) error {
+	t := &types.Tx{Kind: types.TxBountyAccept, Offer: ot.o}
 	if !confirm {
-		return &WarningError{Warnings: []Warning{{Code: "dispute",
-			Message: "이의를 제기하면 상금이 모두 소각돼요. 헌터도 받지 못하고, 나에게도 돌아오지 않아요. 결과 데이터는 이미 공개돼 있어요."}}}
+		// Accepting cannot be undone: once the data is revealed the pot is
+		// the hunter's, whatever the rest of the data turns out to be.
+		ws, fee := n.Warnings(t)
+		ws = append([]Warning{{Code: "accept", Message: "수락하면 되돌릴 수 없어요. 제안자가 데이터를 공개하면 현상금은 바로 제안자에게 가요. " +
+			"앞부분 미리보기가 찾던 자료인지 꼭 확인하세요(앞부분은 진짜 데이터의 일부로 확인된 것이에요)."}}, ws...)
+		return &WarningError{Warnings: ws, Fee: fee}
 	}
-	return n.SendChecked(&types.Tx{Kind: types.TxBountyDispute, Target: id}, true)
+	return n.Send(t)
 }
 
-// tendBounties shares the data of accepted own offers and sends their proof
-// once the seed is known; it forgets offers whose bounty moved on.
+// tendBounties shares the data of accepted own offers and sends their
+// reveal (valid only once peers can have all of the data, which this node
+// now serves); it forgets offers whose bounty moved on.
 func (n *Node) tendBounties(st *state.State) {
 	h := st.Height + 1
 	n.offerMu.Lock()
@@ -347,7 +346,7 @@ func (n *Node) tendBounties(st *state.State) {
 			n.shared[ot.o.DataRoot] = true
 		case ok && b.Status == state.BountyOpen && h < b.Deadline:
 		case ot.own && ok && b.Status != state.BountyRefunding:
-			// accepted for someone else, or proven: wait for the outcome
+			// accepted for someone else: wait for the outcome
 		case ot.own && n.shared[ot.o.DataRoot]:
 			delete(n.offers, id) // revealed: public anyway
 		case ot.own:
@@ -360,18 +359,13 @@ func (n *Node) tendBounties(st *state.State) {
 	n.offerMu.Unlock()
 	for _, ot := range own {
 		b, _ := st.Bounties.Get(ot.o.Bounty)
-		if b.Status != state.BountyAccepted || b.Seed.IsZero() || (ot.sentAt != 0 && h < ot.sentAt+5) {
+		if b.Status != state.BountyAccepted || (ot.sentAt != 0 && h < ot.sentAt+5) {
 			continue
 		}
 		if pb, ok := n.trialState().Bounties.Get(ot.o.Bounty); !ok || pb.Status != state.BountyAccepted {
-			continue // the proof is already in the pool
+			continue // the reveal is already in the pool
 		}
-		samples, err := miner.FundSamples(n.Store, b.Seed, ot.o.Bounty, b.DataRoot, b.Size)
-		if err != nil {
-			n.cfg.Logf("node: bounty reveal: %v", err)
-			continue
-		}
-		if err := n.Send(&types.Tx{Kind: types.TxBountyProof, Target: ot.o.Bounty, Samples: samples}); err != nil {
+		if err := n.Send(&types.Tx{Kind: types.TxBountyReveal, Target: ot.o.Bounty, DataRoot: b.DataRoot, Size: b.Size}); err != nil {
 			n.cfg.Logf("node: bounty reveal: %v", err)
 			continue
 		}
@@ -387,14 +381,16 @@ type BountyItem struct {
 	Refs      []string `json:"refs,omitempty"`
 	Requester string   `json:"requester"`
 	Mine      bool     `json:"mine,omitempty"`
-	Status    string   `json:"status"` // open, accepted, proven, refunding
+	Status    string   `json:"status"` // open, accepted, refunding
 	Pot       string   `json:"pot"`
 	Backers   int      `json:"backers"`
 	Deadline  uint64   `json:"deadline"`
 	Left      uint64   `json:"blocks_left"`
 	Tier      uint16   `json:"tier"`
 	Offers    int      `json:"offers"`
-	// The accepted offer, and the windows of its reveal and dispute.
+	Extended  uint64   `json:"extended,omitempty"` // blocks given back for failed reveals
+	Failed    int      `json:"failed,omitempty"`   // accepted offers that never revealed
+	// The accepted offer, and the window of its reveal.
 	Offer        string `json:"offer,omitempty"`
 	Hunter       string `json:"hunter,omitempty"`
 	Root         string `json:"root,omitempty"`
@@ -405,7 +401,7 @@ type BountyItem struct {
 }
 
 var bountyStatusNames = map[state.BountyStatus]string{state.BountyOpen: "open", state.BountyAccepted: "accepted",
-	state.BountyProven: "proven", state.BountyRefunding: "refunding"}
+	state.BountyRefunding: "refunding"}
 
 // BountyList lists bounties on chain: open first, nearest deadline first.
 func (n *Node) BountyList(limit int) []BountyItem {
@@ -427,7 +423,7 @@ func (n *Node) BountyList(limit int) []BountyItem {
 	tip.Bounties.Range(func(id cryptox.Hash, b *state.Bounty) bool {
 		it := BountyItem{ID: id.String(), Requester: b.Requester.String(), Mine: b.Requester == n.Wallet.Address(),
 			Status: bountyStatusNames[b.Status], Pot: coins(b.Escrow), Backers: b.Pledges.Len(), Deadline: b.Deadline,
-			Tier: b.Tier, Offers: counts[id]}
+			Tier: b.Tier, Offers: counts[id], Extended: b.Extended, Failed: len(b.Failed)}
 		months, perm, _ := params.TierMonths(b.Tier)
 		it.StorageToday = coins(state.StorageFee(tip.P, tip.Price, 1_000_000, tip.P.MediaReplicas, months, perm))
 		if b.Deadline > h {
@@ -436,20 +432,16 @@ func (n *Node) BountyList(limit int) []BountyItem {
 		if v, ok := n.Index.post(id); ok {
 			it.Board, it.Note, it.Refs = v.Board, v.Text, v.Attach
 		}
-		if b.Status == state.BountyAccepted || b.Status == state.BountyProven {
+		if b.Status == state.BountyAccepted {
 			it.Offer, it.Hunter, it.Root, it.Size, it.MyOffer = b.Offer.String(), b.Hunter.String(), b.DataRoot.String(), b.Size, mine[b.Offer]
-			end := b.Accepted + tip.P.BountyRevealBlocks
-			if b.Status == state.BountyProven {
-				end = b.Proven + tip.P.BountyDisputeBlocks
-			}
-			if end >= h {
+			if end := b.Accepted + tip.P.BountyRevealBlocks; end >= h {
 				it.WindowLeft = end - h + 1
 			}
 		}
 		out = append(out, it)
 		return true
 	})
-	rank := map[string]int{"open": 0, "accepted": 1, "proven": 2, "refunding": 3}
+	rank := map[string]int{"open": 0, "accepted": 1, "refunding": 2}
 	sort.Slice(out, func(i, j int) bool {
 		if rank[out[i].Status] != rank[out[j].Status] {
 			return rank[out[i].Status] < rank[out[j].Status]

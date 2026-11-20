@@ -14,7 +14,6 @@ import (
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 
 	"github.com/namsaeg/chainboard/internal/cryptox"
-	"github.com/namsaeg/chainboard/internal/keystore"
 	"github.com/namsaeg/chainboard/internal/params"
 	"github.com/namsaeg/chainboard/internal/rln"
 	"github.com/namsaeg/chainboard/internal/state"
@@ -107,7 +106,7 @@ func (n *Node) loadRLN() error {
 			n.usage.Epochs = map[uint64]map[uint16]string{}
 		}
 	}
-	b, err := keystore.Read(n.rlnPath("rln.key"), n.cfg.Password)
+	b, err := n.readKey("rln.key")
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -136,7 +135,7 @@ func (n *Node) newIdentity() error {
 		return err
 	}
 	b := rln.ToBytes(s)
-	if err := keystore.Write(n.rlnPath("rln.key"), []byte(`{"secret":"`+hex.EncodeToString(b[:])+`"}`+"\n"), n.cfg.Password); err != nil {
+	if err := n.writeKey("rln.key", []byte(`{"secret":"`+hex.EncodeToString(b[:])+`"}`+"\n")); err != nil {
 		return err
 	}
 	n.secret = &s
@@ -230,12 +229,13 @@ type BondQuote struct {
 }
 
 // RLNQuote quotes a bond (and the bond for every limit, for a calculator).
-func (n *Node) RLNQuote(bond uint64) BondQuote {
-	st := n.trialState()
+func (n *Node) RLNQuote(bond uint64) BondQuote { return bondQuote(n.trialState(), bond) }
+
+func bondQuote(st *state.State, bond uint64) BondQuote {
 	headroom := 1_000_000 + 2*st.P.PriceMaxDayPPM
 	q := BondQuote{Limit: bondLimit(st, bond, headroom)}
 	for l := uint64(1); l <= st.P.RLNMaxLimit; l++ {
-		q.BondFor = append(q.BondFor, mulDivU(st.BondFor(l), headroom, 1_000_000)+1)
+		q.BondFor = append(q.BondFor, mulDivUp(st.BondFor(l), headroom, 1_000_000))
 	}
 	if q.Limit < st.P.RLNMaxLimit {
 		q.NextBond = q.BondFor[q.Limit]
@@ -252,6 +252,17 @@ func bondLimit(st *state.State, bond, headroom uint64) uint64 {
 func mulDivU(a, b, c uint64) uint64 {
 	hi, lo := bits.Mul64(a, b)
 	q, _ := bits.Div64(hi%c, lo, c)
+	return q
+}
+
+// mulDivUp is a*b/c rounded up: the smallest bond that still buys a count
+// once the headroom is taken off again.
+func mulDivUp(a, b, c uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, r := bits.Div64(hi%c, lo, c)
+	if r != 0 {
+		q++
+	}
 	return q
 }
 
@@ -345,7 +356,7 @@ func (n *Node) AnonPost(req AnonRequest) error {
 	n.rlnMu.Lock()
 	idc, ok := n.commitment()
 	if ok && req.Pseudo && n.pseudo == nil {
-		k, err := loadKey(n.rlnPath("pseudonym.key"), n.cfg.Password)
+		k, err := n.loadKeyFile("pseudonym.key")
 		if err != nil {
 			n.rlnMu.Unlock()
 			return err

@@ -132,6 +132,11 @@ func (n *Node) fillView(v *PostView, tip *state.State) {
 // and says how long their attachments are kept.
 func (n *Node) fillLiked(v *PostView) {
 	v.Liked = n.Index.Liked(v.id, n.Wallet.Address())
+	if a, err := cryptox.ParseAddress(v.TipTo); err == nil && n.ownAddress(a) {
+		v.Mine = true
+	} else if a, err := cryptox.ParseAddress(v.Author); err == nil && n.ownAddress(a) {
+		v.Mine = true
+	}
 	tip := n.Chain.Tip()
 	for _, a := range v.Attach {
 		root, err := cryptox.ParseHash(a)

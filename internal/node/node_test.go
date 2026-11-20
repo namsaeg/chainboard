@@ -25,7 +25,6 @@ import (
 	"github.com/namsaeg/chainboard/internal/nat"
 	"github.com/namsaeg/chainboard/internal/p2p"
 	"github.com/namsaeg/chainboard/internal/params"
-	"github.com/namsaeg/chainboard/internal/state"
 	"github.com/namsaeg/chainboard/internal/types"
 )
 
@@ -222,7 +221,8 @@ func TestAnonymousPosts(t *testing.T) {
 	waitFor(t, "stake aging", 60*time.Second, func() bool { return b.Chain.Height() > start+p.StakeAgingBlocks })
 	// The bond follows the storage price: the quote leaves room for the
 	// price to move before the join is mined, and counts both ways.
-	q := b.RLNQuote(0)
+	st := b.trialState() // one state: the price moves from block to block
+	q := bondQuote(st, 0)
 	if q.Limit != 0 || q.NextBond != q.BondFor[0] || len(q.BondFor) != int(p.RLNMaxLimit) {
 		t.Fatalf("quote for nothing: %+v", q)
 	}
@@ -231,10 +231,15 @@ func TestAnonymousPosts(t *testing.T) {
 			t.Fatalf("bonds not rising: %v", q.BondFor)
 		}
 	}
-	if q4 := b.RLNQuote(q.BondFor[3]); q4.Limit != 4 || q4.NextBond != q.BondFor[4] {
+	for i, bond := range q.BondFor { // each quoted bond is the least that buys its count
+		if got, under := bondQuote(st, bond).Limit, bondQuote(st, bond-1).Limit; got != uint64(i+1) || under != uint64(i) {
+			t.Fatalf("bond %d buys %d, one unit less %d; want %d", bond, got, under, i+1)
+		}
+	}
+	if q4 := bondQuote(st, q.BondFor[3]); q4.Limit != 4 || q4.NextBond != q.BondFor[4] {
 		t.Fatalf("quote for four: %+v", q4)
 	}
-	if q3 := b.RLNQuote(q.BondFor[3] - 1); q3.Limit != 3 {
+	if q3 := bondQuote(st, q.BondFor[3]-1); q3.Limit != 3 {
 		t.Fatalf("quote just under four: %+v", q3)
 	}
 	if err := b.JoinRLN(q.BondFor[3]); err != nil {
@@ -281,6 +286,21 @@ func TestAnonymousPosts(t *testing.T) {
 	}
 	tip := 2 * a.MinLikeAmount()
 	pid, _ := cryptox.ParseHash(plain.ID)
+	// The writer's own node knows the post as its own and will not like it
+	// (that would be a transfer between its own addresses by another way).
+	for _, v := range b.Board("익명", 0, 10) {
+		if !v.Mine {
+			t.Fatalf("own anonymous post not marked: %+v", v)
+		}
+	}
+	if _, err := b.QueueLike(LikeRequest{ID: pid, Amount: tip}); err == nil {
+		t.Fatal("liked its own anonymous post")
+	}
+	for _, v := range a.Board("익명", 0, 10) {
+		if v.Mine {
+			t.Fatal("someone else's post marked as one's own")
+		}
+	}
 	if _, err := a.QueueLike(LikeRequest{ID: pid, Amount: tip, Now: true, Confirm: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -517,10 +537,10 @@ func TestLikesAndTips(t *testing.T) {
 
 // TestCrowdfunding: a creator with no coins signs a request; a backer
 // checks a sample of the data, pledges (carrying the request), and the
-// creator's node uploads and proves by itself once the deadline nears.
+// creator's node stores the data by itself once the deadline nears. Every
+// node takes the store's block only with the whole data at hand.
 func TestCrowdfunding(t *testing.T) {
 	p := fastParams()
-	p.FundProofBlocks = 20
 	a := start(t, p, true)
 	b := start(t, p, false, a.Host.Addr())
 	c := start(t, p, false, a.Host.Addr())
@@ -557,6 +577,10 @@ func TestCrowdfunding(t *testing.T) {
 		return len(l) == 1 && l[0].OnChain && l[0].Fund.Backers == 1
 	})
 	waitFor(t, "data stored", 120*time.Second, func() bool { return a.Chain.Tip().Data.Has(q.DataRoot) })
+	waitFor(t, "store block at a bystander", 60*time.Second, func() bool { return c.Chain.Tip().Data.Has(q.DataRoot) })
+	if !c.Store.Complete(q.DataRoot) {
+		t.Fatal("a node took the store's block without the whole data")
+	}
 	if a.Chain.Tip().Funds.Has(q.ID()) {
 		t.Fatal("campaign open after its data was stored")
 	}
@@ -923,14 +947,15 @@ func noisePNG(w, h int) []byte {
 // TestBounty: a requester posts a bounty; a hunter without coins answers
 // with an offer that travels by gossip; the requester sees the previews but
 // cannot fetch the whole data; on acceptance the hunter's node shares the
-// data and proves it by itself, and after the dispute window the pot is
-// the hunter's.
+// data and reveals it by itself, and the pot is the hunter's at once. Every
+// node takes the reveal's block only with the whole data at hand.
 func TestBounty(t *testing.T) {
 	p := fastParams()
-	p.BountyMaxBlocks, p.BountyRevealBlocks, p.BountyDisputeBlocks = 400, 20, 6
+	p.BountyMaxBlocks, p.BountyRevealBlocks = 400, 20
 	p.FileCapDivisor = 10 // room for a picture of a few chunks
 	a := start(t, p, true)
 	b := start(t, p, false, a.Host.Addr())
+	c := start(t, p, false, a.Host.Addr())
 	waitFor(t, "funds", 60*time.Second, func() bool { return a.Chain.Tip().Peek(a.Wallet.Address()).Balance > 10*params.Coin })
 	id, err := a.CreateBounty("현상금", "비 오는 광화문 사진을 찾아요", nil, 3*params.Coin, 30, 12, true)
 	if err != nil {
@@ -963,19 +988,23 @@ func TestBounty(t *testing.T) {
 	if got := a.Host.ProbeResult(o.DataRoot); len(got) != 0 {
 		t.Fatal("the hunter served data beyond its preview before acceptance")
 	}
+	var warn *WarningError
+	if err := a.AcceptOffer(o.ID(), false); !errors.As(err, &warn) || warn.Warnings[0].Code != "accept" {
+		t.Fatalf("accepting without the warning: %v", err)
+	}
 	if err := a.AcceptOffer(o.ID(), true); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "revealed and proven", 90*time.Second, func() bool {
-		x, ok := a.Chain.Tip().Bounties.Get(id)
-		return ok && x.Status == state.BountyProven
+	waitFor(t, "revealed and paid", 120*time.Second, func() bool {
+		_, open := b.Chain.Tip().Bounties.Get(id)
+		return !open && b.Chain.Tip().Peek(b.Wallet.Address()).Balance > 2*params.Coin
 	})
-	if !a.Chain.Tip().Data.Has(o.DataRoot) {
+	if !b.Chain.Tip().Data.Has(o.DataRoot) {
 		t.Fatal("result not stored")
 	}
-	waitFor(t, "hunter paid", 60*time.Second, func() bool { return b.Chain.Tip().Peek(b.Wallet.Address()).Balance > 2*params.Coin })
-	if _, ok := a.Chain.Tip().Bounties.Get(id); ok {
-		t.Fatal("bounty still open after payment")
+	waitFor(t, "reveal block at a bystander", 60*time.Second, func() bool { return c.Chain.Tip().Data.Has(o.DataRoot) })
+	if !c.Store.Complete(o.DataRoot) {
+		t.Fatal("a node took the reveal's block without the whole data")
 	}
 	if err := a.Chain.Tip().CheckSupply(); err != nil {
 		t.Fatal(err)
@@ -1006,5 +1035,49 @@ func TestBadWorkBans(t *testing.T) {
 	time.Sleep(3 * time.Second) // a keeps dialing its seed
 	if b.Host.PeerCount() != 0 || len(b.ItemIDs(p2p.ItemFund)) != 0 {
 		t.Fatal("a banned peer got back in, or its item was kept")
+	}
+}
+
+// TestPasswordOnRunningNode: the key files can be locked, relocked and
+// unlocked while the node runs; key files the node makes afterwards use the
+// new password, and the reported state follows the files.
+func TestPasswordOnRunningNode(t *testing.T) {
+	p := fastParams()
+	n := start(t, p, false)
+	if s := n.KeyState(); s != "plain" {
+		t.Fatalf("new node keys %s", s)
+	}
+	if err := n.ChangePassword("", "첫 비밀번호"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.newTipKey(); err != nil { // a key file made after the change
+		t.Fatal(err)
+	}
+	if s := n.KeyState(); s != "locked" {
+		t.Fatalf("after locking: %s", s)
+	}
+	if err := keystore.Check(n.dir, "첫 비밀번호"); err != nil {
+		t.Fatalf("files not all under the new password: %v", err)
+	}
+	if err := n.ChangePassword("틀림", "두 번째"); !errors.Is(err, ErrWrongPassword) {
+		t.Fatalf("changed with a wrong current password: %v", err)
+	}
+	if err := n.ChangePassword("첫 비밀번호", "두 번째"); err != nil {
+		t.Fatal(err)
+	}
+	if err := keystore.Check(n.dir, "두 번째"); err != nil || n.KeyState() != "locked" {
+		t.Fatalf("relock: %v %s", err, n.KeyState())
+	}
+	if err := os.WriteFile(filepath.Join(n.dir, "onion.key"), []byte("plain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s := n.KeyState(); s != "partial" {
+		t.Fatalf("with a plain file among locked ones: %s", s)
+	}
+	if err := n.ChangePassword("두 번째", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(n.dir, keystore.PlainMarker)); err != nil || n.KeyState() != "plain" {
+		t.Fatalf("unlock: %v %s", err, n.KeyState())
 	}
 }

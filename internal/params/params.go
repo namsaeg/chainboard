@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version = "0.6.0"
+	Version = "0.6.1"
 
 	Coin = 100_000_000 // units per coin
 
@@ -120,10 +120,8 @@ type Params struct {
 	RLNSlashPermille uint64 // share of a slashed bond paid to the block's miner; the rest is burned
 
 	// Crowdfunding: a request's deadline is at most FundMaxBlocks after it
-	// is carried on chain; after a funded upload, its proof must follow
-	// within FundProofBlocks.
-	FundMaxBlocks   uint64
-	FundProofBlocks uint64
+	// is carried on chain.
+	FundMaxBlocks uint64
 	// GossipPoWBits is the proof of work a funding request or a bounty offer
 	// carries to be gossiped before it is on chain: 2^bits memory-hard
 	// hashes (Argon2id, 4 MiB each) on average, about ten seconds of a
@@ -131,11 +129,12 @@ type Params struct {
 	GossipPoWBits uint8
 
 	// Bounties: a deadline at most BountyMaxBlocks ahead; an accepted
-	// offer's data must be proven within BountyRevealBlocks, after which the
-	// requester may dispute for BountyDisputeBlocks before the hunter is paid.
-	BountyMaxBlocks     uint64
-	BountyRevealBlocks  uint64
-	BountyDisputeBlocks uint64
+	// offer's data must be revealed within BountyRevealBlocks. A reveal that
+	// never comes gives the bounty back the blocks it was locked for, up to
+	// BountyExtendMaxBlocks in all.
+	BountyMaxBlocks       uint64
+	BountyRevealBlocks    uint64
+	BountyExtendMaxBlocks uint64
 
 	// Media.
 	MinMediaPerBlock  uint64 // bytes; floor of the automatic media cap
@@ -155,7 +154,7 @@ func mustHex(s string) *big.Int {
 func Testnet() *Params {
 	p := &Params{
 		Name:              "testnet",
-		Magic:             0xCB0A0006, // 0.6.0: new genesis (likes are coins, bounties, epoch-key RLN)
+		Magic:             0xCB0A0007, // 0.6.1: new genesis (paid data stored only when fully available, no disputes)
 		BlockTime:         60 * time.Second,
 		VDFIterations:     9_000_000,
 		PartitionChunks:   1 << 21, // 512 GiB
@@ -177,7 +176,7 @@ func Testnet() *Params {
 func Devnet() *Params {
 	p := &Params{
 		Name:              "devnet",
-		Magic:             0xCB0D0006,
+		Magic:             0xCB0D0007,
 		BlockTime:         2 * time.Second,
 		VDFIterations:     400_000,
 		PartitionChunks:   16,
@@ -249,11 +248,10 @@ func (p *Params) setEconomics() {
 	p.BurstStep = 10
 	p.TextSealBlocks = p.BlocksPerDay / 24 // hourly bundles
 	p.FundMaxBlocks = 30 * p.BlocksPerDay
-	p.FundProofBlocks = p.BlocksPerDay
 	p.GossipPoWBits = 14
 	p.BountyMaxBlocks = 90 * p.BlocksPerDay
 	p.BountyRevealBlocks = p.BlocksPerDay
-	p.BountyDisputeBlocks = p.BlocksPerDay
+	p.BountyExtendMaxBlocks = 7 * p.BlocksPerDay
 	p.MinMediaPerBlock = 4 * 1024 * 1024
 	p.MediaHeadroomPerm = 500
 	p.FileCapDivisor = 100

@@ -52,7 +52,6 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/bounty/offer", s.bountyOffer)
 	mux.HandleFunc("/api/bounty/preview", s.bountyPreview)
 	mux.HandleFunc("/api/bounty/accept", s.bountyAccept)
-	mux.HandleFunc("/api/bounty/dispute", s.bountyDispute)
 	mux.HandleFunc("/api/stake", s.stake)
 	mux.HandleFunc("/api/unstake", s.stake)
 	mux.HandleFunc("/api/transfer", s.transfer)
@@ -63,6 +62,7 @@ func Handler(n *node.Node) http.Handler {
 	mux.HandleFunc("/api/rln/ack", s.rlnAck)
 	mux.HandleFunc("/api/tips", s.tips)
 	mux.HandleFunc("/api/activity", s.activity)
+	mux.HandleFunc("/api/password", s.changePassword)
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	return guard(mux)
@@ -649,6 +649,32 @@ func (s *server) rlnQuote(w http.ResponseWriter, r *http.Request) {
 	}
 	out["bond_for"] = table // bond_for[i]: the bond for i+1 posts per epoch
 	writeJSON(w, out)
+}
+
+// changePassword locks, relocks or unlocks the key files of the running
+// node: {"current", "new"}; an empty new password unlocks them.
+func (s *server) changePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		fail(w, 405, errors.New("POST only"))
+		return
+	}
+	var req struct {
+		Current string `json:"current"`
+		New     string `json:"new"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if err := s.n.ChangePassword(req.Current, req.New); err != nil {
+		code := 500
+		if errors.Is(err, node.ErrWrongPassword) {
+			code = 403
+		}
+		fail(w, code, err)
+		return
+	}
+	writeJSON(w, map[string]string{"keys": s.n.KeyState()})
 }
 
 // activity lists this node's own posts, likes, crowdfunding, bounties and
